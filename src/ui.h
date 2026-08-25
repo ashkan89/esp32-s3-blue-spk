@@ -44,9 +44,21 @@ bool ui_present();
 /// Resets the idle timers and undims. Call on anything the user did.
 void ui_wake();
 
-/// Replaces "Ready to pair" on the idle screen, and suppresses the Bluetooth
-/// screens. Used by the test-tone build, which has no radio at all.
-void ui_set_headline(const char *text);
+enum UiSystemStatus : uint8_t {
+  UI_STATUS_NETWORK = 0,
+  UI_STATUS_UPDATE,
+  UI_STATUS_SUCCESS,
+  UI_STATUS_ERROR,
+  UI_STATUS_RESTART,
+};
+
+/// Temporarily takes over the OLED for an important system operation. Progress
+/// is 0..100, or -1 for a status without a progress bar. duration_ms=0 keeps it
+/// visible until replaced/cleared. Safe to call from any task.
+void ui_show_system_status(UiSystemStatus kind, const char *title,
+                           const char *detail, int16_t progress,
+                           uint32_t duration_ms = 0);
+void ui_clear_system_status();
 
 /// Serial console: "next", "screen <n>", "auto", "bright <0-255>", "ui".
 /// Returns false if the line was not one of those.

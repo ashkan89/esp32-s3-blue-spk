@@ -3,11 +3,13 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <Wire.h>
+#include <WiFi.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "audio_probe.h"
+#include "app_config.h"
 #include "player_state.h"
 #include "soft_clock.h"
 #include "ui_assets.h"
@@ -38,7 +40,6 @@ static U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE,
 #endif
 
 static bool g_present;
-static const char *g_headline;  // non-null in the test-tone build
 
 // Fonts. "_tf" carries the full Latin-1 range, which is what drawUTF8 needs for
 // accented track titles; "_tn" is digits only, which is all the clock wants.
@@ -86,6 +87,18 @@ enum ToastKind : uint8_t {
 static ToastKind toast_kind;
 static uint32_t toast_until;
 static uint32_t popup_until;  // volume popup
+
+struct SystemOverlay {
+  UiSystemStatus kind;
+  char title[36];
+  char detail[80];
+  int16_t progress;
+  uint32_t until;
+  bool active;
+};
+
+static SystemOverlay system_overlay;
+static portMUX_TYPE system_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // ------------------------------------------------------------------ timers ---
 static uint32_t last_frame_ms;
@@ -184,6 +197,8 @@ enum MqSlot : uint8_t {
   MQ_STATS,
   MQ_TOAST_A,
   MQ_TOAST_B,
+  MQ_SYSTEM_A,
+  MQ_SYSTEM_B,
   MQ_COUNT,
 };
 
@@ -618,7 +633,7 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
     u8g2.drawXBMP(0, 8, 8, 8, ICON_PHONE);
     draw_marquee(MQ_PEER, 10, 15, W - 10 - rw - 3, who, dt);
   } else {
-    u8g2.drawUTF8(0, 15, g_headline ? g_headline : "waiting for a phone");
+    u8g2.drawUTF8(0, 15, "waiting for a phone");
   }
 
   // --- row 3: volume ---
@@ -633,9 +648,31 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
   // --- row 4: the numbers you want when something is odd ---
   char up[12];
   fmt_uptime(now, up, sizeof(up));
-  snprintf(line, sizeof(line), "up %s  heap %uk  %ufps  agc %ddB  clk %s", up,
-           (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(fps_avg + 0.5f),
-           (int)v.agc_db, soft_clock_source_name());
+  static char network_line[72] = "network starting";
+  static uint32_t network_at;
+  if (now - network_at >= 2000 || network_at == 0) {
+    network_at = now;
+    if (WiFi.status() == WL_CONNECTED) {
+      const IPAddress ip = WiFi.localIP();
+      const String ssid = WiFi.SSID();
+      snprintf(network_line, sizeof(network_line),
+               "wifi %s  %u.%u.%u.%u  %ddBm", ssid.c_str(), ip[0], ip[1],
+               ip[2], ip[3], WiFi.RSSI());
+    } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+      const IPAddress ip = WiFi.softAPIP();
+      snprintf(network_line, sizeof(network_line), "setup AP  %u.%u.%u.%u", ip[0],
+               ip[1], ip[2], ip[3]);
+    } else {
+      strlcpy(network_line, "wifi offline", sizeof(network_line));
+    }
+  }
+  if ((now / 5000) & 1) {
+    strlcpy(line, network_line, sizeof(line));
+  } else {
+    snprintf(line, sizeof(line), "up %s  heap %uk  %ufps  agc %ddB  clk %s", up,
+             (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(fps_avg + 0.5f),
+             (int)v.agc_db, soft_clock_source_name());
+  }
   u8g2.setFont(FONT_SMALL);
   draw_marquee(MQ_STATS, 0, 30, W, line, dt);
 }
@@ -666,7 +703,7 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   }
 
   u8g2.setFont(FONT_TITLE);
-  u8g2.drawUTF8(32, 11, g_headline ? g_headline : "Ready to pair");
+  u8g2.drawUTF8(32, 11, "Ready to pair");
 
   u8g2.setFont(FONT_TEXT);
   draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
@@ -765,6 +802,67 @@ static void draw_toast(const PlayerInfo &s, uint32_t dt) {
   draw_marquee(MQ_TOAST_B, 7, 26, W - 14, detail, dt);
 }
 
+static bool system_overlay_snapshot(SystemOverlay *out, uint32_t now) {
+  bool visible;
+  portENTER_CRITICAL(&system_overlay_mux);
+  if (system_overlay.active && system_overlay.until != 0 &&
+      (int32_t)(now - system_overlay.until) >= 0) {
+    system_overlay.active = false;
+  }
+  visible = system_overlay.active;
+  if (visible) memcpy(out, &system_overlay, sizeof(*out));
+  portEXIT_CRITICAL(&system_overlay_mux);
+  return visible;
+}
+
+static void draw_system_overlay(const SystemOverlay &status, uint32_t dt) {
+  draw_panel(0, 0, W, H);
+
+  const uint8_t *icon = ICON_UPDATE;
+  const char *label = "FIRMWARE";
+  switch (status.kind) {
+    case UI_STATUS_NETWORK:
+      icon = ICON_WIFI;
+      label = "NETWORK";
+      break;
+    case UI_STATUS_SUCCESS:
+      icon = ICON_OK;
+      label = "COMPLETE";
+      break;
+    case UI_STATUS_ERROR:
+      icon = ICON_ERROR;
+      label = "ATTENTION";
+      break;
+    case UI_STATUS_RESTART:
+      icon = ICON_UPDATE;
+      label = "SYSTEM";
+      break;
+    default:
+      break;
+  }
+
+  u8g2.drawXBMP(5, 3, 8, 8, icon);
+  u8g2.setFont(FONT_SMALL);
+  u8g2.drawUTF8(17, 9, label);
+  if (status.progress >= 0) {
+    char pct[8];
+    snprintf(pct, sizeof(pct), "%d%%", status.progress);
+    draw_right(W - 5, 9, pct);
+  }
+
+  u8g2.setFont(FONT_TITLE);
+  draw_marquee(MQ_SYSTEM_A, 5, 20, W - 10, status.title, dt);
+
+  if (status.progress >= 0) {
+    const int fill = (status.progress * (W - 12)) / 100;
+    u8g2.drawRFrame(4, 24, W - 8, 7, 2);
+    if (fill > 0) u8g2.drawBox(6, 26, fill, 3);
+  } else {
+    u8g2.setFont(FONT_SMALL);
+    draw_marquee(MQ_SYSTEM_B, 5, 29, W - 10, status.detail, dt);
+  }
+}
+
 // ============================================================= transitions ===
 /*
  * Screen changes are animated by compositing the previous frame (kept in
@@ -841,8 +939,8 @@ static bool screen_eligible(UiScreen s, const PlayerInfo &info, uint32_t now) {
     case SCR_NOW_PLAYING:
       // Needs a phone. A title is not required -- plenty of players never send
       // AVRCP metadata at all, and the progress row and spectrum are still worth
-      // showing. The test-tone build has no phone, hence the headline check.
-      return g_headline == nullptr && info.connected;
+      // showing.
+      return info.connected;
     case SCR_SPECTRUM:
     case SCR_VU:
     case SCR_SCOPE:
@@ -887,7 +985,7 @@ static UiScreen pick_screen(const PlayerInfo &info, uint32_t now,
   }
 
   if (deep_idle) return SCR_SAVER;
-  if (g_headline == nullptr && !info.connected) return SCR_PAIRING;
+  if (!info.connected) return SCR_PAIRING;
 
   if (cur_screen == SCR_PAIRING || cur_screen == SCR_SAVER) {
     screen_since = now;
@@ -1050,9 +1148,13 @@ static void ui_frame() {
 
   if (trans_active) compose_transition(now - trans_start);
 
-  // Overlays go on last so a transition never slices through them. Volume wins
-  // over a toast: it is the one the user is actively driving.
-  if ((int32_t)(popup_until - now) > 0) {
+  // System operations win while active: losing update progress behind a volume
+  // popup would make a deliberate restart look like a crash. Ordinary volume
+  // still wins over Bluetooth/track toasts.
+  SystemOverlay status;
+  if (system_overlay_snapshot(&status, now)) {
+    draw_system_overlay(status, dt);
+  } else if ((int32_t)(popup_until - now) > 0) {
     draw_volume_popup(info);
   } else if ((int32_t)(toast_until - now) > 0 && toast_kind != TOAST_NONE) {
     draw_toast(info, dt);
@@ -1138,7 +1240,9 @@ bool ui_begin() {
   u8g2.setFont(FONT_TITLE);
   u8g2.drawUTF8(26, 14, ps_device_name()[0] ? ps_device_name() : "ESP32");
   u8g2.setFont(FONT_SMALL);
-  u8g2.drawUTF8(26, 24, "bluetooth speaker");
+  char version[28];
+  snprintf(version, sizeof(version), "firmware v%s", FW_VERSION);
+  u8g2.drawUTF8(26, 24, version);
   u8g2.drawHLine(26, 27, 96);
   u8g2.setContrast(UI_BRIGHT_MID);
   bright_applied = UI_BRIGHT_MID;
@@ -1163,7 +1267,25 @@ bool ui_present() { return g_present; }
 
 void ui_wake() { last_activity_ms = millis(); }
 
-void ui_set_headline(const char *text) { g_headline = text; }
+void ui_show_system_status(UiSystemStatus kind, const char *title,
+                           const char *detail, int16_t progress,
+                           uint32_t duration_ms) {
+  portENTER_CRITICAL(&system_overlay_mux);
+  system_overlay.kind = kind;
+  strlcpy(system_overlay.title, title ? title : "", sizeof(system_overlay.title));
+  strlcpy(system_overlay.detail, detail ? detail : "", sizeof(system_overlay.detail));
+  system_overlay.progress = progress < 0 ? -1 : (progress > 100 ? 100 : progress);
+  system_overlay.until = duration_ms ? millis() + duration_ms : 0;
+  system_overlay.active = true;
+  portEXIT_CRITICAL(&system_overlay_mux);
+  ui_wake();
+}
+
+void ui_clear_system_status() {
+  portENTER_CRITICAL(&system_overlay_mux);
+  system_overlay.active = false;
+  portEXIT_CRITICAL(&system_overlay_mux);
+}
 
 bool ui_command(const char *line) {
   if (!g_present) return false;

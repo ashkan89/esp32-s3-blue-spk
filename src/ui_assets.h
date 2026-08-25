@@ -104,6 +104,52 @@ static const uint8_t ICON_PHONE[8] = {
     xr(0b01111110),  // .######.
 };
 
+/// Wi-Fi radio waves, used by provisioning and dashboard status overlays.
+static const uint8_t ICON_WIFI[8] = {
+    xr(0b01111110),
+    xr(0b10000001),
+    xr(0b00111100),
+    xr(0b01000010),
+    xr(0b00011000),
+    xr(0b00100100),
+    xr(0b00000000),
+    xr(0b00011000),
+};
+
+/// Down arrow into a tray: firmware download / install.
+static const uint8_t ICON_UPDATE[8] = {
+    xr(0b00011000),
+    xr(0b00011000),
+    xr(0b00011000),
+    xr(0b01011010),
+    xr(0b00111100),
+    xr(0b00011000),
+    xr(0b00000000),
+    xr(0b01111110),
+};
+
+static const uint8_t ICON_OK[8] = {
+    xr(0b00000000),
+    xr(0b00000001),
+    xr(0b00000011),
+    xr(0b01000110),
+    xr(0b01101100),
+    xr(0b00111000),
+    xr(0b00010000),
+    xr(0b00000000),
+};
+
+static const uint8_t ICON_ERROR[8] = {
+    xr(0b01000010),
+    xr(0b00100100),
+    xr(0b00011000),
+    xr(0b00011000),
+    xr(0b00011000),
+    xr(0b00100100),
+    xr(0b01000010),
+    xr(0b00000000),
+};
+
 // ------------------------------------------------------------ 16x8 icons -----
 // Two bytes per row: the first byte is columns 0-7, the second 8-15.
 

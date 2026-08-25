@@ -1,10 +1,9 @@
 /*
  * soft_clock.h -- wall-clock time on a device that has no clock.
  *
- * A Bluetooth speaker has no RTC and, deliberately, no network: Wi-Fi and
- * Bluetooth share one 2.4 GHz radio, and running both while A2DP is streaming is
- * exactly the kind of thing that makes the audio stutter. So the time comes from
- * whichever of these is available, in order of preference:
+ * A Bluetooth speaker has no hardware RTC. The management dashboard can set
+ * the clock from a browser, while the sources below keep it useful even when
+ * the speaker has no network. The time comes from whichever is available:
  *
  *   1. DS3231 module on the same two I2C wires as the display  (-DUSE_DS3231=1)
  *      The only option that survives a power cut properly. ~1 EUR, keeps time
@@ -17,8 +16,8 @@
  *      before a2dp_sink.start() is ever called, so the two radios never overlap.
  *      Costs about four seconds of boot time.
  *
- *   3. Typed in over the serial monitor:  time 2026-08-18 14:30:00
- *      Also  time 14:30  to set just the clock, and  date 2026-08-18.
+ *   3. Set from the web dashboard, or typed in over the serial monitor:
+ *      time 2026-08-18 14:30:00. Also time 14:30 and date 2026-08-18.
  *
  *   4. The build timestamp, as a last resort, so a fresh flash shows roughly
  *      the right time instead of 1 Jan 1970 -- it drifts, and it is wrong by

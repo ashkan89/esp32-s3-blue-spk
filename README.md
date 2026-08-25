@@ -1,4 +1,4 @@
-# ESP32 Bluetooth Speaker (A2DP sink → PCM5102A + 0.91" OLED)
+# esp32-blue-spk
 
 Turns an **ESP32 WROOM-32D** into a Bluetooth audio receiver. Pair your phone,
 press play, and the audio comes out of the headphone jack on a **PCM5102A** I2S
@@ -19,7 +19,7 @@ what the folder is named.
 
 | Part | Notes |
 |------|-------|
-| ESP32 WROOM-32D devkit | classic ESP32 only, see above |
+| ESP32-WROOM-32D devkit, 16 MB flash | classic ESP32 only; this build uses the full 16 MB layout |
 | PCM5102A I2S DAC board | the usual purple breakout with a 3.5 mm jack |
 | 0.91" 128×32 I2C OLED  | SSD1306, 4 pins (VCC/GND/SDA/SCL) — optional |
 | DS3231 RTC module      | optional, shares the OLED's two I2C wires |
@@ -105,20 +105,86 @@ unpacks several GB** and takes roughly 25 minutes; later builds are ~20 seconds.
 pio run                        # compile
 pio run -e esp32dev -t upload  # flash the speaker firmware
 pio device monitor             # serial log at 115200
-
-pio run -e testtone -t upload  # flash the diagnostic sine wave instead
 ```
 
-Then on your phone: Bluetooth settings → pair with **"ESP32 Speaker"** → play.
+Then on your phone: Bluetooth settings → pair with **"esp32-blue-spk"** → play.
+
+## Web dashboard and OTA updates
+
+The normal firmware includes a responsive management console for desktop and
+mobile. On its first boot it creates a WPA2 setup network:
+
+| Setting | First-boot value |
+|---------|------------------|
+| Wi-Fi network | `esp32-blue-spk-XXXXXX` (the suffix is unique to the board) |
+| Wi-Fi password | `speaker-setup` |
+| Dashboard address | `http://192.168.4.1/` |
+| Dashboard user | `admin` |
+| Dashboard password | `admin` |
+
+Connect to that network, open the address, sign in, then use **Wi-Fi → Scan
+networks** to join the speaker to your normal network. After it connects the
+console is available at the IP printed on the serial monitor (and shown in the
+dashboard). If saved credentials stop working, the setup network comes
+back after 15 seconds, so the speaker cannot be locked out by a router change.
+
+Change both default passwords under **Settings → Identity & access**. The
+dashboard uses authenticated HTTP on the local network; it is not intended to
+be port-forwarded or exposed directly to the internet. Wi-Fi credentials,
+dashboard password, and an optional GitHub token live in NVS on the device.
+
+The console provides:
+
+- live track metadata, progress, link state, memory, uptime, RSSI and OTA state;
+- play/pause, stop, previous/next, rewind/fast-forward, mute and absolute volume;
+- active-device disconnect plus a list of bonded devices that can be forgotten;
+- Wi-Fi scanning/provisioning, automatic recovery AP, hostname and AP controls;
+- every OLED screen, carousel, wake and brightness control;
+- browser clock sync, device identity, restart, and full factory reset;
+- firmware upload and background check/install from the latest GitHub Release.
+
+### Initial OTA migration
+
+This version targets the board's full 16 MB flash and uses two 6.25 MB A/B
+application slots plus 3.375 MB reserved filesystem space. The **first
+installation must be done over USB** so the 16 MB bootloader header and new
+partition table are flashed along with the application:
+
+```sh
+pio run -e esp32dev -t upload
+```
+
+After that, use **Updates → Upload firmware** with
+`.pio/build/esp32dev/firmware.bin`. Do not upload `firmware.factory.bin`; that
+combined image is only for a serial flash at address zero. An OTA write always
+targets the inactive slot and restarts only after `Update.end()` validates the
+complete ESP32 image.
+
+### GitHub Releases updater
+
+Under **Settings → GitHub Releases**, enter `owner/repository` and an asset
+pattern such as `*.bin` or `speaker-*.bin`. The updater ignores bootloader,
+partition-table, LittleFS and SPIFFS images. Publish the normal PlatformIO
+`firmware.bin` as a release asset, then use **Check GitHub** and **Install
+release**. Public repositories need no token; a fine-grained token can be saved
+for a private repository. GitHub API and release downloads are verified over
+TLS against DigiCert Global Root G2 (valid through 2038).
+
+Set the version reported by the dashboard in [src/app_config.h](src/app_config.h)
+for each release. A leading `v` in a GitHub tag is ignored during comparison.
+
+Wi-Fi and Bluetooth Classic share one radio. Ordinary dashboard polling is
+lightweight, but network scans and firmware downloads consume radio time; the
+console warns before installation and pauses playback when writing firmware.
 
 The serial monitor stays deliberately sparse — see the note about serial logging
 under Troubleshooting:
 
 ```
-=== ESP32 Bluetooth speaker ===
+=== esp32-blue-spk v2.0.0 ===
 [ui] SSD1306 128x32 at 0x3C, 400 kHz, 30 fps
 [clock] 2026-08-18 14:29:33 (build)
-Discoverable as "ESP32 Speaker" - pair from your phone.
+Discoverable as "esp32-blue-spk" - pair from your phone.
 Type 'help' for the serial commands (clock, screens).
 [bt] connected
 [bt] peer: Pixel 8
@@ -196,7 +262,12 @@ rounded box, bouncing around the panel so no pixel stays lit.
 
 ### Overlays
 
-Two things interrupt whatever is on screen:
+Three things interrupt whatever is on screen:
+
+- **System status.** Wi-Fi connection/setup details, the dashboard IP, network
+  scans, clock sync, restart/factory reset, and GitHub/browser firmware updates
+  take priority. Firmware check, download, upload and install state is visible
+  directly on the OLED, including a live percentage bar and success/error state.
 
 - **Volume.** Every AVRCP volume change takes the whole panel for 1.4 s: speaker
   icon, the percentage in 16 px digits, and a segmented bar.
@@ -258,10 +329,9 @@ animation degrades instead of the audio.
 
 ## The clock
 
-There is no RTC and no network in a Bluetooth speaker — Wi-Fi and Bluetooth share
-one 2.4 GHz radio, and running both while A2DP is streaming is exactly the kind of
-thing that makes audio stutter. So the time comes from whichever of these you set
-up, in this order of preference:
+There is no built-in RTC. The quickest accurate option is **Settings → Sync
+browser time** in the dashboard. The clock also works without a network and can
+come from whichever of these you set up, in this order of preference:
 
 **1. Nothing at all.** The clock is seeded from the build timestamp, so a fresh
 flash shows roughly the right time rather than 1 Jan 1970. It drifts, and it is
@@ -378,18 +448,7 @@ listening level 20 dB below full scale, every band would be a two-pixel stub.
 
 ## Troubleshooting noise ("heavy rain", crackle, static)
 
-First, **narrow it down** — flash the Bluetooth-free test tone:
-
-```sh
-pio run -e testtone -t upload
-pio device monitor
-```
-
-You should hear a steady, clean 440 Hz sine. The tone is fed to the analyser too,
-so this build doubles as a display self-test: the spectrum screen should show one
-steady spike and the scope a clean sine.
-
-**If the test tone is also noisy → it is hardware.** In order of likelihood:
+Start with the hardware path, in order of likelihood:
 
 1. **SCK is not tied to GND.** A floating SCK leaves the PCM5102A hunting for a
    master clock it will never see. This is the number-one cause and it sounds
@@ -403,9 +462,7 @@ steady spike and the scope a clean sine.
    is already loaded by the radio). A 100 µF cap across the DAC's VIN/GND helps.
 5. **XMT, FMT, FLT, DEMP floating.** Tie FMT/FLT/DEMP to GND and XMT to 3.3 V.
 
-**If the test tone is clean but Bluetooth is noisy → it is the stream.** The
-usual causes are already handled in this project, so if you regressed one of
-them, check:
+If the hardware path is sound but Bluetooth playback is noisy, check:
 
 - `-DCORE_DEBUG_LEVEL` above `1` in [platformio.ini](platformio.ini). Verbose IDF
   logging prints from inside the audio path and starves the I2S writer.
@@ -500,6 +557,8 @@ To make the ESP32 forget the paired phone, call
 | File | What is in it |
 |------|---------------|
 | [src/main.cpp](src/main.cpp) | A2DP sink, volume control, melodies, serial console |
+| [src/management.h](src/management.h) / [.cpp](src/management.cpp) | Wi-Fi, authenticated API, Bluetooth/media control, OTA and GitHub updater |
+| [src/web_assets.h](src/web_assets.h) | responsive dashboard source, gzip-embedded at build time |
 | [src/ui_config.h](src/ui_config.h) | every display, analyser and clock knob |
 | [src/player_state.h](src/player_state.h) / [.cpp](src/player_state.cpp) | the shared "what is playing" model (seqlock) |
 | [src/audio_probe.h](src/audio_probe.h) / [.cpp](src/audio_probe.cpp) | sample tap, FFT, bands, VU, waveform, beat |
@@ -521,9 +580,9 @@ To make the ESP32 forget the paired phone, call
   build of Arduino core 3.3.11 / IDF 5.5.5. The official `platformio/espressif32`
   platform never shipped a core 3.x release, and ESP32-A2DP ≥ 1.8.10 uses IDF 5
   symbols (e.g. `ESP_A2D_AUDIO_STATE_SUSPEND`) that do not exist on core 2.x.
-- `board_build.partitions = huge_app.csv` is required; the Bluetooth stack does
-  not fit in the default 1.2 MB app partition. With the display the app is about
-  1.28 MB of the 3 MB partition.
+- `board_upload.flash_size = 16MB` and `default_16MB.csv` provide two 6.25 MB
+  application slots and 3.375 MB of filesystem space. Dashboard assets are
+  gzip-compressed by `scripts/embed_web.py` before compile.
 - The FFT is written out in [src/audio_probe.cpp](src/audio_probe.cpp) rather
   than pulled from a library: it is 20 lines, and having the window, the banding
   and the scaling in one place is what makes the display look right.

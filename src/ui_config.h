@@ -131,9 +131,9 @@ static const float VIS_AGC_RELEASE_S = 3.0f;
 
 // ------------------------------------------------------------------ clock ----
 
-/// There is no RTC and no network in a Bluetooth speaker, so the clock is a
-/// software one. It is seeded at boot from the build timestamp (so it is never
-/// wildly wrong), and can be set exactly in three ways -- see soft_clock.h:
+/// There is no built-in RTC, so the clock is a software one. It is seeded at
+/// boot from the build timestamp (so it is never wildly wrong), and can be set
+/// exactly from the dashboard or the three sources below -- see soft_clock.h:
 ///
 ///   1. over the serial monitor:  time 2026-08-18 14:30:00
 ///   2. a DS3231 module on the same two I2C wires:  -DUSE_DS3231=1

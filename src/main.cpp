@@ -37,19 +37,19 @@
  * The display is optional: if nothing answers on the I2C bus the UI switches
  * itself off at boot and everything else behaves as it did before.
  *
- * Build -DTEST_TONE=1 (env:testtone) for a Bluetooth-free sine wave, to tell
- * hardware noise apart from Bluetooth noise.
  */
 
 #include "AudioTools.h"
+#include "app_config.h"
 #include "audio_probe.h"
+#include "management.h"
 #include "player_state.h"
 #include "soft_clock.h"
 #include "ui.h"
 #include "ui_config.h"
 
 // ---------------------------------------------------------------- config ----
-static const char *DEVICE_NAME = "ESP32 Speaker";
+static const char *DEVICE_NAME = APP_NAME;
 
 static const int PIN_I2S_BCLK = 26;
 static const int PIN_I2S_LRCK = 25;
@@ -167,60 +167,6 @@ static void poll_console() {
     Serial.printf("[console] unknown: %s (try 'help')\n", buf);
   }
 }
-
-#if TEST_TONE
-// ======================================================= diagnostic build ====
-// No Bluetooth, no radio, no decoder: just a synthesised 440 Hz sine pushed
-// into the same I2S pins with the same config. Everything that could make the
-// *Bluetooth* path noisy is compiled out, so whatever you hear here is the DAC,
-// the wiring, or the power supply.
-//
-// The tone is also fed to the analyser, which makes this build a display self
-// test as well: the spectrum screen should show one steady spike a third of the
-// way up the scale, and the scope a clean sine.
-
-SineWaveGenerator<int16_t> sine(8000);  // ~25% of full scale, no clipping
-GeneratedSoundStream<int16_t> sound(sine);
-
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("\n=== I2S test tone (no Bluetooth) ===");
-  Serial.println("Expect a steady, clean 440 Hz sine. Any rain/crackle you hear");
-  Serial.println("now is hardware: SCK not grounded, loose wires, or power.");
-
-  AudioLogger::instance().begin(Serial, AudioLogger::Warning);
-
-  ps_init(DEVICE_NAME);
-  audio_probe_init();
-  ui_set_headline("Test tone 440 Hz");
-  if (ui_begin()) {
-    soft_clock_begin();
-    ui_start();
-  }
-
-  auto cfg = make_i2s_config();
-  i2s.begin(cfg);
-
-  sine.begin(cfg, N_A4);  // 440.00 Hz
-}
-
-void loop() {
-  // Hand-rolled instead of StreamCopy, only so the same buffer can be shown to
-  // the analyser on its way past. 512 bytes is 128 frames, ~2.9 ms of audio.
-  static uint8_t block[512];
-  const size_t n = sound.readBytes(block, sizeof(block));
-  if (n >= 4) {
-    audio_probe_feed((const Frame *)block, (uint16_t)(n / 4));
-    i2s.write(block, n);
-  }
-
-  soft_clock_tick();
-  poll_console();
-}
-
-#else
-// ========================================================== normal build ====
 
 #include "BluetoothA2DPSink.h"
 
@@ -527,7 +473,7 @@ static void log_state_changes() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== ESP32 Bluetooth speaker ===");
+  Serial.printf("\n=== %s v%s ===\n", APP_NAME, FW_VERSION);
 
   pinMode(PIN_STATUS_LED, OUTPUT);
   digitalWrite(PIN_STATUS_LED, LOW);
@@ -536,6 +482,7 @@ void setup() {
 
   // The shared state and the analyser have to exist before anything can write
   // to them, which for the analyser means before the first audio packet.
+  DEVICE_NAME = management_device_name(DEVICE_NAME);
   ps_init(DEVICE_NAME);
   audio_probe_init();
 
@@ -547,6 +494,11 @@ void setup() {
   // itself -- Wi-Fi and Bluetooth Classic share one antenna, and overlapping
   // them is how you get dropouts.
   soft_clock_begin();
+
+  // Wi-Fi is brought up before Bluetooth starts so the shared radio is never
+  // reconfigured in the middle of an A2DP stream. Connection is asynchronous;
+  // an unreachable network falls back to the setup AP after 15 seconds.
+  management_begin(a2dp_sink);
 
   auto cfg = make_i2s_config();
   i2s.begin(cfg);
@@ -606,8 +558,7 @@ void loop() {
   update_status_led();
   log_state_changes();
   soft_clock_tick();
+  management_loop();
   poll_console();
   delay(10);
 }
-
-#endif  // TEST_TONE
