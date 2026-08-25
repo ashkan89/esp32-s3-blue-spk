@@ -8,15 +8,19 @@
 #include <NetworkClientSecure.h>
 #include <Preferences.h>
 #include <Update.h>
+#include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp_gap_bt_api.h>
 #include <esp_ota_ops.h>
+#include <nvs_flash.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 
 #include "BluetoothA2DPSink.h"
 #include "player_state.h"
 #include "soft_clock.h"
+#include "status_led.h"
 #include "ui.h"
 #include "web_assets_gzip.h"
 
@@ -58,6 +62,25 @@ bool apRunning;
 bool announcedIp;
 uint32_t wifiStartedAt;
 uint32_t rebootAt;
+uint32_t updatePhaseAt;  // when updateState.phase last changed
+// Deliberate station retries while the setup AP is up. See startAccessPoint()
+// for why the core's own auto-reconnect cannot be left switched on.
+uint32_t staRetryAt;
+uint32_t staRetryStartedAt;
+constexpr uint32_t STA_RETRY_PERIOD_MS = 120000;
+constexpr uint32_t STA_RETRY_WINDOW_MS = 15000;
+// How long the saved network gets before the recovery access point is raised.
+// A cold boot brings up Wi-Fi, Bluetooth and DHCP at once; 15 s was short
+// enough that a merely slow router looked like a dead one, and raising the AP
+// parks the station and quiets Bluetooth, so a wrong call here is expensive.
+constexpr uint32_t FIRST_CONNECT_GRACE_MS = 30000;
+constexpr uint16_t AP_BEACON_INTERVAL_MS = 300;
+
+bool btActive;
+uint8_t apClients;
+// Which radio owns the antenna this boot. Persisted, so a power cut brings the
+// speaker back doing whatever it was doing.
+RadioMode radioMode = RADIO_MODE_MANAGEMENT;
 uint8_t mutedFrom = 80;
 bool browserUploadAccepted;
 bool browserUploadOk;
@@ -91,6 +114,8 @@ Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
 pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
 MrY=
 -----END CERTIFICATE-----)CERT";
+
+void startResponder();  // defined with the other web plumbing, below
 
 String cleanHostname(String value) {
   value.trim();
@@ -155,13 +180,6 @@ bool authenticated() {
   return server.authenticate("admin", settings.adminPassword.c_str());
 }
 
-bool requireAuth() {
-  if (authenticated()) return true;
-  server.sendHeader("Cache-Control", "no-store");
-  server.requestAuthentication(BASIC_AUTH, APP_NAME, "Sign in required");
-  return false;
-}
-
 template <typename T>
 void sendJson(const T &doc, int code = 200) {
   String body;
@@ -175,6 +193,18 @@ void sendError(int code, const String &message) {
   doc["ok"] = false;
   doc["error"] = message;
   sendJson(doc, code);
+}
+
+// A plain 401, deliberately without a WWW-Authenticate challenge.
+//
+// The dashboard has its own sign-in modal and sends the Basic header itself.
+// Adding the challenge makes the browser stack its native password dialog on
+// top of ours for the same request, and cancelling that dialog reads as a
+// failed login -- "admin does not work, it just asks again".
+bool requireAuth() {
+  if (authenticated()) return true;
+  sendError(401, "Sign in required");
+  return false;
 }
 
 bool readBody(JsonDocument &doc) {
@@ -220,6 +250,7 @@ bool parseMac(const String &text, esp_bd_addr_t out) {
 void updateSet(const char *phase, const char *message, bool busy) {
   bool available;
   char tag[40];
+  updatePhaseAt = millis();
   portENTER_CRITICAL(&updateMux);
   strlcpy(updateState.phase, phase, sizeof(updateState.phase));
   strlcpy(updateState.message, message, sizeof(updateState.message));
@@ -472,18 +503,175 @@ bool startGithubJob(bool install) {
   return true;
 }
 
+// Where a failed join actually fails.
+//
+// "Cannot connect to this network" is all a phone will tell you, and the three
+// causes look identical from the outside. These events separate them:
+//   nothing logged at all      -> association never completed. The radio was
+//                                 off channel or too busy (see the setup window
+//                                 below), or the client is out of range.
+//   joined then left, reason 15 -> WPA2 four-way handshake timed out. Wrong
+//                                 password, or the AP could not answer in time.
+//   joined but no lease         -> the DHCP server could not allocate. Look at
+//                                 the free-heap figure logged at AP start.
+void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_AP_STACONNECTED: {
+      const uint8_t *m = info.wifi_ap_staconnected.mac;
+      apClients = WiFi.softAPgetStationNum();
+      status_led_blip(2);
+      Serial.printf("[ap] joined %s (aid %u, %u client%s)\n",
+                    macString(m).c_str(), info.wifi_ap_staconnected.aid,
+                    apClients, apClients == 1 ? "" : "s");
+      break;
+    }
+    case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED: {
+      const uint8_t *m = info.wifi_ap_stadisconnected.mac;
+      apClients = WiFi.softAPgetStationNum();
+      Serial.printf("[ap] left %s (reason %u, %u client%s)\n",
+                    macString(m).c_str(), info.wifi_ap_stadisconnected.reason,
+                    apClients, apClients == 1 ? "" : "s");
+      break;
+    }
+    // Station side. WIFI_REASON_BEACON_TIMEOUT (200) or NO_AP_FOUND (201)
+    // after a working connection means the radio lost the router rather than
+    // the credentials being wrong; AUTH_FAIL (202) / 4WAY_HANDSHAKE_TIMEOUT
+    // (15) means they are.
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.printf("[sta] associated with %s on channel %u\n",
+                    settings.ssid.c_str(),
+                    info.wifi_sta_connected.channel);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+      const uint8_t reason = info.wifi_sta_disconnected.reason;
+      Serial.printf("[sta] disconnected: %s (%u)\n",
+                    WiFi.disconnectReasonName((wifi_err_reason_t)reason),
+                    reason);
+      break;
+    }
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("[sta] address %s\n",
+                    IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
+      break;
+    case ARDUINO_EVENT_WIFI_STA_LOST_IP:
+      Serial.println("[sta] lost the DHCP lease");
+      break;
+    case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
+      Serial.printf("[ap] lease %s\n",
+                    IPAddress(info.wifi_ap_staipassigned.ip.addr).toString().c_str());
+      break;
+    default:
+      break;
+  }
+}
+
+// Stop the station half from stealing the radio.
+//
+// The ESP32 has one transceiver on one channel. In AP_STA the SoftAP is dragged
+// along wherever the station goes, and the Arduino core retries a failed
+// station connection forever: STA.cpp's disconnect handler fires
+// disconnect() + connect() on every failure, and each connect() sweeps the
+// band. During those sweeps the SoftAP is off channel, so a client that saw the
+// beacon gets no reply to its authentication or association frame and gives up.
+// The channel argument to softAP() cannot help: the station half decides the
+// channel.
+void parkStation() {
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+  staRetryStartedAt = 0;
+  staRetryAt = millis() + STA_RETRY_PERIOD_MS;
+}
+
 void startAccessPoint() {
   if (apRunning) return;
-  apName = defaultApName();
-  apRunning = WiFi.softAP(apName.c_str(), settings.apPassword.c_str());
-  if (apRunning) {
-    const String oled = apName + " / " + settings.apPassword + " / " +
-                        WiFi.softAPIP().toString();
-    ui_show_system_status(UI_STATUS_NETWORK, "Setup Wi-Fi", oled.c_str(), -1,
-                          12000);
-    Serial.printf("[web] setup AP: %s / %s -> http://%s\n", apName.c_str(),
-                  settings.apPassword.c_str(), WiFi.softAPIP().toString().c_str());
+
+  // AP_STA is only worth its cost when the station is actually associated --
+  // then the channel is settled and the AP simply shares it. Any other time the
+  // setup AP is the interface people need to reach, so give it the radio alone.
+  const bool stationUp = WiFi.status() == WL_CONNECTED;
+  if (stationUp) {
+    WiFi.mode(WIFI_AP_STA);
+  } else {
+    parkStation();
+    WiFi.mode(WIFI_AP);
   }
+
+  apName = defaultApName();
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1),
+                    IPAddress(255, 255, 255, 0));
+  // 20 MHz only. HT40 in the 2.4 GHz band buys nothing for a config page and is
+  // a known way to lose clients that will not associate to a 40 MHz AP.
+  WiFi.softAPbandwidth(WIFI_BW_HT20);
+  apRunning = WiFi.softAP(apName.c_str(), settings.apPassword.c_str(), 1, 0, 4);
+
+  if (!apRunning) {
+    Serial.printf("[web] setup AP failed to start (heap %u)\n",
+                  (unsigned)ESP.getFreeHeap());
+    return;
+  }
+
+  apClients = 0;
+  // 300 ms beacons instead of the 100 ms default. A config page does not need
+  // to be discovered three times a second, and the two thirds of beacon airtime
+  // this gives back is airtime Bluetooth can use -- the difference between an
+  // access point that coexists with A2DP and one that fights it.
+  wifi_config_t apConf;
+  if (esp_wifi_get_config(WIFI_IF_AP, &apConf) == ESP_OK) {
+    apConf.ap.beacon_interval = AP_BEACON_INTERVAL_MS;
+    esp_wifi_set_config(WIFI_IF_AP, &apConf);
+  }
+  startResponder();  // http://<hostname>.local works on the setup network too
+  const String oled = apName + " / " + settings.apPassword + " / " +
+                      WiFi.softAPIP().toString();
+  ui_show_system_status(UI_STATUS_NETWORK, "Setup Wi-Fi", oled.c_str(), -1,
+                        12000);
+  Serial.printf("[web] setup AP: %s / %s -> http://%s (ch %d, heap %u)\n",
+                apName.c_str(), settings.apPassword.c_str(),
+                WiFi.softAPIP().toString().c_str(), WiFi.channel(),
+                (unsigned)ESP.getFreeHeap());
+}
+
+// The recovery access point has done its job once the station is back. Leaving
+// it up costs a permanent AP_STA mode, a degraded access point nobody can join
+// while Bluetooth runs, and a second network for the user to trip over.
+void stopAccessPoint(const char *why) {
+  if (!apRunning) return;
+  apRunning = false;
+  apClients = 0;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  Serial.printf("[web] setup AP stopped (%s)\n", why);
+}
+
+// Periodic, deliberate station retry while the setup AP is serving. Auto
+// reconnect stays off; one attempt every couple of minutes costs the AP a few
+// seconds off channel instead of making it permanently unreachable, and no
+// attempt is made at all while somebody is associated to the AP.
+void serviceStationRetry() {
+  if (!apRunning || !settings.ssid.length()) return;
+
+  if (staRetryStartedAt) {
+    if (WiFi.status() == WL_CONNECTED) {
+      staRetryStartedAt = 0;
+      return;
+    }
+    if (millis() - staRetryStartedAt > STA_RETRY_WINDOW_MS) {
+      staRetryStartedAt = 0;
+      WiFi.disconnect(false, false);
+      WiFi.mode(WIFI_AP);
+      staRetryAt = millis() + STA_RETRY_PERIOD_MS;
+    }
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (!staRetryAt || (int32_t)(millis() - staRetryAt) < 0) return;
+  staRetryAt = millis() + STA_RETRY_PERIOD_MS;
+  if (apClients) return;  // somebody is configuring; do not go off channel
+
+  staRetryStartedAt = millis();
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(settings.ssid.c_str(), settings.wifiPassword.c_str());
 }
 
 void handleStatus() {
@@ -520,8 +708,11 @@ void handleStatus() {
   wifi["apSsid"] = apRunning ? apName : "";
   wifi["apIp"] = apRunning ? WiFi.softAPIP().toString() : "";
   wifi["apClients"] = apRunning ? WiFi.softAPgetStationNum() : 0;
+  wifi["apChannel"] = apRunning ? WiFi.channel() : 0;
+  wifi["radioMode"] = management_mode_name(radioMode);
 
   JsonObject bt = doc["bluetooth"].to<JsonObject>();
+  bt["active"] = btActive;
   bt["connected"] = p.connected;
   bt["avrcp"] = p.avrc;
   bt["streaming"] = p.streaming;
@@ -556,6 +747,10 @@ void handleAuth() {
 
 void handleMedia() {
   if (!requireAuth()) return;
+  if (!btActive) {
+    sendError(409, "Bluetooth is off in Wi-Fi mode");
+    return;
+  }
   JsonDocument body;
   if (!readBody(body)) return;
   const String action = body["action"] | "";
@@ -598,6 +793,13 @@ void handleDevices() {
   JsonDocument doc;
   doc["ok"] = true;
   JsonArray devices = doc["devices"].to<JsonArray>();
+  // Bluedroid is not running in Wi-Fi mode, so there is nothing to enumerate
+  // and its API would fail anyway. Answer honestly rather than erroring.
+  if (!btActive) {
+    doc["unavailable"] = "Bluetooth is off in Wi-Fi mode";
+    sendJson(doc);
+    return;
+  }
   const int count = esp_bt_gap_get_bond_device_num();
   if (count > 0) {
     esp_bd_addr_t *list = (esp_bd_addr_t *)malloc((size_t)count * sizeof(esp_bd_addr_t));
@@ -621,6 +823,10 @@ void handleDevices() {
 
 void handleDeviceAction() {
   if (!requireAuth()) return;
+  if (!btActive) {
+    sendError(409, "Bluetooth is off in Wi-Fi mode");
+    return;
+  }
   JsonDocument body;
   if (!readBody(body)) return;
   const String action = body["action"] | "";
@@ -884,6 +1090,39 @@ void handleUploadChunk() {
   }
 }
 
+// Wipes settings and Bluetooth bonds. Shared by the dashboard action and the
+// BOOT-button hold, so the two can never drift apart. The caller reboots.
+void factoryReset() {
+  prefs.clear();
+
+  // Bonds belong to Bluedroid, which is only running in Bluetooth mode. Ask it
+  // nicely when it is there...
+  if (btActive) {
+    const int count = esp_bt_gap_get_bond_device_num();
+    if (count > 0) {
+      esp_bd_addr_t *list =
+          (esp_bd_addr_t *)malloc((size_t)count * sizeof(esp_bd_addr_t));
+      if (list) {
+        int actual = count;
+        if (esp_bt_gap_get_bond_device_list(&actual, list) == ESP_OK) {
+          for (int i = 0; i < actual; ++i) esp_bt_gap_remove_bond_device(list[i]);
+        }
+        free(list);
+      }
+    }
+  }
+
+  // ...and either way wipe the whole NVS partition, which is where Bluedroid
+  // keeps them. A reset done from Wi-Fi mode would otherwise leave every
+  // pairing behind, and "factory reset" has to mean it whichever mode you are
+  // standing in. The caller reboots immediately; the partition reformats itself
+  // on the next boot.
+  prefs.end();
+  const esp_err_t err = nvs_flash_erase();
+  Serial.printf("[web] factory reset: settings cleared, nvs erase %s\n",
+                esp_err_to_name(err));
+}
+
 void handleSystem() {
   if (!requireAuth()) return;
   JsonDocument body;
@@ -896,19 +1135,18 @@ void handleSystem() {
     sendJson(reply);
     ui_show_system_status(UI_STATUS_RESTART, "Restarting", "Please wait", -1, 0);
     rebootAt = millis() + 700;
+  } else if (action == "startBluetooth") {
+    // Switching modes shuts Wi-Fi down, so answer before the reboot lands.
+    JsonDocument reply;
+    reply["ok"] = true;
+    reply["message"] = "Switching to Bluetooth mode; Wi-Fi and this dashboard "
+                       "go away. Hold BOOT on the speaker to come back.";
+    sendJson(reply);
+    server.client().flush();
+    delay(150);
+    management_switch_mode(RADIO_MODE_BLUETOOTH);  // does not return
   } else if (action == "factoryReset") {
-    prefs.clear();
-    const int count = esp_bt_gap_get_bond_device_num();
-    if (count > 0) {
-      esp_bd_addr_t *list = (esp_bd_addr_t *)malloc((size_t)count * sizeof(esp_bd_addr_t));
-      if (list) {
-        int actual = count;
-        if (esp_bt_gap_get_bond_device_list(&actual, list) == ESP_OK) {
-          for (int i = 0; i < actual; ++i) esp_bt_gap_remove_bond_device(list[i]);
-        }
-        free(list);
-      }
-    }
+    factoryReset();
     JsonDocument reply;
     reply["ok"] = true;
     reply["message"] = "Settings and Bluetooth bonds cleared; restarting";
@@ -919,6 +1157,20 @@ void handleSystem() {
   } else {
     sendError(400, "Unknown system action");
   }
+}
+
+// http://<hostname>.local/ so the dashboard can be reached without hunting for
+// the DHCP lease. Started once the station has an address; harmless to call
+// again, MDNS.end() makes the restart idempotent.
+void startResponder() {
+  MDNS.end();
+  if (!MDNS.begin(settings.hostname.c_str())) {
+    Serial.println("[web] mDNS responder failed to start");
+    return;
+  }
+  MDNS.addService("http", "tcp", 80);
+  MDNS.addServiceTxt("http", "tcp", "path", "/");
+  MDNS.addServiceTxt("http", "tcp", "version", FW_VERSION);
 }
 
 void configureRoutes() {
@@ -963,23 +1215,105 @@ const char *management_device_name(const char *fallback) {
   return stableDeviceName.c_str();
 }
 
+RadioMode management_radio_mode() { return radioMode; }
+
+RadioMode management_other_mode() {
+  return radioMode == RADIO_MODE_BLUETOOTH ? RADIO_MODE_MANAGEMENT
+                                           : RADIO_MODE_BLUETOOTH;
+}
+
+const char *management_mode_name(RadioMode mode) {
+  return mode == RADIO_MODE_BLUETOOTH ? "Bluetooth" : "Wi-Fi";
+}
+
+void management_switch_mode(RadioMode mode) {
+  // Through a restart rather than by tearing one stack down and building the
+  // other up in place. Both stacks own controller state, DMA and tasks, and
+  // ESP32-A2DP's end() also forgets the last paired device; a reboot costs a
+  // second and guarantees each mode starts from a clean radio.
+  if (!stableDeviceName.length()) loadSettings(APP_NAME);
+  prefs.putUChar("radioMode", (uint8_t)mode);
+  Serial.printf("[mode] switching to %s mode\n", management_mode_name(mode));
+  ui_show_system_status(UI_STATUS_RESTART,
+                        mode == RADIO_MODE_BLUETOOTH ? "Bluetooth mode"
+                                                     : "Wi-Fi mode",
+                        "Restarting", -1, 0);
+  delay(700);  // let the panel land on the message
+  ESP.restart();
+}
+
+bool management_ap_running() { return apRunning; }
+
+void management_factory_reset() {
+  factoryReset();
+  ui_show_system_status(UI_STATUS_RESTART, "Factory reset",
+                        "Settings cleared", -1, 0);
+}
+
+void management_set_bt_active(bool active) { btActive = active; }
+
+bool management_led_state(StatusLedState *out) {
+  if (radioMode == RADIO_MODE_BLUETOOTH) return false;
+
+  const UpdateState u = updateSnapshot();
+  if (u.busy) {
+    *out = LED_UPDATING;
+    return true;
+  }
+  // Failures are worth shouting about, but not forever.
+  if (strcmp(u.phase, "error") == 0 && millis() - updatePhaseAt < 20000) {
+    *out = LED_FAULT;
+    return true;
+  }
+  // In Wi-Fi mode the LED is entirely the network's to talk about: Bluetooth
+  // has nothing to say because it is not running.
+  if (apRunning && WiFi.status() != WL_CONNECTED) {
+    *out = LED_SETUP_AP;
+    return true;
+  }
+  *out = WiFi.status() == WL_CONNECTED ? LED_IDLE : LED_WIFI_CONNECTING;
+  return true;
+}
+
 void management_begin(BluetoothA2DPSink &a2dp) {
   sink = &a2dp;
   if (!stableDeviceName.length()) loadSettings(APP_NAME);
+  radioMode = (RadioMode)prefs.getUChar("radioMode", RADIO_MODE_MANAGEMENT);
+  if (radioMode > RADIO_MODE_BLUETOOTH) radioMode = RADIO_MODE_MANAGEMENT;
+
+  if (radioMode == RADIO_MODE_BLUETOOTH) {
+    // Not one Wi-Fi call. Leaving the driver uninitialised is the point: the
+    // antenna, the coexistence scheduler and ~50 KB of heap all stay with the
+    // Bluetooth stack. main.cpp starts the sink.
+    Serial.println("[mode] Bluetooth mode: Wi-Fi is off. Hold BOOT to switch.");
+    return;
+  }
+
+  Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
   WiFi.persistent(false);
-  WiFi.setSleep(false);
   WiFi.setHostname(settings.hostname.c_str());
+  WiFi.onEvent(onWifiEvent);
+
+  // Leave Wi-Fi power save at its default. Nothing shares the antenna in this
+  // mode, but modem sleep costs nothing a dashboard would notice.
 
   if (settings.ssid.length()) {
-    WiFi.mode(settings.apAlways ? WIFI_AP_STA : WIFI_STA);
-    if (settings.apAlways) startAccessPoint();
+    // Station first and on its own, even when the AP is meant to stay up. The
+    // initial connect sweeps the band, and an AP raised before that finishes is
+    // dragged off channel with it -- clients see the SSID and then fail to
+    // associate. management_loop() raises the AP once the station has settled
+    // on a channel, or given up.
+    WiFi.mode(WIFI_STA);
+    // Adopt the router's regulatory domain from its beacons. Without 802.11d
+    // the station is stuck on the "01" world-safe channels and a router sitting
+    // on channel 12 or 13 shows up in a scan but can never be associated with.
+    esp_wifi_set_country_code("01", true);
     WiFi.begin(settings.ssid.c_str(), settings.wifiPassword.c_str());
     wifiStartedAt = millis();
     ui_show_system_status(UI_STATUS_NETWORK, "Connecting Wi-Fi",
                           settings.ssid.c_str(), -1, 0);
     Serial.printf("[web] connecting Wi-Fi: %s\n", settings.ssid.c_str());
   } else {
-    WiFi.mode(WIFI_AP);
     startAccessPoint();
   }
   configureRoutes();
@@ -987,24 +1321,47 @@ void management_begin(BluetoothA2DPSink &a2dp) {
 }
 
 void management_loop() {
+  if (radioMode == RADIO_MODE_BLUETOOTH) {
+    if (rebootAt && (int32_t)(millis() - rebootAt) >= 0) {
+      delay(50);
+      ESP.restart();
+    }
+    return;
+  }
+
   server.handleClient();
   if (WiFi.status() == WL_CONNECTED && !announcedIp) {
     announcedIp = true;
+    // parkStation() switched the core's own retry off to keep the access point
+    // on one channel. The station is home now, so hand normal reconnection back.
+    WiFi.setAutoReconnect(true);
+    staRetryStartedAt = 0;
+    if (!settings.apAlways && !apClients) stopAccessPoint("station connected");
     const String ip = WiFi.localIP().toString();
+    startResponder();
+    status_led_blip(2);
     ui_show_system_status(UI_STATUS_NETWORK, "Dashboard ready", ip.c_str(), -1,
                           6000);
-    Serial.printf("[web] dashboard: http://%s/ (hostname: %s)\n",
+    Serial.printf("[web] dashboard: http://%s/ or http://%s.local/\n",
                   ip.c_str(), settings.hostname.c_str());
   } else if (WiFi.status() != WL_CONNECTED && announcedIp) {
     announcedIp = false;
+    // Restart the grace period. Without this the stale boot timestamp makes any
+    // momentary drop raise the access point on the very next loop, which parks
+    // the station and stops it reconnecting on its own.
+    wifiStartedAt = millis();
     ui_show_system_status(UI_STATUS_NETWORK, "Wi-Fi disconnected",
-                          "Starting recovery", -1, 4000);
+                          "Reconnecting", -1, 4000);
   }
-  if (settings.ssid.length() && WiFi.status() != WL_CONNECTED && !apRunning &&
-      millis() - wifiStartedAt > 15000) {
-    WiFi.mode(WIFI_AP_STA);
+  // Raise the setup AP once the station has settled -- associated, if the AP is
+  // configured to stay up alongside it, or clearly failed. Never mid-scan.
+  if (settings.ssid.length() && !apRunning &&
+      ((settings.apAlways && WiFi.status() == WL_CONNECTED) ||
+       (WiFi.status() != WL_CONNECTED &&
+        millis() - wifiStartedAt > FIRST_CONNECT_GRACE_MS))) {
     startAccessPoint();
   }
+  serviceStationRetry();
   if (rebootAt && (int32_t)(millis() - rebootAt) >= 0) {
     delay(50);
     ESP.restart();

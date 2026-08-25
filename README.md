@@ -124,9 +124,95 @@ mobile. On its first boot it creates a WPA2 setup network:
 
 Connect to that network, open the address, sign in, then use **Wi-Fi → Scan
 networks** to join the speaker to your normal network. After it connects the
-console is available at the IP printed on the serial monitor (and shown in the
-dashboard). If saved credentials stop working, the setup network comes
-back after 15 seconds, so the speaker cannot be locked out by a router change.
+console is available at the IP printed on the serial monitor, at
+`http://esp32-blue-spk.local/`, and in the dashboard. If saved credentials stop
+working, the setup network comes back after 15 seconds, so the speaker cannot be
+locked out by a router change.
+
+### One radio, one job: Wi-Fi mode and Bluetooth mode
+
+This chip has a single 2.4 GHz front end shared by Wi-Fi and Bluetooth Classic.
+Espressif's coexistence scheduler covers Wi-Fi *station* plus Bluetooth; a
+SoftAP alongside an A2DP sink is **not** a supported combination, and in
+practice neither side works — the access point cannot be joined, and the sink is
+not reliably discoverable. Earlier versions tried to referee that contest with
+coexistence preferences, beacon tuning and a "quiet window". Choosing turned out
+to be better than refereeing.
+
+So the speaker does one thing at a time:
+
+| Mode | Wi-Fi | Bluetooth |
+|------|-------|-----------|
+| **Wi-Fi** | station if a network is configured, setup hotspot if not; dashboard and OTA available | not started at all |
+| **Bluetooth** | never initialised | A2DP sink owns the antenna |
+
+The mode is remembered across restarts, so a power cut brings the speaker back
+doing whatever it was doing. A factory-fresh board starts in Wi-Fi mode with the
+setup hotspot up, which is where configuration happens.
+
+**From the speaker:** hold BOOT for three seconds. The panel offers *Bluetooth
+mode?* (or *Wi-Fi mode?*); let go and press BOOT once within eight seconds to
+confirm. Ignore it and it goes away. On a board with no display, a three-second
+hold released before six seconds switches immediately — there is nothing to show
+an offer on, and a deliberate three-second hold is confirmation enough.
+
+**From the dashboard:** **Overview → Bluetooth → Switch to Bluetooth mode**.
+Wi-Fi shuts down and the page goes with it, so it asks first.
+
+**From the console:** `mode` toggles, `bt` and `wifi` go somewhere specific,
+`radio` prints where you are.
+
+Every switch goes through a restart. Both stacks own controller state, DMA
+channels and tasks, and ESP32-A2DP's `end()` also forgets the last paired
+device — a reboot costs about a second and guarantees each mode starts from a
+clean radio.
+
+In Wi-Fi mode the dashboard says so rather than pretending: the Bluetooth card
+reads *Wi-Fi mode*, the Devices page explains why the list is empty, and the
+media and device endpoints answer `409` instead of poking a stack that is not
+running. The OLED pairing screen reads *Wi-Fi mode — hold BOOT to switch*.
+
+**The Class of Device is set.** ESP32-A2DP never calls `esp_bt_gap_set_cod()`,
+so the sink inherited Bluedroid's default and phones listed it as a nondescript
+"other" device — a generic icon, and on some Android builds no offer to connect
+it for media at all. It now identifies as an Audio/Video loudspeaker with the
+rendering and audio service classes. This is written a couple of seconds *after*
+`a2dp_sink.start()`, not right after it: `start()` only queues the bring-up, and
+a class of device written before the profiles register gets overwritten — and
+writing it mid-init raced the scan-mode setup and left the speaker invisible.
+The same deferred pass re-asserts discoverability, and `pair` forces it by hand.
+
+### Diagnosing a failed join
+
+If a join still fails, the serial log now says where. `[ap] joined ...` means
+association worked; a following `[ap] left ... (reason 15)` is a WPA2 handshake
+timeout; `[ap] lease ...` means DHCP handed out an address and the client is
+really on. Nothing at all means the client never got as far as associating.
+
+The station side is logged the same way — `[sta] associated`, `[sta] address`,
+and `[sta] disconnected: <reason>`. `AUTH_FAIL` or `4WAY_HANDSHAKE_TIMEOUT`
+after a fresh save means the password is wrong; `BEACON_TIMEOUT` or
+`NO_AP_FOUND` after a working connection means the radio lost the router.
+
+### Station behaviour
+
+Wi-Fi power save is left at its default `WIFI_PS_MIN_MODEM`. It used to be
+turned off for a snappier dashboard, which was one of the causes of "the display
+shows an IP address but the router shows no client": with `WiFi.setSleep(false)`
+and an A2DP sink running, coexistence had no modem-sleep windows to hand the
+antenna over in, and the station associated, took a lease and then quietly
+missed beacons until the router aged it out. Bluetooth no longer runs alongside
+it, but the default costs nothing a dashboard would notice.
+
+The station enables 802.11d so it adopts the router's regulatory domain
+from its beacons. Without it the radio is stuck on the "01" world-safe channels
+and a router on channel 12 or 13 appears in a scan but can never be joined.
+
+The saved network gets 30 seconds to connect before the recovery access point is
+raised, and the same grace again after any later drop — raising the AP parks the
+station, so calling a slow router a dead one is expensive. Once the station is
+back, the recovery AP is torn down again (unless **Always keep setup hotspot
+on** is set, or somebody is still connected to it).
 
 Change both default passwords under **Settings → Identity & access**. The
 dashboard uses authenticated HTTP on the local network; it is not intended to
@@ -139,6 +225,7 @@ The console provides:
 - play/pause, stop, previous/next, rewind/fast-forward, mute and absolute volume;
 - active-device disconnect plus a list of bonded devices that can be forgotten;
 - Wi-Fi scanning/provisioning, automatic recovery AP, hostname and AP controls;
+- the mode switch between Wi-Fi and Bluetooth;
 - every OLED screen, carousel, wake and brightness control;
 - browser clock sync, device identity, restart, and full factory reset;
 - firmware upload and background check/install from the latest GitHub Release.
@@ -288,9 +375,21 @@ time.
 
 | Press | Action |
 |-------|--------|
-| short (< 600 ms) | next screen |
-| long (> 600 ms)  | pin the current screen / release it |
-| hold (> 2.5 s)   | brightness: low → mid → high |
+| short (< 600 ms) | next screen, or confirm a pending mode switch |
+| long (600 ms – 1.5 s) | pin the current screen / release it |
+| hold 1.5 s | brightness: low → mid → high |
+| hold 3 s | offer to switch radio mode — release, then press once to confirm |
+| hold 6 s | factory reset countdown — release to cancel |
+
+Keep holding past the mode offer and the panel starts a five-second countdown with a shrinking progress bar. Let go at any point and it says
+*Cancelled* and nothing happens. Hold it to zero and every setting, the
+dashboard password and every Bluetooth bond are wiped, then the speaker
+restarts. On a board built without a display the same hold works with the LED
+strobing instead of a countdown.
+
+The restart deliberately waits for you to let go of the button: GPIO0 is also
+the download-mode strap, and rebooting while it is held drops the chip into the
+ROM serial bootloader, where it looks bricked.
 
 Set `PIN_UI_BUTTON` to `-1` in [src/ui_config.h](src/ui_config.h) to disable it.
 
@@ -303,7 +402,34 @@ screen 0..6            hold one screen (0 now playing, 1 spectrum, 2 VU,
 auto                   resume the carousel
 bright 0..255          fix the contrast (0 = back to automatic)
 ui                     current screen, frame rate, style
+radio                  current mode and radio state
+mode                   switch mode (Wi-Fi <-> Bluetooth), reboots
+bt                     switch to Bluetooth mode, reboots
+wifi                   switch to Wi-Fi mode, reboots
+pair                   force Bluetooth discoverable again
 ```
+
+### The status LED
+
+The on-board LED (GPIO2 on most WROOM-32D devkits) is the only indicator the
+bare board has, so it carries a pattern per state rather than a single bit. Each
+pattern repeats every two seconds:
+
+| Pattern | Meaning |
+|---------|---------|
+| solid | booting, or audio is streaming |
+| almost solid, one short wink | a phone is connected but not playing |
+| one short flash | up and waiting — discoverable, or Wi-Fi connected and idle |
+| even 500 ms blink | joining the saved Wi-Fi network |
+| three quick blinks, then dark | the setup hotspot is open and waiting for you |
+| fast strobe | writing flash — do not remove power |
+| two double blinks | an update failed |
+
+Events are shown as a short burst of fast blinks over whatever pattern is
+running: two on a phone connecting or a Wi-Fi client joining, three on a
+disconnect, one on a track change. Override `PIN_STATUS_LED` or
+`STATUS_LED_ACTIVE_HIGH` from `build_flags` for boards that wire it differently.
+
 
 ### Where the display gets its data
 
@@ -557,8 +683,9 @@ To make the ESP32 forget the paired phone, call
 | File | What is in it |
 |------|---------------|
 | [src/main.cpp](src/main.cpp) | A2DP sink, volume control, melodies, serial console |
+| [src/status_led.h](src/status_led.h) / [.cpp](src/status_led.cpp) | the on-board LED: one blink pattern per state, plus event blips |
 | [src/management.h](src/management.h) / [.cpp](src/management.cpp) | Wi-Fi, authenticated API, Bluetooth/media control, OTA and GitHub updater |
-| [src/web_assets.h](src/web_assets.h) | responsive dashboard source, gzip-embedded at build time |
+| [src/web_assets.h](src/web_assets.h) | responsive dashboard source, gzip-embedded at build time; its `<script>` is syntax-checked by [scripts/embed_web.py](scripts/embed_web.py) before every build |
 | [src/ui_config.h](src/ui_config.h) | every display, analyser and clock knob |
 | [src/player_state.h](src/player_state.h) / [.cpp](src/player_state.cpp) | the shared "what is playing" model (seqlock) |
 | [src/audio_probe.h](src/audio_probe.h) / [.cpp](src/audio_probe.cpp) | sample tap, FFT, bands, VU, waveform, beat |

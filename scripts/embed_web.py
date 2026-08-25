@@ -7,7 +7,11 @@ The gzip timestamp is fixed, keeping firmware builds reproducible.
 
 from pathlib import Path
 import gzip
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 
 Import("env")  # type: ignore[name-defined]  # supplied by PlatformIO/SCons
 
@@ -21,7 +25,36 @@ html_match = re.search(r'R"DASH\((.*?)\)DASH";', source, re.DOTALL)
 if not icon_match or not html_match:
     raise RuntimeError("Could not find dashboard raw-string markers")
 
-payload = gzip.compress(html_match.group(1).encode("utf-8"), compresslevel=9, mtime=0)
+html = html_match.group(1)
+
+# The dashboard is one enormous minified line, so a broken string literal is
+# invisible on inspection and takes the whole <script> down with it -- the page
+# renders, nothing works, and the browser says only "Unexpected token". Check it
+# here, where the failure is a build error instead of a bricked dashboard.
+def check_script(source: str) -> None:
+    scripts = re.findall(r"<script>(.*?)</script>", source, re.DOTALL)
+    if not scripts:
+        return
+    node = shutil.which("node")
+    if node is None:
+        print("embed_web: node not found, skipping dashboard JS syntax check")
+        return
+    with tempfile.NamedTemporaryFile("w", suffix=".js", encoding="utf-8",
+                                     delete=False, newline="") as handle:
+        handle.write("\n".join(scripts))
+        temp = handle.name
+    try:
+        result = subprocess.run([node, "--check", temp], capture_output=True,
+                                text=True)
+    finally:
+        os.unlink(temp)
+    if result.returncode != 0:
+        raise RuntimeError("dashboard JavaScript does not parse:\n"
+                           + (result.stderr or result.stdout))
+
+check_script(html)
+
+payload = gzip.compress(html.encode("utf-8"), compresslevel=9, mtime=0)
 rows = []
 for offset in range(0, len(payload), 16):
     rows.append("  " + ", ".join(f"0x{byte:02x}" for byte in payload[offset:offset + 16]))

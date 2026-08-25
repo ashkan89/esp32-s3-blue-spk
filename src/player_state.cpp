@@ -160,6 +160,12 @@ void ps_set_avrc(bool up) {
   end_write();
 }
 
+void ps_set_bt_active(bool active) {
+  begin_write();
+  g_info.bt_active = active;
+  end_write();
+}
+
 void ps_set_streaming(bool on) {
   begin_write();
   g_info.streaming = on;

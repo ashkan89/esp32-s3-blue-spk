@@ -98,8 +98,28 @@ static const uint32_t UI_SLEEP_AFTER_MS = 300000;
 ///   hold        (> 2500 ms)  cycle brightness: low -> mid -> high
 static const int PIN_UI_BUTTON = 0;
 
+/// One button, escalating by how long you hold it. Each tier is far enough from
+/// the next to be told apart by feel:
+///
+///   release < 600 ms      next screen (or confirm a pending mode switch)
+///   release < 1.5 s       pin the current screen / release it
+///   held 1.5 s            brightness: low -> mid -> high
+///   held 3 s              offer to switch radio mode; release, then one short
+///                         press confirms it
+///   held 6 s              factory reset countdown, 5 s, release cancels
 static const uint16_t UI_BTN_LONG_MS = 600;
-static const uint16_t UI_BTN_HOLD_MS = 2500;
+static const uint16_t UI_BTN_HOLD_MS = 1500;
+static const uint16_t UI_BTN_MODE_MS = 3000;
+
+/// How long the "press again to confirm" offer stays on screen after you let
+/// go. Long enough to read it, short enough that a stray press later does not
+/// tip the speaker into the other mode.
+static const uint16_t UI_BTN_MODE_CONFIRM_MS = 8000;
+
+/// The factory reset countdown is deliberately long and loud: it throws away
+/// Wi-Fi credentials, the dashboard password and every Bluetooth bond.
+static const uint16_t UI_BTN_RESET_ARM_MS = 6000;
+static const uint16_t UI_BTN_RESET_COUNT_MS = 5000;
 
 // -------------------------------------------------------------- analyser ----
 

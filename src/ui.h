@@ -63,3 +63,13 @@ void ui_clear_system_status();
 /// Serial console: "next", "screen <n>", "auto", "bright <0-255>", "ui".
 /// Returns false if the line was not one of those.
 bool ui_command(const char *line);
+
+/// True once, when the BOOT button offer to change radio mode has been
+/// confirmed with a second press. Polled from loop().
+bool ui_take_mode_switch_request();
+
+/// True once, when the BOOT button has been held through the whole factory
+/// reset countdown. Polled from loop(); the caller does the wiping and the
+/// reboot, because GPIO0 is also the download-mode strap and restarting while
+/// it is still held leaves the chip in the serial bootloader.
+bool ui_take_factory_reset_request();

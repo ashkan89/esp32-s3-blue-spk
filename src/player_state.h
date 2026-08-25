@@ -63,6 +63,10 @@ struct PlayerInfo {
   char peer[PS_NAME_MAX];  ///< the phone's Bluetooth name, "" until it arrives
   esp_bd_addr_t peer_addr;
   bool connected;
+  /// The Bluetooth stack is actually running. False while the setup access
+  /// point holds the antenna: nothing can pair, and the screens should say so
+  /// rather than claiming to be discoverable.
+  bool bt_active;
   bool avrc;      ///< remote control channel up (no AVRC = no metadata at all)
   bool streaming; ///< A2DP audio state is STARTED
   PsPlayback playback;
@@ -89,6 +93,9 @@ uint32_t ps_position_ms(const PlayerInfo &s, uint32_t now_ms);
 
 // --- writers, Bluetooth task only -----------------------------------------
 void ps_set_connection(bool connected, const esp_bd_addr_t addr);
+
+/// Whether the Bluetooth stack is up at all. Written from setup()/loop().
+void ps_set_bt_active(bool active);
 void ps_set_peer_name(const char *name);
 void ps_set_avrc(bool up);
 void ps_set_streaming(bool on);

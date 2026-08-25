@@ -8,10 +8,12 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "audio_probe.h"
 #include "app_config.h"
+#include "management.h"
+#include "audio_probe.h"
 #include "player_state.h"
 #include "soft_clock.h"
+#include "status_led.h"
 #include "ui_assets.h"
 #include "ui_config.h"
 
@@ -129,6 +131,16 @@ static uint8_t trans_kind;
 static bool btn_down;
 static uint32_t btn_since;
 static bool btn_consumed;
+/// Factory reset countdown. btn_reset_shown is the digit currently on screen,
+/// 0xFF when the countdown is not running; btn_reset_request is handed to
+/// loop() exactly once via ui_take_factory_reset_request().
+static uint8_t btn_reset_shown = 0xFF;
+static bool btn_reset_fired;
+static bool btn_mode_offered;
+static volatile bool btn_reset_request;
+/// The radio-mode offer: non-zero while "press again to confirm" is on screen.
+static uint32_t btn_mode_until;
+static volatile bool btn_mode_request;
 
 // ---------------------------------------------------------------- waterfall --
 static uint8_t wf_fb[FB_BYTES];
@@ -652,7 +664,10 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
   static uint32_t network_at;
   if (now - network_at >= 2000 || network_at == 0) {
     network_at = now;
-    if (WiFi.status() == WL_CONNECTED) {
+    if (management_radio_mode() == RADIO_MODE_BLUETOOTH) {
+      // The Wi-Fi driver was never initialised in this mode; do not ask it.
+      strlcpy(network_line, "bluetooth mode  wifi off", sizeof(network_line));
+    } else if (WiFi.status() == WL_CONNECTED) {
       const IPAddress ip = WiFi.localIP();
       const String ssid = WiFi.SSID();
       snprintf(network_line, sizeof(network_line),
@@ -683,9 +698,12 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
    * hand side only, so it reads as "broadcasting" rather than "loading". Two
    * rings a half period apart keeps it continuous.
    */
+  PlayerInfo s;
+  ps_snapshot(&s);
+
   const int cx = 12, cy = 16;
   u8g2.drawXBMP(cx - 8, cy - 8, 16, 16, ICON_BT_BIG);
-  for (int k = 0; k < 2; k++) {
+  for (int k = 0; s.bt_active && k < 2; k++) {
     // now % 4096 rather than now: a float loses its fractional bits once the
     // millisecond count gets large, and the animation would start to stutter
     // after a few weeks of uptime.
@@ -703,10 +721,17 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   }
 
   u8g2.setFont(FONT_TITLE);
-  u8g2.drawUTF8(32, 11, "Ready to pair");
+  // In Wi-Fi mode the Bluetooth stack is not running at all, so do not claim to
+  // be pairable -- this screen is the first place anyone looks.
+  u8g2.drawUTF8(32, 11, s.bt_active ? "Ready to pair" : "Wi-Fi mode");
 
   u8g2.setFont(FONT_TEXT);
-  draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
+  if (s.bt_active) {
+    draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
+  } else {
+    draw_marquee(MQ_NAME, 32, 21, W - 32,
+                 "Bluetooth off - hold BOOT to switch", dt);
+  }
 
   struct tm t;
   soft_clock_now(&t);
@@ -1046,6 +1071,17 @@ static void detect_events(const PlayerInfo &info, uint32_t now) {
   }
 }
 
+/*
+ * One button, four tiers, longest wins:
+ *
+ *   < 600 ms          next screen
+ *   600 ms - 2.5 s    pin the current screen / release it
+ *   2.5 s             brightness step
+ *   3 s .. 8 s        factory reset countdown -- release cancels
+ *
+ * The countdown owns the panel while it runs so there is no way to trigger a
+ * reset without watching it happen, and it clears itself on release.
+ */
 static void poll_button(uint32_t now) {
   if (PIN_UI_BUTTON < 0) return;
   const bool down = digitalRead(PIN_UI_BUTTON) == LOW;
@@ -1054,6 +1090,9 @@ static void poll_button(uint32_t now) {
     btn_down = true;
     btn_since = now;
     btn_consumed = false;
+    btn_reset_shown = 0xFF;
+    btn_reset_fired = false;
+    btn_mode_offered = false;
     return;
   }
 
@@ -1066,11 +1105,73 @@ static void poll_button(uint32_t now) {
     return;
   }
 
+  // Keep holding and the speaker offers to swap which radio is running. The
+  // offer is only made here; it is confirmed by a separate short press below,
+  // so a pocket cannot toggle the mode on its own.
+  if (down && !btn_mode_offered && now - btn_since >= UI_BTN_MODE_MS) {
+    btn_mode_offered = true;
+    btn_mode_until = now + UI_BTN_MODE_CONFIRM_MS;
+    char title[24];
+    snprintf(title, sizeof(title), "%s mode?",
+             management_mode_name(management_other_mode()));
+    ui_show_system_status(UI_STATUS_NETWORK, title, "Let go, then press BOOT",
+                          -1, UI_BTN_MODE_CONFIRM_MS);
+    status_led_blip(2);
+    last_activity_ms = now;
+    return;
+  }
+
+  if (down && now - btn_since >= UI_BTN_RESET_ARM_MS) {
+    const uint32_t into = now - btn_since - UI_BTN_RESET_ARM_MS;
+    if (into >= UI_BTN_RESET_COUNT_MS) {
+      if (!btn_reset_fired) {
+        btn_reset_fired = true;
+        btn_reset_request = true;
+        ui_show_system_status(UI_STATUS_RESTART, "Factory reset",
+                              "Release the button", 100, 0);
+      }
+      return;
+    }
+    // One redraw per second rather than per frame, so the digit is readable and
+    // the LED blip marks each tick.
+    const uint8_t left = (uint8_t)((UI_BTN_RESET_COUNT_MS - into + 999) / 1000);
+    if (left != btn_reset_shown) {
+      btn_reset_shown = left;
+      char detail[32];
+      snprintf(detail, sizeof(detail), "Release to cancel  %u", left);
+      ui_show_system_status(UI_STATUS_ERROR, "Factory reset", detail,
+                            (int16_t)(100 - into * 100 / UI_BTN_RESET_COUNT_MS),
+                            0);
+      status_led_blip(1);
+    }
+    last_activity_ms = now;
+    return;
+  }
+
   if (!down && btn_down) {
     btn_down = false;
     const uint32_t held = now - btn_since;
     last_activity_ms = now;
+    if (btn_reset_shown != 0xFF && !btn_reset_fired) {
+      btn_reset_shown = 0xFF;
+      ui_show_system_status(UI_STATUS_SUCCESS, "Factory reset",
+                            "Cancelled", -1, 2000);
+      return;
+    }
+    btn_reset_shown = 0xFF;
     if (btn_consumed) return;
+
+    // A short press while the offer stands is the confirmation.
+    if (held < UI_BTN_LONG_MS && held > 25 && btn_mode_until &&
+        (int32_t)(now - btn_mode_until) < 0) {
+      btn_mode_until = 0;
+      btn_mode_request = true;
+      ui_show_system_status(UI_STATUS_RESTART, "Switching mode", "Restarting",
+                            -1, 0);
+      return;
+    }
+    btn_mode_until = 0;
+
     if (held >= UI_BTN_LONG_MS) {
       carousel_paused = !carousel_paused;
     } else if (held > 25) {  // anything shorter is contact bounce
@@ -1285,6 +1386,18 @@ void ui_clear_system_status() {
   portENTER_CRITICAL(&system_overlay_mux);
   system_overlay.active = false;
   portEXIT_CRITICAL(&system_overlay_mux);
+}
+
+bool ui_take_mode_switch_request() {
+  if (!btn_mode_request) return false;
+  btn_mode_request = false;
+  return true;
+}
+
+bool ui_take_factory_reset_request() {
+  if (!btn_reset_request) return false;
+  btn_reset_request = false;
+  return true;
 }
 
 bool ui_command(const char *line) {

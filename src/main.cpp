@@ -39,12 +39,16 @@
  *
  */
 
+#include <WiFi.h>
+#include <esp_gap_bt_api.h>
+
 #include "AudioTools.h"
 #include "app_config.h"
 #include "audio_probe.h"
 #include "management.h"
 #include "player_state.h"
 #include "soft_clock.h"
+#include "status_led.h"
 #include "ui.h"
 #include "ui_config.h"
 
@@ -55,7 +59,20 @@ static const int PIN_I2S_BCLK = 26;
 static const int PIN_I2S_LRCK = 25;
 static const int PIN_I2S_DOUT = 22;
 
-static const int PIN_STATUS_LED = 2;  // on-board LED of most WROOM-32D devkits
+// The on-board LED of most WROOM-32D devkits. It is the only indicator this
+// board has, so status_led.h drives it as a real one: a distinct blink pattern
+// per state, plus one-shot blips for events. Override either from build_flags
+// if your board wires the LED the other way round or brings it out elsewhere.
+#ifndef PIN_STATUS_LED
+#define PIN_STATUS_LED 2
+#endif
+#ifndef STATUS_LED_ACTIVE_HIGH
+#define STATUS_LED_ACTIVE_HIGH 1
+#endif
+
+// Bluetooth "Audio/Video" minor device class 0x05, Loudspeaker. The IDF header
+// only names the major classes, so this one is spelled out.
+static const uint8_t BT_COD_MINOR_LOUDSPEAKER = 0x05;
 
 static const int SAMPLE_RATE = 44100;  // A2DP/SBC is 44.1 kHz in practice
 
@@ -139,8 +156,16 @@ static void print_help() {
       "  auto                      resume the screen carousel\n"
       "  bright 0..255             fix the contrast (0 = automatic)\n"
       "  ui                        display status\n"
+      "  radio                     current mode and radio state\n"
+      "  mode                      switch mode (Wi-Fi <-> Bluetooth), reboots\n"
+      "  bt                        switch to Bluetooth mode, reboots\n"
+      "  wifi                      switch to Wi-Fi mode, reboots\n"
+      "  pair                      force Bluetooth discoverable again\n"
       "  help"));
 }
+
+// Defined below, once the Bluetooth sink exists.
+static bool radio_command(const char *line);
 
 static void poll_console() {
   static char buf[64];
@@ -160,6 +185,7 @@ static void poll_console() {
     ui_wake();
     if (soft_clock_command(buf)) continue;
     if (ui_command(buf)) continue;
+    if (radio_command(buf)) continue;
     if (strcmp(buf, "help") == 0 || strcmp(buf, "?") == 0) {
       print_help();
       continue;
@@ -291,6 +317,11 @@ enum MelodyId : uint8_t {
 // Written from the Bluetooth task, read from loop().
 static volatile uint8_t pending_melody = MELODY_NONE;
 
+// The sink is started from loop(), not setup(): see service_bluetooth_start().
+static bool bt_started;
+static uint32_t bt_started_at;
+static bool bt_identity_applied;
+
 static const uint32_t TONE_CHUNK_FRAMES = 128;
 
 static void play_note(const Note &note) {
@@ -334,6 +365,8 @@ static void play_note(const Note &note) {
     // makes the connect animation move in time with the sound.
     audio_probe_feed((const Frame *)frames, (uint16_t)n);
     i2s.write((const uint8_t *)frames, n * 4);  // blocks until the DMA takes it
+    // loop() is stalled for the length of the melody; keep the indicator alive.
+    status_led_tick();
     done += n;
   }
 }
@@ -384,12 +417,12 @@ static void service_melody() {
 void on_connection_state_changed(esp_a2d_connection_state_t state, void *) {
   switch (state) {
     case ESP_A2D_CONNECTION_STATE_CONNECTED:
-      digitalWrite(PIN_STATUS_LED, HIGH);
+      status_led_blip(2);
       ps_set_connection(true, *a2dp_sink.get_current_peer_address());
       pending_melody = MELODY_ID_CONNECT;
       break;
     case ESP_A2D_CONNECTION_STATE_DISCONNECTED:
-      digitalWrite(PIN_STATUS_LED, LOW);
+      status_led_blip(3);
       ps_set_connection(false, nullptr);
       pending_melody = MELODY_ID_DISCONNECT;
       break;
@@ -425,18 +458,89 @@ void on_avrc_playstatus(esp_avrc_playback_stat_t playback) {
 /// bar interpolates between these.
 void on_avrc_play_pos(uint32_t pos_ms) { ps_set_position(pos_ms); }
 
-void on_avrc_track_change(uint8_t *) { ps_new_track(); }
+void on_avrc_track_change(uint8_t *) {
+  ps_new_track();
+  status_led_blip(1);
+}
 
 void on_peer_name(char *name) { ps_set_peer_name(name); }
 
 void on_sample_rate(uint16_t rate) { ps_set_sample_rate(rate); }
 
-/// Solid while a phone is connected, a short flash every 2 s while waiting.
-/// Timed off millis() rather than delay() so a queued melody starts promptly.
+/// Chooses the resting blink pattern. The network and update layer gets first
+/// refusal -- an access point waiting to be configured or an OTA write in
+/// progress matters more than what Bluetooth is doing -- and Bluetooth fills in
+/// the rest. status_led_tick() does the actual blinking, off millis().
 static void update_status_led() {
-  const bool connected = a2dp_sink.is_connected();
-  digitalWrite(PIN_STATUS_LED,
-               connected ? HIGH : (millis() % 2000 < 60 ? HIGH : LOW));
+  StatusLedState state;
+  if (!management_led_state(&state)) {
+    if (!bt_started) {
+      state = LED_BOOT;
+    } else if (a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) {
+      state = LED_BT_STREAMING;
+    } else if (a2dp_sink.is_connected()) {
+      state = LED_BT_CONNECTED;
+    } else {
+      state = LED_IDLE;
+    }
+  }
+  status_led_state(state);
+  status_led_tick();
+}
+
+/// Radio state and the mode switch, from the serial console. Handy precisely
+/// when the access point is unreachable and the dashboard therefore is too.
+static bool radio_command(const char *line) {
+  if (strcmp(line, "radio") == 0) {
+    Serial.printf("[radio] mode %s",
+                  management_mode_name(management_radio_mode()));
+    if (management_radio_mode() == RADIO_MODE_MANAGEMENT) {
+      const bool sta = WiFi.status() == WL_CONNECTED;
+      Serial.printf(" | wifi %s", sta ? WiFi.SSID().c_str() : "disconnected");
+      if (sta) {
+        Serial.printf(" %s rssi %d", WiFi.localIP().toString().c_str(),
+                      (int)WiFi.RSSI());
+      }
+      Serial.printf(" | ap %s", management_ap_running() ? "up" : "down");
+      if (management_ap_running()) {
+        Serial.printf(" %s ch %d clients %u", WiFi.softAPIP().toString().c_str(),
+                      WiFi.channel(), WiFi.softAPgetStationNum());
+      }
+    } else {
+      Serial.printf(" | bt %s", !bt_started                ? "starting"
+                                : a2dp_sink.is_connected() ? "connected"
+                                : bt_identity_applied      ? "discoverable"
+                                                           : "starting");
+    }
+    Serial.printf(" | heap %u\n", (unsigned)ESP.getFreeHeap());
+    return true;
+  }
+  if (strcmp(line, "mode") == 0) {
+    management_switch_mode(management_other_mode());  // does not return
+    return true;
+  }
+  if (strcmp(line, "bt") == 0) {
+    management_switch_mode(RADIO_MODE_BLUETOOTH);  // does not return
+    return true;
+  }
+  if (strcmp(line, "wifi") == 0) {
+    management_switch_mode(RADIO_MODE_MANAGEMENT);  // does not return
+    return true;
+  }
+  if (strcmp(line, "pair") == 0) {
+    if (management_radio_mode() != RADIO_MODE_BLUETOOTH) {
+      Serial.println("[bt] Wi-Fi mode; type 'bt' to switch to Bluetooth mode");
+    } else if (!bt_started) {
+      Serial.println("[bt] still starting");
+    } else if (a2dp_sink.is_connected()) {
+      Serial.println("[bt] a phone is already connected; disconnect it first");
+    } else {
+      a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+      Serial.println("[bt] discoverable now");
+    }
+    return true;
+  }
+  return false;
 }
 
 /// The serial log the README documents. Driven from loop() by watching the
@@ -470,13 +574,141 @@ static void log_state_changes() {
   }
 }
 
+/// Completes a factory reset the BOOT button asked for.
+///
+/// The wipe itself is management's, but the reboot has to happen here and only
+/// once the button is up: GPIO0 is the download-mode strap, and restarting
+/// while it is still held drops the chip into the ROM serial bootloader, where
+/// it looks bricked.
+/// The BOOT button when there is no panel to draw the countdown on. ui.cpp owns
+/// the button whenever a display was found; this is the fallback so a speaker
+/// built without one is still resettable. Same hold time, LED instead of digits.
+static bool poll_reset_button_headless() {
+  if (PIN_UI_BUTTON < 0 || ui_present()) return false;
+
+  static uint32_t since;
+  static bool announced;
+  static bool mode_armed;
+  const bool down = digitalRead(PIN_UI_BUTTON) == LOW;
+
+  if (!down) {
+    // Released between the mode tier and the reset tier: switch. There is no
+    // panel to show a "press again to confirm" offer on, so the hold itself is
+    // the confirmation -- three seconds is already a deliberate act.
+    const bool switch_now = mode_armed;
+    since = 0;
+    announced = false;
+    mode_armed = false;
+    if (switch_now) management_switch_mode(management_other_mode());
+    return false;
+  }
+  if (!since) {
+    since = millis();
+    return false;
+  }
+
+  const uint32_t held = millis() - since;
+  if (held >= UI_BTN_MODE_MS && !mode_armed) {
+    mode_armed = true;
+    Serial.printf("[mode] release BOOT to switch to %s mode, or keep holding "
+                  "to factory reset\n",
+                  management_mode_name(management_other_mode()));
+    status_led_blip(2);
+  }
+  if (held < UI_BTN_RESET_ARM_MS) return false;
+  mode_armed = false;  // past the mode tier now; releasing must not switch
+  if (!announced) {
+    announced = true;
+    Serial.println("[reset] keep holding BOOT to wipe settings and pairings");
+  }
+  status_led_state(LED_FAULT);
+  if (held < (uint32_t)UI_BTN_RESET_ARM_MS + UI_BTN_RESET_COUNT_MS) return false;
+  since = 0;
+  return true;
+}
+
+static void service_factory_reset() {
+  if (!ui_take_factory_reset_request() && !poll_reset_button_headless()) return;
+
+  Serial.println("[reset] BOOT held through the countdown; clearing everything");
+  management_factory_reset();
+
+  while (PIN_UI_BUTTON >= 0 && digitalRead(PIN_UI_BUTTON) == LOW) {
+    status_led_state(LED_UPDATING);
+    status_led_tick();
+    delay(10);
+  }
+  delay(300);  // let the OLED land on the message before the panel goes dark
+  ESP.restart();
+}
+
+/// Names the device properly, once the stack is actually up.
+///
+/// a2dp_sink.start() only queues the bring-up: esp_a2d_sink_init() and the
+/// first esp_bt_gap_set_scan_mode() run later, on the library's own work task.
+/// esp_bt_gap_set_cod() has to come after that -- the IDF header is explicit
+/// that a class of device written before the profiles register gets
+/// overwritten, and writing it mid-init raced the scan-mode setup and left the
+/// speaker invisible. A couple of seconds is comfortably past both.
+static void service_bluetooth_identity() {
+  if (!bt_started || bt_identity_applied) return;
+  if (millis() - bt_started_at < 2500) return;
+  bt_identity_applied = true;
+
+  // ESP32-A2DP never sets a class of device, so the sink inherits Bluedroid's
+  // default and phones list it as a nondescript "other" device: a generic icon,
+  // and on some Android builds no offer to connect it for media at all. Say
+  // what this is -- an audio/video loudspeaker that renders audio.
+  esp_bt_cod_t cod = {};
+  cod.major = ESP_BT_COD_MAJOR_DEV_AV;
+  cod.minor = BT_COD_MINOR_LOUDSPEAKER;
+  cod.service = ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO;
+  const esp_err_t err = esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
+  Serial.printf("[bt] class of device: %s@N", esp_err_to_name(err));
+
+  // And belt-and-braces: say out loud that we want to be findable. Nothing
+  // above should have left us hidden, but "the speaker is invisible" is an
+  // expensive failure to debug from the other end of a phone.
+  if (!a2dp_sink.is_connected()) {
+    a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+    Serial.println("[bt] discoverable");
+  }
+}
+
+/// Brings the A2DP sink up, in Bluetooth mode and only in Bluetooth mode.
+///
+/// In Wi-Fi mode the sink is never started at all -- not started and quiet, but
+/// never initialised. That is what makes the two modes exclusive: the antenna,
+/// the coexistence scheduler and the controller's heap all belong to one stack
+/// or the other, never both. See the note in management.h.
+static void service_bluetooth_start() {
+  if (bt_started) return;
+  if (management_radio_mode() != RADIO_MODE_BLUETOOTH) return;
+
+  a2dp_sink.start(DEVICE_NAME);
+  a2dp_sink.set_volume(START_VOLUME);
+  bt_started = true;
+  bt_started_at = millis();
+  management_set_bt_active(true);
+  ps_set_bt_active(true);
+  Serial.printf("Discoverable as \"%s\" - pair from your phone.\n", DEVICE_NAME);
+  // Chime once the radio is up: the speaker is ready to be paired.
+  pending_melody = MELODY_ID_NOTIFY;
+}
+
+/// Acts on a mode switch the BOOT button asked for. management_switch_mode()
+/// persists the choice and restarts, so this never returns when it fires.
+static void service_mode_switch() {
+  if (!ui_take_mode_switch_request()) return;
+  management_switch_mode(management_other_mode());
+}
+
 void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.printf("\n=== %s v%s ===\n", APP_NAME, FW_VERSION);
 
-  pinMode(PIN_STATUS_LED, OUTPUT);
-  digitalWrite(PIN_STATUS_LED, LOW);
+  status_led_begin(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH);
 
   AudioLogger::instance().begin(Serial, AudioLogger::Warning);
 
@@ -489,6 +721,9 @@ void setup() {
   // Display first: it brings up I2C, which the DS3231 path in soft_clock also
   // uses, and it puts a splash on the panel during the seconds the radio takes.
   const bool have_display = ui_begin();
+  // ui_begin() only claims the button when it found a panel; without one the
+  // headless reset poll still needs the pull-up.
+  if (!have_display && PIN_UI_BUTTON >= 0) pinMode(PIN_UI_BUTTON, INPUT_PULLUP);
 
   // Before a2dp_sink.start(), because the optional NTP sync needs the radio to
   // itself -- Wi-Fi and Bluetooth Classic share one antenna, and overlapping
@@ -537,23 +772,26 @@ void setup() {
   // and stopping/restarting the channel pops through the DAC anyway.
   a2dp_sink.set_output_active_by_state(false);
 
-  a2dp_sink.start(DEVICE_NAME);
-  a2dp_sink.set_volume(START_VOLUME);
+  // Bluetooth is started from loop() rather than here. While the setup access
+  // point is open, management asks for the radio to itself -- see the note in
+  // management.h. On a speaker that already has Wi-Fi, or with the setup window
+  // switched off, this fires immediately and nothing is delayed.
+  service_bluetooth_start();
 
   // Radio is up: hand the panel over to the UI task, which from here on owns it.
   if (have_display) ui_start();
 
-  Serial.printf("Discoverable as \"%s\" - pair from your phone.\n", DEVICE_NAME);
-  Serial.println("Type 'help' for the serial commands (clock, screens).");
-
-  // Chime once the radio is up: the speaker is ready to be paired.
-  pending_melody = MELODY_ID_NOTIFY;
+  Serial.println("Type 'help' for the serial commands (clock, screens, radio).");
 }
 
 void loop() {
   // A2DP, I2S and the display all run in their own FreeRTOS tasks. What is left
   // here is the status LED, the melodies a callback queued, the serial log and
   // the console.
+  service_factory_reset();
+  service_mode_switch();
+  service_bluetooth_start();
+  service_bluetooth_identity();
   service_melody();
   update_status_led();
   log_state_changes();
