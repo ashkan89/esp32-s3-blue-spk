@@ -11,6 +11,7 @@
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <esp_bt.h>
 #include <esp_gap_bt_api.h>
 #include <esp_ota_ops.h>
 #include <nvs_flash.h>
@@ -61,8 +62,13 @@ String apName;
 bool apRunning;
 bool announcedIp;
 uint32_t wifiStartedAt;
-uint32_t rebootAt;
+bool rebootPending;
 uint32_t updatePhaseAt;  // when updateState.phase last changed
+// When the station last came up, and whether the boot-time update check has
+// already run. See serviceStartupUpdateCheck().
+uint32_t stationUpAt;
+bool startupCheckDone;
+bool startupCheckHadClock;
 // Deliberate station retries while the setup AP is up. See startAccessPoint()
 // for why the core's own auto-reconnect cannot be left switched on.
 uint32_t staRetryAt;
@@ -89,31 +95,36 @@ char browserUploadError[96];
 portMUX_TYPE updateMux = portMUX_INITIALIZER_UNLOCKED;
 UpdateState updateState = {"idle", "Ready", "", "", "", "", 0, 0, false, false};
 
-// DigiCert Global Root G2, valid until 2038. GitHub's API and release asset
-// endpoints chain to this public root. Keeping certificate verification on is
-// important here: this connection writes executable code to flash.
-static const char GITHUB_ROOT_CA[] PROGMEM = R"CERT(-----BEGIN CERTIFICATE-----
-MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
-MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
-d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
-MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
-MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
-b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
-9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
-2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
-1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
-q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
-tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
-vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
-BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
-5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
-1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
-NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
-Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
-8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
-pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
-MrY=
------END CERTIFICATE-----)CERT";
+/*
+ * Trust anchors for the updater.
+ *
+ * This used to pin a single root, DigiCert Global Root G2. GitHub has since
+ * moved: api.github.com now chains to Sectigo Public Server Authentication
+ * Root E46, and release assets are served from a host with a Let's Encrypt
+ * chain. Neither validates against a DigiCert root, so every request failed the
+ * TLS handshake and HTTPClient reported it as HTTP -1 (connection refused) --
+ * a number that tells you nothing about what actually went wrong.
+ *
+ * Pinning one root was the mistake, not the choice of root. The IDF ships the
+ * Mozilla root store as a compact bundle linked into libmbedtls; using it costs
+ * about 68 KB of flash, which this 16 MB board has in abundance, and survives
+ * the next CA change without a firmware update. Verification stays on: this
+ * connection writes executable code to flash.
+ */
+extern const uint8_t rootCaBundleStart[] asm("_binary_x509_crt_bundle_start");
+extern const uint8_t rootCaBundleEnd[] asm("_binary_x509_crt_bundle_end");
+
+void trustPublicRoots(NetworkClientSecure &tls) {
+  tls.setCACertBundle(rootCaBundleStart,
+                      (size_t)(rootCaBundleEnd - rootCaBundleStart));
+}
+
+// HTTPClient reports transport failures as small negative numbers that mean
+// nothing on a dashboard. Turn them back into words.
+String httpErrorText(int code) {
+  if (code > 0) return String("HTTP ") + code;
+  return HTTPClient::errorToString(code) + " (" + code + ")";
+}
 
 void startResponder();  // defined with the other web plumbing, below
 
@@ -229,6 +240,38 @@ const char *playbackName(PsPlayback playback) {
   }
 }
 
+/*
+ * Restarting, from a task that cannot be blocked.
+ *
+ * This used to be a deadline checked in management_loop(), which works right up
+ * until the Arduino loop task is the thing that is stuck -- and then the OLED
+ * sits on its last frame and the restart the dashboard promised never arrives.
+ * A restart is exactly the wrong thing to make conditional on the health of the
+ * task asking for it.
+ *
+ * So it gets its own task at a priority above everything this firmware runs,
+ * doing nothing but sleeping and then resetting. esp_restart() rather than
+ * ESP.restart(): the Arduino wrapper stops the Bluetooth controller on the way
+ * out, which is both unnecessary here and one more thing that can block.
+ */
+void rebootTask(void *arg) {
+  vTaskDelay(pdMS_TO_TICKS((uint32_t)(uintptr_t)arg));
+  Serial.flush();
+  esp_restart();
+}
+
+void scheduleReboot(uint32_t delayMs) {
+  if (rebootPending) return;
+  rebootPending = true;
+  if (xTaskCreate(rebootTask, "reboot", 2048, (void *)(uintptr_t)delayMs,
+                  configMAX_PRIORITIES - 2, nullptr) != pdPASS) {
+    // Nothing left to schedule it with, so take the delay in line and go.
+    delay(delayMs);
+    Serial.flush();
+    esp_restart();
+  }
+}
+
 String macString(const uint8_t *mac) {
   char out[18];
   snprintf(out, sizeof(out), "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1],
@@ -336,9 +379,14 @@ bool globMatch(const char *pattern, const char *text) {
 bool isFirmwareAsset(const String &name) {
   String lower = name;
   lower.toLowerCase();
+  // "factory" and "merged" images start with the bootloader at 0x1000, not with
+  // the application. They pass the 0xE9 magic-byte check, so an OTA would
+  // happily write one into the app slot and then fail to boot from it. Only a
+  // plain application image belongs here.
   return lower.endsWith(".bin") && lower.indexOf("bootloader") < 0 &&
          lower.indexOf("partition") < 0 && lower.indexOf("littlefs") < 0 &&
-         lower.indexOf("spiffs") < 0;
+         lower.indexOf("spiffs") < 0 && lower.indexOf("factory") < 0 &&
+         lower.indexOf("merged") < 0;
 }
 
 String normalizedVersion(String value) {
@@ -354,33 +402,68 @@ struct GithubJob {
   String token;
 };
 
-void githubTask(void *raw) {
-  std::unique_ptr<GithubJob> job((GithubJob *)raw);
-  updateSet("checking", "Contacting GitHub releases", true);
-  updateProgress(0, 0);
+struct GithubRelease {
+  String tag;
+  String name;
+  String url;
+  String assetName;
+  String assetUrl;
+  uint32_t assetSize;
+};
 
-  NetworkClientSecure tls;
-  tls.setCACert(GITHUB_ROOT_CA);
-  HTTPClient http;
-  const String api = "https://api.github.com/repos/" + job->repo + "/releases/latest";
-  if (!http.begin(tls, api)) {
-    updateSet("error", "Could not initialize HTTPS", false);
-    vTaskDelete(nullptr);
-    return;
-  }
+// Transport failures are almost always about memory or the network, and the
+// number alone says neither. The free-heap figure is what distinguishes "the
+// CDN was unreachable" from "there was not enough room left for a handshake".
+String heapNote() {
+  return String(" (heap ") + (unsigned)ESP.getFreeHeap() + " B free)";
+}
+
+// Only github.com is entitled to the token.
+bool isGithubHost(const String &url) {
+  return url.startsWith("https://github.com/") ||
+         url.startsWith("https://api.github.com/");
+}
+
+void prepareRequest(HTTPClient &http, const String &url, const String &token) {
   http.setUserAgent(String(APP_NAME) + "/" + FW_VERSION);
-  http.setTimeout(15000);
-  if (job->token.length()) http.addHeader("Authorization", "Bearer " + job->token);
+  // The default connect timeout is five seconds, which is a TCP handshake, a
+  // TLS handshake and a certificate chain walk on a 240 MHz core -- comfortably
+  // achievable, and comfortably missable on a slow uplink. Missing it looks
+  // exactly like a refused connection.
+  http.setConnectTimeout(20000);
+  http.setTimeout(20000);
+  // Nothing here reuses a connection: every request in this file goes to a
+  // different host from the one before it.
+  http.setReuse(false);
+  if (token.length() && isGithubHost(url)) {
+    http.addHeader("Authorization", "Bearer " + token);
+  }
+}
+
+// ------------------------------------------------------------- metadata -----
+bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error) {
+  NetworkClientSecure tls;
+  trustPublicRoots(tls);
+  HTTPClient http;
+  const String api =
+      "https://api.github.com/repos/" + job.repo + "/releases/latest";
+  if (!http.begin(tls, api)) {
+    error = "Could not initialize HTTPS";
+    return false;
+  }
+  prepareRequest(http, api, job.token);
   http.addHeader("Accept", "application/vnd.github+json");
   http.addHeader("X-GitHub-Api-Version", "2022-11-28");
+
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    char message[96];
-    snprintf(message, sizeof(message), "GitHub returned HTTP %d", code);
-    updateSet("error", message, false);
-    http.end();
-    vTaskDelete(nullptr);
-    return;
+    if (code == HTTP_CODE_NOT_FOUND) {
+      error = "No releases found for " + job.repo;
+    } else {
+      error = "GitHub check failed: " + httpErrorText(code);
+      if (code < 0) error += heapNote();
+    }
+    return false;
   }
 
   JsonDocument filter;
@@ -394,93 +477,203 @@ void githubTask(void *raw) {
   const DeserializationError jsonError = deserializeJson(
       release, http.getStream(), DeserializationOption::Filter(filter));
   if (jsonError) {
-    updateSet("error", "GitHub returned invalid release metadata", false);
-    http.end();
-    vTaskDelete(nullptr);
-    return;
+    error = "GitHub returned invalid release metadata";
+    return false;
   }
 
-  const String tag = release["tag_name"] | "";
-  const String releaseName = release["name"] | tag;
-  const String releaseUrl = release["html_url"] | "";
-  String assetName;
-  String assetUrl;
-  uint32_t assetSize = 0;
+  out.tag = release["tag_name"] | "";
+  out.name = release["name"] | out.tag;
+  out.url = release["html_url"] | "";
+  out.assetSize = 0;
   for (JsonObject asset : release["assets"].as<JsonArray>()) {
     const String candidate = asset["name"] | "";
-    if (isFirmwareAsset(candidate) && globMatch(job->pattern.c_str(), candidate.c_str())) {
-      assetName = candidate;
-      assetUrl = asset["browser_download_url"] | "";
-      assetSize = asset["size"] | 0;
+    if (isFirmwareAsset(candidate) &&
+        globMatch(job.pattern.c_str(), candidate.c_str())) {
+      out.assetName = candidate;
+      out.assetUrl = asset["browser_download_url"] | "";
+      out.assetSize = asset["size"] | 0;
       break;
     }
   }
-  http.end();
+  if (!out.assetUrl.length()) {
+    error = "No release firmware matched the asset pattern";
+    return false;
+  }
+  return true;
+}
 
-  if (!assetUrl.length()) {
-    updateSet("error", "No release firmware matched the asset pattern", false);
-    vTaskDelete(nullptr);
+// -------------------------------------------------------------- install -----
+bool flashFromStream(HTTPClient &http, String &error) {
+  const int contentLength = http.getSize();
+  if (contentLength <= 0) {
+    error = "Release asset did not declare a size";
+    return false;
+  }
+  if ((size_t)contentLength > ESP.getFreeSketchSpace()) {
+    error = String("Firmware is ") + contentLength + " B; the OTA slot holds " +
+            (unsigned)ESP.getFreeSketchSpace() + " B";
+    return false;
+  }
+  if (!Update.begin((size_t)contentLength, U_FLASH)) {
+    error = Update.errorString();
+    return false;
+  }
+  Update.onProgress(updateProgress);
+  const size_t written = Update.writeStream(http.getStream());
+  if (written != (size_t)contentLength) {
+    error = String("Transfer stopped after ") + (unsigned)written + " of " +
+            contentLength + " B: " + Update.errorString();
+    Update.abort();
+    return false;
+  }
+  if (!Update.end(true)) {
+    error = Update.errorString();
+    return false;
+  }
+  return true;
+}
+
+/*
+ * Where the install used to fail.
+ *
+ * browser_download_url points at github.com, which answers 302 with a signed,
+ * time-limited URL on a storage host with a different name and a different
+ * certificate chain. HTTPClient will follow that by itself, but it does it by
+ * switching hosts underneath a live NetworkClientSecure: stop the socket,
+ * reconnect the same mbedtls context to a different name. The check reached
+ * api.github.com and the next handshake came back as HTTP -1 -- a refused
+ * connection, which is what a handshake that never completes looks like from
+ * up here.
+ *
+ * So the redirect is followed by hand. Each hop constructs its own client in
+ * its own scope, which means every handshake starts from a clean context, only
+ * one TLS session is ever allocated at a time, and the token stays with
+ * github.com rather than being forwarded to a storage host that rejects
+ * requests carrying two sets of credentials.
+ */
+constexpr int MAX_REDIRECTS = 5;
+constexpr int CONNECT_ATTEMPTS = 3;
+
+bool downloadAndFlash(const String &startUrl, const String &token, String &error) {
+  String url = startUrl;
+
+  for (int hop = 0; hop <= MAX_REDIRECTS; ++hop) {
+    for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; ++attempt) {
+      NetworkClientSecure tls;
+      trustPublicRoots(tls);
+      HTTPClient http;
+      http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+      if (!http.begin(tls, url)) {
+        error = "Could not initialize firmware download";
+        return false;
+      }
+      prepareRequest(http, url, token);
+      http.addHeader("Accept", "application/octet-stream");
+
+      const int code = http.GET();
+      if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+          code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
+          code == HTTP_CODE_PERMANENT_REDIRECT) {
+        const String next = http.getLocation();
+        if (!next.startsWith("https://")) {
+          error = "Release download redirected off HTTPS";
+          return false;
+        }
+        Serial.printf("[ota] redirect %d -> %.60s\n", code, next.c_str());
+        url = next;
+        break;  // next hop, with a fresh client
+      }
+
+      if (code == HTTP_CODE_OK) return flashFromStream(http, error);
+
+      // A negative code never reached the server: DNS, TCP or TLS. Those are
+      // worth one more try -- a redirect to a storage host is signed and only
+      // valid for a few minutes, but three attempts fit inside that window.
+      // An HTTP status did reach us, and retrying it would say the same thing.
+      if (code >= 0 || attempt == CONNECT_ATTEMPTS) {
+        error = "Firmware download failed: " + httpErrorText(code);
+        if (code < 0) error += heapNote();
+        return false;
+      }
+      Serial.printf("[ota] %s, retrying (%d/%d)\n",
+                    httpErrorText(code).c_str(), attempt + 1, CONNECT_ATTEMPTS);
+      delay(1000);
+    }
+  }
+
+  error = "Release download redirected too many times";
+  return false;
+}
+
+// ------------------------------------------------------------------ job -----
+void runGithubJob(const GithubJob &job) {
+  updateSet("checking", "Contacting GitHub releases", true);
+  updateProgress(0, 0);
+
+  GithubRelease release;
+  String error;
+  if (!fetchLatestRelease(job, release, error)) {
+    updateSet("error", error.c_str(), false);
     return;
   }
 
   portENTER_CRITICAL(&updateMux);
-  strlcpy(updateState.tag, tag.c_str(), sizeof(updateState.tag));
-  strlcpy(updateState.releaseName, releaseName.c_str(), sizeof(updateState.releaseName));
-  strlcpy(updateState.assetName, assetName.c_str(), sizeof(updateState.assetName));
-  strlcpy(updateState.releaseUrl, releaseUrl.c_str(), sizeof(updateState.releaseUrl));
-  updateState.total = assetSize;
-  updateState.available = normalizedVersion(tag) != normalizedVersion(FW_VERSION);
+  strlcpy(updateState.tag, release.tag.c_str(), sizeof(updateState.tag));
+  strlcpy(updateState.releaseName, release.name.c_str(), sizeof(updateState.releaseName));
+  strlcpy(updateState.assetName, release.assetName.c_str(), sizeof(updateState.assetName));
+  strlcpy(updateState.releaseUrl, release.url.c_str(), sizeof(updateState.releaseUrl));
+  updateState.total = release.assetSize;
+  const bool available =
+      normalizedVersion(release.tag) != normalizedVersion(FW_VERSION);
+  updateState.available = available;
   portEXIT_CRITICAL(&updateMux);
 
-  if (!job->install) {
-    updateSet("ready", updateState.available ? "A firmware release is available"
-                                              : "Firmware is up to date", false);
-    vTaskDelete(nullptr);
+  if (!job.install) {
+    updateSet("ready",
+              available ? "A firmware release is available"
+                        : "Firmware is up to date",
+              false);
     return;
   }
 
   updateSet("downloading", "Downloading and verifying firmware", true);
   if (sink && sink->is_connected()) sink->pause();
-  HTTPClient download;
-  download.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  download.setTimeout(20000);
-  if (!download.begin(tls, assetUrl)) {
-    updateSet("error", "Could not initialize firmware download", false);
-    vTaskDelete(nullptr);
+  Serial.printf("[ota] installing %s (%s, %u B, heap %u)\n",
+                release.tag.c_str(), release.assetName.c_str(),
+                (unsigned)release.assetSize, (unsigned)ESP.getFreeHeap());
+
+  if (!downloadAndFlash(release.assetUrl, job.token, error)) {
+    Serial.printf("[ota] %s\n", error.c_str());
+    updateSet("error", error.c_str(), false);
     return;
   }
-  download.setUserAgent(String(APP_NAME) + "/" + FW_VERSION);
-  if (job->token.length()) download.addHeader("Authorization", "Bearer " + job->token);
-  const int downloadCode = download.GET();
-  if (downloadCode != HTTP_CODE_OK) {
-    char message[96];
-    snprintf(message, sizeof(message), "Firmware download returned HTTP %d", downloadCode);
-    updateSet("error", message, false);
-    download.end();
-    vTaskDelete(nullptr);
-    return;
-  }
-  const int contentLength = download.getSize();
-  const size_t expected = contentLength > 0 ? (size_t)contentLength : UPDATE_SIZE_UNKNOWN;
-  if (!Update.begin(expected, U_FLASH)) {
-    updateSet("error", Update.errorString(), false);
-    download.end();
-    vTaskDelete(nullptr);
-    return;
-  }
-  Update.onProgress(updateProgress);
-  const size_t written = Update.writeStream(download.getStream());
-  const bool complete = Update.end(true);
-  download.end();
-  if (!complete || (contentLength > 0 && written != (size_t)contentLength)) {
-    updateSet("error", Update.errorString(), false);
-    vTaskDelete(nullptr);
-    return;
-  }
+
   updateSet("success", "Update installed; restarting", false);
-  rebootAt = millis() + 1800;
+  scheduleReboot(1800);
+}
+
+void githubTask(void *raw) {
+  // Every object this job touches has to be destroyed before vTaskDelete(),
+  // which never returns and so never unwinds the stack. Leaving a TLS context
+  // or a JSON document behind on each check is how a board that updated fine
+  // when it was fresh runs out of heap for a handshake three checks later.
+  {
+    std::unique_ptr<GithubJob> job((GithubJob *)raw);
+    runGithubJob(*job);
+  }
   vTaskDelete(nullptr);
 }
+
+
+/*
+ * A TLS session against the root bundle needs roughly 45 KB, and it needs a
+ * good part of it in one piece: two mbedtls record buffers, the session
+ * context, and the server's certificate chain while it is being parsed. Failing
+ * that allocation surfaces as HTTPClient's HTTP -1, which reads as a network
+ * problem and sends you looking in the wrong place. Refuse in words instead.
+ */
+constexpr uint32_t TLS_HEAP_FLOOR = 60000;
+constexpr uint32_t TLS_BLOCK_FLOOR = 34000;
 
 bool startGithubJob(bool install) {
   const UpdateState u = updateSnapshot();
@@ -489,13 +682,26 @@ bool startGithubJob(bool install) {
     updateSet("error", "Internet connection required", false);
     return false;
   }
+  const uint32_t heap = ESP.getFreeHeap();
+  const uint32_t block = ESP.getMaxAllocHeap();
+  if (heap < TLS_HEAP_FLOOR || block < TLS_BLOCK_FLOOR) {
+    const String message = String("Not enough memory for a secure connection (") +
+                           (unsigned)heap + " B free, largest block " +
+                           (unsigned)block + " B). Restart the speaker.";
+    updateSet("error", message.c_str(), false);
+    return false;
+  }
   if (settings.githubRepo.indexOf('/') <= 0 || settings.githubAsset.length() == 0) {
     updateSet("error", "Configure owner/repository and an asset pattern first", false);
     return false;
   }
   GithubJob *job = new GithubJob{install, settings.githubRepo, settings.githubAsset,
                                  settings.githubToken};
-  if (xTaskCreatePinnedToCore(githubTask, "github_ota", 14336, job, 1, nullptr, 0) != pdPASS) {
+  // 16 KB. A TLS handshake that walks a certificate chain against the Mozilla
+  // root bundle is the deepest thing this firmware does and the OTA writer runs
+  // on top of it, so 14 KB was tight -- but a task stack comes out of the same
+  // heap the handshake then has to allocate from, and this margin is not free.
+  if (xTaskCreatePinnedToCore(githubTask, "github_ota", 16384, job, 1, nullptr, 0) != pdPASS) {
     delete job;
     updateSet("error", "Could not start update task", false);
     return false;
@@ -672,6 +878,43 @@ void serviceStationRetry() {
   staRetryStartedAt = millis();
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(settings.ssid.c_str(), settings.wifiPassword.c_str());
+}
+
+/*
+ * The check that runs by itself, once, after the speaker comes up.
+ *
+ * It waits for the clock. A TLS handshake validates the server's certificate
+ * against this clock, and until the first sync lands the clock is the build
+ * stamp -- which on a board that has been in a drawer for a month reads as a
+ * certificate that has not started yet, and fails the handshake exactly as if
+ * the network were down. If SNTP cannot get out at all, the wait gives up after
+ * a minute and tries anyway: a DS3231 or a recent NVS write may well have left
+ * the clock good enough.
+ */
+constexpr uint32_t STARTUP_CHECK_SYNC_WAIT_MS = 60000;
+
+void serviceStartupUpdateCheck() {
+  if (!stationUpAt || WiFi.status() != WL_CONNECTED) return;
+  if (settings.githubRepo.indexOf('/') <= 0) return;
+  const UpdateState u = updateSnapshot();
+  if (u.busy) return;  // a manual check is already running
+
+  const bool synced = soft_clock_network_synced();
+  if (startupCheckDone) {
+    // One retry, and only this shape of it: the first attempt gave up waiting
+    // for SNTP and went ahead on an unverified clock, it failed, and the sync
+    // has since landed. That is precisely the failure a correct clock fixes.
+    if (startupCheckHadClock || !synced) return;
+    if (strcmp(u.phase, "error") != 0) return;
+  } else if (!synced && millis() - stationUpAt < STARTUP_CHECK_SYNC_WAIT_MS) {
+    return;
+  }
+
+  startupCheckDone = true;
+  startupCheckHadClock = synced;
+  Serial.printf("[ota] startup update check (clock %s)\n",
+                soft_clock_source_name());
+  startGithubJob(false);
 }
 
 void handleStatus() {
@@ -898,7 +1141,7 @@ void handleWifiSave() {
   sendJson(reply);
   ui_show_system_status(UI_STATUS_RESTART, "Wi-Fi saved", "Restarting speaker", -1,
                         0);
-  rebootAt = millis() + 900;
+  scheduleReboot(900);
 }
 
 void handleSettingsGet() {
@@ -915,6 +1158,8 @@ void handleSettingsGet() {
   doc["githubAsset"] = settings.githubAsset;
   doc["githubTokenSet"] = settings.githubToken.length() > 0;
   doc["clockSource"] = soft_clock_source_name();
+  doc["clockOffsetMinutes"] = soft_clock_utc_offset_min();
+  doc["clockNetworkSynced"] = soft_clock_network_synced();
   sendJson(doc);
 }
 
@@ -998,6 +1243,15 @@ void handleClock() {
     sendError(400, "Invalid browser time");
     return;
   }
+
+  // The browser sends its UTC offset along with the time. Storing it is what
+  // keeps the automatic network sync honest: SNTP hands over UTC, and without
+  // an offset the speaker would helpfully correct the time the owner just set
+  // to something an hour or eight wrong. Sent as minutes east of UTC; the
+  // dashboard has already flipped the sign of getTimezoneOffset().
+  if (body["offsetMinutes"].is<int32_t>()) {
+    soft_clock_set_utc_offset_min(body["offsetMinutes"].as<int32_t>());
+  }
   struct tm local = {};
   local.tm_year = year - 1900;
   local.tm_mon = month - 1;
@@ -1038,7 +1292,7 @@ void handleUploadComplete() {
   browserUploadOk = false;
   if (ok) {
     updateSet("success", "Upload installed; restarting", false);
-    rebootAt = millis() + 1200;
+    scheduleReboot(1200);
   }
 }
 
@@ -1134,7 +1388,7 @@ void handleSystem() {
     reply["message"] = "Restarting";
     sendJson(reply);
     ui_show_system_status(UI_STATUS_RESTART, "Restarting", "Please wait", -1, 0);
-    rebootAt = millis() + 700;
+    scheduleReboot(700);
   } else if (action == "startBluetooth") {
     // Switching modes shuts Wi-Fi down, so answer before the reboot lands.
     JsonDocument reply;
@@ -1153,7 +1407,7 @@ void handleSystem() {
     sendJson(reply);
     ui_show_system_status(UI_STATUS_RESTART, "Factory reset", "Clearing settings", -1,
                           0);
-    rebootAt = millis() + 900;
+    scheduleReboot(900);
   } else {
     sendError(400, "Unknown system action");
   }
@@ -1238,8 +1492,8 @@ void management_switch_mode(RadioMode mode) {
                         mode == RADIO_MODE_BLUETOOTH ? "Bluetooth mode"
                                                      : "Wi-Fi mode",
                         "Restarting", -1, 0);
-  delay(700);  // let the panel land on the message
-  ESP.restart();
+  scheduleReboot(700);  // long enough for the panel to land on the message
+  while (true) delay(50);
 }
 
 bool management_ap_running() { return apRunning; }
@@ -1290,6 +1544,29 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   }
 
   Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
+
+  /*
+   * Give the Bluetooth stack's RAM back before anything asks for it.
+   *
+   * The controller and Bluedroid own several fixed regions of DRAM that the
+   * linker reserves whether or not they are ever initialised. In Wi-Fi mode
+   * they never are -- and holding on to them left about 49 KB of heap free,
+   * which is not enough for a TLS handshake against the root bundle. That is
+   * what "GitHub check failed: connection refused (-1)" was: not a refused
+   * connection, a handshake that could not be allocated.
+   *
+   * Releasing is one way. The memory does not come back until a reset, which is
+   * exactly how mode switching works here anyway -- management_switch_mode()
+   * persists the choice and reboots -- so there is nothing to lose. Every
+   * esp_bt_* call in this file is behind btActive, which stays false all the
+   * way through this mode.
+   */
+  const uint32_t heapBefore = ESP.getFreeHeap();
+  const esp_err_t released = esp_bt_mem_release(ESP_BT_MODE_BTDM);
+  Serial.printf("[mode] bluetooth memory released: %s (heap %u -> %u)\n",
+                esp_err_to_name(released), (unsigned)heapBefore,
+                (unsigned)ESP.getFreeHeap());
+
   WiFi.persistent(false);
   WiFi.setHostname(settings.hostname.c_str());
   WiFi.onEvent(onWifiEvent);
@@ -1321,13 +1598,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
 }
 
 void management_loop() {
-  if (radioMode == RADIO_MODE_BLUETOOTH) {
-    if (rebootAt && (int32_t)(millis() - rebootAt) >= 0) {
-      delay(50);
-      ESP.restart();
-    }
-    return;
-  }
+  if (radioMode == RADIO_MODE_BLUETOOTH) return;
 
   server.handleClient();
   if (WiFi.status() == WL_CONNECTED && !announcedIp) {
@@ -1339,6 +1610,13 @@ void management_loop() {
     if (!settings.apAlways && !apClients) stopAccessPoint("station connected");
     const String ip = WiFi.localIP().toString();
     startResponder();
+    stationUpAt = millis() | 1;  // never 0: that is the "not yet" sentinel
+    // There is internet now, so there is no reason for the clock to be a guess.
+    // SNTP keeps re-syncing on its own from here; soft_clock_tick() adopts each
+    // answer. This is also what makes the updater's TLS work on a board that
+    // has been unplugged for a month -- certificate validity is checked against
+    // this clock, and a chain that has not started yet fails the handshake.
+    soft_clock_network_begin();
     status_led_blip(2);
     ui_show_system_status(UI_STATUS_NETWORK, "Dashboard ready", ip.c_str(), -1,
                           6000);
@@ -1346,6 +1624,7 @@ void management_loop() {
                   ip.c_str(), settings.hostname.c_str());
   } else if (WiFi.status() != WL_CONNECTED && announcedIp) {
     announcedIp = false;
+    soft_clock_network_end();
     // Restart the grace period. Without this the stale boot timestamp makes any
     // momentary drop raise the access point on the very next loop, which parks
     // the station and stops it reconnecting on its own.
@@ -1362,10 +1641,7 @@ void management_loop() {
     startAccessPoint();
   }
   serviceStationRetry();
-  if (rebootAt && (int32_t)(millis() - rebootAt) >= 0) {
-    delay(50);
-    ESP.restart();
-  }
+  serviceStartupUpdateCheck();
 }
 
 #endif

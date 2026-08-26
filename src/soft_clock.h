@@ -10,11 +10,17 @@
  *      for years on its coin cell, and it is the same SDA/SCL pair the OLED
  *      already uses -- two extra wires, no extra GPIO.
  *
- *   2. One NTP sync at boot, before the radio starts    (-DUSE_NTP=1 plus
- *      -DWIFI_SSID=\"..\" -DWIFI_PASS=\"..\")
- *      Wi-Fi is brought up, the time is fetched, and Wi-Fi is switched off again
- *      before a2dp_sink.start() is ever called, so the two radios never overlap.
- *      Costs about four seconds of boot time.
+ *   2. SNTP, automatically, whenever the speaker is on Wi-Fi in management
+ *      mode. Nothing to configure: management_loop() calls
+ *      soft_clock_network_begin() the moment the station has an address, the
+ *      answer is adopted from soft_clock_tick(), and the IDF's SNTP client
+ *      keeps re-syncing on its own for as long as the network is up.
+ *
+ *      Bluetooth mode has no Wi-Fi at all -- one antenna, one radio -- so the
+ *      clock there runs from whatever the last sync left in NVS and the RTC.
+ *
+ *      The legacy boot-time sync (-DUSE_NTP=1 with -DWIFI_SSID/-DWIFI_PASS)
+ *      still exists for builds with MANAGEMENT_ENABLED=0.
  *
  *   3. Set from the web dashboard, or typed in over the serial monitor:
  *      time 2026-08-18 14:30:00. Also time 14:30 and date 2026-08-18.
@@ -41,7 +47,7 @@ enum ClockSource : uint8_t {
   CLOCK_SRC_NVS,        ///< restored from flash after a power cut
   CLOCK_SRC_SERIAL,     ///< set by hand
   CLOCK_SRC_RTC,        ///< DS3231
-  CLOCK_SRC_NTP,        ///< network, once, at boot
+  CLOCK_SRC_NTP,        ///< network (SNTP)
 };
 
 /// Seeds the clock. Call after Wire has been set up (the DS3231 path needs it)
@@ -70,3 +76,36 @@ void soft_clock_tick();
 /// Handles the "time ..." and "date ..." serial commands. Returns false if the
 /// line was not one of them, so the caller can try its own commands.
 bool soft_clock_command(const char *line);
+
+// ------------------------------------------------------------- time zone ----
+/*
+ * Everything above deals in *local* time, and the system clock holds UTC. The
+ * bridge between the two is a fixed offset -- there is no DST rule engine on
+ * this device, and inventing one that goes stale is worse than an offset the
+ * owner sets once.
+ *
+ * The offset starts at CLOCK_TZ_OFFSET_MIN and is then learned from the
+ * browser: the dashboard's "Sync browser time" button sends its UTC offset
+ * along with the time, so the network sync below lands on the same wall clock
+ * the owner just confirmed rather than on UTC.
+ */
+
+/// Minutes east of UTC. Negative is west: -300 is US Eastern, 330 is IST.
+int32_t soft_clock_utc_offset_min();
+
+/// Persists a new offset and re-derives local time from it immediately.
+/// Accepts -840..840 (UTC-14 to UTC+14); anything else is ignored.
+void soft_clock_set_utc_offset_min(int32_t minutes);
+
+// --------------------------------------------------------- network sync -----
+
+/// Starts (or restarts) SNTP. Call once the station has an address; it is
+/// cheap and idempotent, so calling it again after a reconnect is fine.
+void soft_clock_network_begin();
+
+/// Stops SNTP. Call when the network goes away, so the client is not polling
+/// an interface that cannot answer.
+void soft_clock_network_end();
+
+/// True once an SNTP answer has been adopted this boot.
+bool soft_clock_network_synced();

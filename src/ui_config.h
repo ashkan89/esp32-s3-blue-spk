@@ -155,10 +155,10 @@ static const float VIS_AGC_RELEASE_S = 3.0f;
 /// boot from the build timestamp (so it is never wildly wrong), and can be set
 /// exactly from the dashboard or the three sources below -- see soft_clock.h:
 ///
-///   1. over the serial monitor:  time 2026-08-18 14:30:00
-///   2. a DS3231 module on the same two I2C wires:  -DUSE_DS3231=1
-///   3. one NTP sync at boot before the radio starts: -DUSE_NTP=1 plus
-///      -DWIFI_SSID=\"...\" -DWIFI_PASS=\"...\"
+///   1. network time, automatically, whenever the speaker is on Wi-Fi in
+///      management mode -- nothing to configure
+///   2. over the serial monitor:  time 2026-08-18 14:30:00
+///   3. a DS3231 module on the same two I2C wires:  -DUSE_DS3231=1
 ///
 /// Whatever the source, the time is written to NVS every 10 minutes, so a
 /// reboot or a power cut comes back within minutes rather than back to 1970.
@@ -168,6 +168,11 @@ static const float VIS_AGC_RELEASE_S = 3.0f;
 #define CLOCK_24H 1
 #endif
 
-/// Minutes east of UTC. Only used by the NTP sync; the serial and DS3231 paths
-/// set local time directly. 0 = UTC, -300 = US Eastern (EST), 210 = IST.
+/// Minutes east of UTC, used to turn network (UTC) time into local time.
+/// 0 = UTC, -300 = US Eastern (EST), 330 = IST.
+///
+/// This is only the starting value. The dashboard's "Sync browser time" button
+/// sends the browser's own offset, and that is what gets stored and used from
+/// then on -- so the default only has to be right for a speaker that is never
+/// opened in a browser.
 static const int32_t CLOCK_TZ_OFFSET_MIN = 0;

@@ -254,11 +254,18 @@ pattern such as `*.bin` or `speaker-*.bin`. The updater ignores bootloader,
 partition-table, LittleFS and SPIFFS images. Publish the normal PlatformIO
 `firmware.bin` as a release asset, then use **Check GitHub** and **Install
 release**. Public repositories need no token; a fine-grained token can be saved
-for a private repository. GitHub API and release downloads are verified over
-TLS against DigiCert Global Root G2 (valid through 2038).
+for a private repository. GitHub API and release downloads are verified over TLS
+against the Mozilla root store — see **Trust anchors** below.
 
 Set the version reported by the dashboard in [src/app_config.h](src/app_config.h)
 for each release. A leading `v` in a GitHub tag is ignored during comparison.
+
+Restarts — after an update, a settings change, a factory reset or the dashboard
+button — are run from a dedicated high-priority task rather than from a deadline
+checked in the main loop. That used to work right up until the loop task was the
+thing that was stuck, and then the OLED sat on its last frame and the restart
+never arrived. A restart is exactly the wrong thing to make conditional on the
+health of the task asking for it.
 
 Wi-Fi and Bluetooth Classic share one radio. Ordinary dashboard polling is
 lightweight, but network scans and firmware downloads consume radio time; the
@@ -281,6 +288,99 @@ Type 'help' for the serial commands (clock, screens).
 
 The on-board LED (GPIO2) blinks while waiting for a phone and stays solid once
 connected.
+
+### Trust anchors
+
+The updater trusts the **Mozilla root store**, shipped with the IDF as a compact
+bundle linked into `libmbedtls` (about 68 KB of flash). Verification stays on —
+this connection writes executable code to flash.
+
+It used to pin a single root, DigiCert Global Root G2. GitHub has since moved:
+`api.github.com` now chains to *Sectigo Public Server Authentication Root E46*,
+and release assets come from a host with a Let's Encrypt chain. Neither
+validates against a DigiCert root, so every request failed the handshake and
+`HTTPClient` reported it as **HTTP -1** — its code for "connection refused",
+which tells you nothing about what actually went wrong. Pinning one root was the
+mistake, not the choice of root; the bundle survives the next CA change without
+a firmware update. Transport failures are now reported in words rather than as a
+small negative number.
+
+### Checking on its own
+
+The speaker checks GitHub once by itself, shortly after it comes up — and the
+Overview page's **Firmware** card says so, with an **Install update** button, so
+finding out does not mean going looking.
+
+The check waits for the clock rather than running at boot. Certificate validity
+is checked against it, and until the first network sync lands the clock is the
+build stamp — which on a board that has been in a drawer for a month reads as a
+certificate that has not started yet and fails the handshake exactly as if the
+network were down. If SNTP cannot get out at all, the wait gives up after a
+minute and tries anyway, since a DS3231 or a recent NVS write may well have left
+the clock good enough.
+
+### Following the download redirect by hand
+
+`browser_download_url` points at `github.com`, which answers `302` with a signed,
+time-limited URL on a storage host with a different name and a different
+certificate chain. `HTTPClient` can follow that on its own, but it does it by
+switching hosts underneath a live `NetworkClientSecure` — stop the socket,
+reconnect the same mbedtls context to a different name. **Check GitHub** worked
+and **Install release** then failed with **HTTP -1**: a refused connection, which
+is what a handshake that never completes looks like from up there.
+
+So the redirect is followed by hand, one hop at a time, each with its own client
+constructed and destroyed in its own scope. Every handshake starts from a clean
+context, only one TLS session is ever allocated at a time, and the token stays
+with `github.com` instead of being forwarded to a storage host that rejects
+requests carrying two sets of credentials. A hop that fails in transport — DNS,
+TCP or TLS, never an HTTP status — is retried twice, which fits inside the few
+minutes a signed URL stays valid.
+
+Two other things came out of the same failure: the connect timeout is 20 s
+rather than the five-second default (a handshake plus a chain walk is
+comfortably achievable and comfortably missable on a slow uplink), and the task
+no longer leaks. It ends in `vTaskDelete()`, which never returns and so never
+unwinds the stack, and every early exit used to abandon a TLS context and a JSON
+document — which is how a board that updated fine when it was fresh runs out of
+heap for a handshake several checks later. Transport errors now carry the
+free-heap figure, because the number alone does not distinguish "the CDN was
+unreachable" from "there was not enough room left to talk to it".
+
+Certificate validity is checked against the speaker's clock, which is one more
+reason the [automatic time sync](#the-clock) matters: a chain that has not
+started yet fails the handshake exactly as if the network were down.
+
+### Room for a handshake
+
+A TLS session against the root bundle needs roughly 45 KB, a good part of it in
+one piece. Wi-Fi mode used to leave about **49 KB** of heap free, so the check
+itself failed with `connection refused (-1)` — not a refused connection, a
+handshake that could not be allocated.
+
+The memory was never missing, only reserved. The Bluetooth controller and
+Bluedroid own several fixed regions of DRAM that the linker sets aside whether
+or not they are ever initialised, and in Wi-Fi mode they never are.
+`esp_bt_mem_release(ESP_BT_MODE_BTDM)` at the top of Wi-Fi mode hands those back
+— about 65 KB — and the boot log prints the before and after:
+
+```
+[mode] bluetooth memory released: ESP_OK (heap 49436 -> 114892)
+```
+
+The memory does not come back until a reset, which costs nothing here: switching
+modes already persists the choice and reboots. The updater also refuses in words
+now, rather than as `-1`, when the heap or the largest free block is too small
+before it starts.
+
+The updater task's stack is 16 KB, not 20: a task stack comes out of the same
+heap the handshake then has to allocate from, so the margin is not free.
+
+Only plain application images are offered for OTA. Assets whose names contain
+`bootloader`, `partition`, `littlefs`, `spiffs`, `factory` or `merged` are
+skipped — a factory image starts with the bootloader at `0x1000` and passes the
+`0xE9` magic-byte check, so an OTA would write one into the application slot and
+then fail to boot from it.
 
 ## The display
 
@@ -455,9 +555,29 @@ animation degrades instead of the audio.
 
 ## The clock
 
-There is no built-in RTC. The quickest accurate option is **Settings → Sync
-browser time** in the dashboard. The clock also works without a network and can
-come from whichever of these you set up, in this order of preference:
+There is no built-in RTC, so the clock is a software one — but you should never
+have to set it. Whenever the speaker is in management mode and its Wi-Fi station
+has an address, it starts SNTP and keeps the clock on network time for as long
+as the link is up. That covers boot and every reconnection after it; there is
+nothing to configure and no build flag involved.
+
+Bluetooth mode has no Wi-Fi at all — one antenna, one radio — so the clock there
+runs on what the last sync left behind in NVS and the RTC, and it is right again
+the next time you switch back.
+
+### Time zone
+
+Network time arrives as UTC, so the speaker needs to know its offset to show a
+local wall clock. It learns one: **Settings → Sync browser time** sends the
+browser’s UTC offset along with the time, and that offset is stored and used for
+every sync from then on. Press it once after setting the speaker up and the
+matter is closed. `CLOCK_TZ_OFFSET_MIN` in [src/ui_config.h](src/ui_config.h)
+(minutes east of UTC) is only the starting value, for a speaker that is never
+opened in a browser.
+
+### Without a network
+
+The clock still works offline, from whichever of these you set up:
 
 **1. Nothing at all.** The clock is seeded from the build timestamp, so a fresh
 flash shows roughly the right time rather than 1 Jan 1970. It drifts, and it is
@@ -486,24 +606,11 @@ It is read at boot and written whenever you set the time by hand, so it only
 needs setting once ever. A chip that has lost its cell (which reads back as
 2000-01-01) is detected and seeded rather than believed.
 
-**4. One NTP sync at boot**, before the radio starts:
-
-```ini
-build_flags =
-    ${env.build_flags}
-    -DUSE_NTP=1
-    '-DWIFI_SSID="yournetwork"'
-    '-DWIFI_PASS="yourpassword"'
-```
-
-Wi-Fi is brought up, the time is fetched, and Wi-Fi is torn down completely
-before `a2dp_sink.start()` is ever called, so the two radios never overlap. Costs
-about four seconds of boot time. Set `CLOCK_TZ_OFFSET_MIN` in
-[src/ui_config.h](src/ui_config.h) for your timezone (minutes east of UTC; the
-other three paths set local time directly and do not need it).
-
 Whichever it is, the current time is written to NVS every ten minutes, so a power
-cut comes back within ten minutes rather than back to the build stamp.
+cut comes back within ten minutes rather than back to the build stamp. The saved
+value is UTC; firmware older than the automatic sync saved local time under a
+different key, so the first boot after upgrading falls back to the build stamp
+until the first sync lands.
 
 `-DCLOCK_24H=0` switches the clock screen to 12-hour with AM/PM.
 

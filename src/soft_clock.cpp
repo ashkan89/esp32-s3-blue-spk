@@ -3,7 +3,9 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <esp_sntp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -12,19 +14,43 @@
 #ifndef USE_DS3231
 #define USE_DS3231 0
 #endif
-#ifndef USE_NTP
-#define USE_NTP 0
-#endif
 
 static ClockSource g_source = CLOCK_SRC_BUILD;
 static Preferences g_prefs;
 static uint32_t g_last_persist_ms;
 static bool g_prefs_ok;
 
+/// Minutes east of UTC. Seeded from CLOCK_TZ_OFFSET_MIN, then whatever the
+/// dashboard last learned from the browser.
+static int32_t g_offset_min = CLOCK_TZ_OFFSET_MIN;
+
+/// Set from the SNTP callback, which runs on lwIP's thread -- so it does
+/// nothing but raise this, and soft_clock_tick() does the work.
+static volatile bool g_ntp_fresh;
+static bool g_ntp_running;
+static bool g_ntp_synced;
+
+/// An SNTP answer only counts once it is plausibly this decade. The IDF only
+/// calls the notification for a real reply, but a garbage timestamp from a
+/// broken server would otherwise be adopted as gospel.
+static const time_t EPOCH_SANITY_FLOOR = 1700000000;  // late 2023
+
 /// NVS is written at most this often. Ten minutes is 144 writes a day, which the
 /// flash wear levelling shrugs off, and bounds how far behind a power cut can
 /// leave the clock.
 static const uint32_t PERSIST_EVERY_MS = 10UL * 60UL * 1000UL;
+
+/*
+ * The saved epoch is UTC, and the key says so.
+ *
+ * Firmware before the automatic network sync kept *local* time in the system
+ * clock and left TZ unset, so its saved "epoch" is out by the UTC offset. There
+ * is no way to tell the two apart from the number itself, and restoring one as
+ * the other silently shifts the clock -- so the new meaning gets a new key and
+ * the old one is simply ignored. The cost is one boot on the build stamp.
+ */
+static const char *EPOCH_KEY = "utc";
+static const char *OFFSET_KEY = "tzmin";
 
 // ------------------------------------------------------------ build stamp ----
 /*
@@ -50,6 +76,32 @@ static time_t build_epoch() {
 static void apply_epoch(time_t epoch) {
   struct timeval tv = {.tv_sec = epoch, .tv_usec = 0};
   settimeofday(&tv, nullptr);
+}
+
+// ------------------------------------------------------------- time zone ----
+/*
+ * The system clock holds UTC and TZ turns it into local time. That is the only
+ * arrangement in which an SNTP answer -- which is UTC, and which the IDF writes
+ * straight into the system clock behind our back -- and a hand-set local time
+ * can both be right at once.
+ *
+ * POSIX writes the offset with the sign inverted (west is positive), so UTC+5:30
+ * is spelled "UTC-5:30". Naming the zone "UTC" regardless is deliberate: the
+ * device has no zone database, only an offset, and pretending otherwise by
+ * printing "CEST" somewhere would be a lie half the year.
+ */
+static void timezone_string(char *out, size_t len) {
+  const int32_t posix = -g_offset_min;  // west-positive, as POSIX wants it
+  const int32_t magnitude = posix < 0 ? -posix : posix;
+  snprintf(out, len, "UTC%c%ld:%02ld", posix < 0 ? '-' : '+',
+           (long)(magnitude / 60), (long)(magnitude % 60));
+}
+
+static void apply_timezone() {
+  char tz[24];
+  timezone_string(tz, sizeof(tz));
+  setenv("TZ", tz, 1);
+  tzset();
 }
 
 // ---------------------------------------------------------------- DS3231 -----
@@ -126,62 +178,94 @@ static void ds3231_write(const struct tm &t) {
 #endif  // USE_DS3231
 
 // ------------------------------------------------------------------- NTP -----
-#if USE_NTP
-#include <WiFi.h>
-
-#ifndef WIFI_SSID
-#error "USE_NTP=1 also needs WIFI_SSID and WIFI_PASS defined in build_flags"
-#endif
-
 /*
- * One shot, then the radio is handed to Bluetooth for good.
+ * Network time, in the background, for as long as there is a network.
  *
- * This must run before a2dp_sink.start(). Wi-Fi and Bluetooth Classic share the
- * one antenna and one PHY; the coexistence scheduler makes them work together,
- * but it does it by giving each of them gaps -- and a gap in an A2DP stream is
- * an audible dropout. Syncing before the sink exists sidesteps the whole issue.
+ * The IDF's SNTP client owns the system clock once it is started: it writes UTC
+ * straight in with settimeofday() from lwIP's thread, on the first answer and
+ * on every re-sync after that. Nothing here has to poll or parse -- the only
+ * job left is to notice that it happened, so the info screen can stop saying
+ * "build" and the DS3231 and NVS can be brought up to date.
+ *
+ * The notification callback runs on lwIP's thread, which is not a place to
+ * touch I2C or NVS from. It raises a flag; soft_clock_tick() does the work.
  */
-static bool ntp_sync(struct tm *out) {
-  Serial.printf("[clock] wifi: %s\n", WIFI_SSID);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+static void persist_now();
 
-  for (int i = 0; i < 60 && WiFi.status() != WL_CONNECTED; i++) delay(250);
-  bool ok = false;
-
-  if (WiFi.status() == WL_CONNECTED) {
-    // configTime takes the offset in seconds; DST is left at 0 because this
-    // firmware has no way to be told when the rules change.
-    configTime(CLOCK_TZ_OFFSET_MIN * 60, 0, "pool.ntp.org", "time.nist.gov");
-    for (int i = 0; i < 40; i++) {
-      time_t now = time(nullptr);
-      if (now > 1700000000) {  // anything after late 2023 means SNTP answered
-        localtime_r(&now, out);
-        ok = true;
-        break;
-      }
-      delay(250);
-    }
-  }
-  Serial.println(ok ? "[clock] ntp ok" : "[clock] ntp failed");
-
-  // Tear the radio down completely, not just disconnect.
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  return ok;
+static void ntp_notification(struct timeval *tv) {
+  (void)tv;
+  g_ntp_fresh = true;
 }
-#endif  // USE_NTP
+
+void soft_clock_network_begin() {
+  // Re-arming a running client is what a reconnect wants: configTzTime() stops
+  // it first, so the next poll goes out immediately instead of waiting out the
+  // remainder of an hour-long interval that elapsed while the link was down.
+  sntp_set_time_sync_notification_cb(ntp_notification);
+  // Its own buffer, deliberately: configTzTime() setenv()s what it is handed,
+  // and handing it the pointer getenv("TZ") just returned would have it write
+  // over its own source string.
+  char tz[24];
+  timezone_string(tz, sizeof(tz));
+  configTzTime(tz, "pool.ntp.org", "time.nist.gov", "time.google.com");
+  g_ntp_running = true;
+  Serial.println("[clock] sntp started");
+}
+
+void soft_clock_network_end() {
+  if (!g_ntp_running) return;
+  esp_sntp_stop();
+  g_ntp_running = false;
+  Serial.println("[clock] sntp stopped");
+}
+
+bool soft_clock_network_synced() { return g_ntp_synced; }
+
+/// Picks up what the SNTP client already wrote into the system clock.
+static void adopt_network_time() {
+  g_ntp_fresh = false;
+  const time_t now = time(nullptr);
+  if (now < EPOCH_SANITY_FLOOR) return;
+
+  const bool first = !g_ntp_synced;
+  g_ntp_synced = true;
+  g_source = CLOCK_SRC_NTP;
+
+#if USE_DS3231
+  struct tm local;
+  localtime_r(&now, &local);
+  if (ds3231_present()) ds3231_write(local);
+#endif
+  persist_now();
+
+  if (first) {
+    struct tm local;
+    localtime_r(&now, &local);
+    Serial.printf("[clock] sntp %04d-%02d-%02d %02d:%02d:%02d (utc%+ld min)\n",
+                  local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
+                  local.tm_hour, local.tm_min, local.tm_sec,
+                  (long)g_offset_min);
+  }
+}
 
 // ----------------------------------------------------------------- public ----
 void soft_clock_begin() {
+  // The offset has to be in place before anything else: build_epoch() and the
+  // DS3231 both hand out *local* broken-down time, and mktime() cannot turn
+  // that into the right UTC instant without knowing the zone.
+  g_prefs_ok = g_prefs.begin("clock", false);
+  if (g_prefs_ok) {
+    g_offset_min = (int32_t)g_prefs.getLong(OFFSET_KEY, CLOCK_TZ_OFFSET_MIN);
+    if (g_offset_min < -840 || g_offset_min > 840) g_offset_min = CLOCK_TZ_OFFSET_MIN;
+  }
+  apply_timezone();
+
   // Always start from the build stamp, so nothing downstream ever sees 1970.
   apply_epoch(build_epoch());
   g_source = CLOCK_SRC_BUILD;
 
-  g_prefs_ok = g_prefs.begin("clock", false);
   if (g_prefs_ok) {
-    const uint32_t saved = g_prefs.getULong("epoch", 0);
+    const uint32_t saved = g_prefs.getULong(EPOCH_KEY, 0);
     // Only trust the saved value if it is newer than this build: an older one is
     // left over from a previous firmware and is worse than the build stamp.
     if (saved > (uint32_t)build_epoch()) {
@@ -214,15 +298,6 @@ void soft_clock_begin() {
   }
 #endif
 
-#if USE_NTP
-  {
-    struct tm t;
-    if (ntp_sync(&t)) {
-      soft_clock_set(t, CLOCK_SRC_NTP);
-    }
-  }
-#endif
-
   struct tm now;
   soft_clock_now(&now);
   Serial.printf("[clock] %04d-%02d-%02d %02d:%02d:%02d (%s)\n",
@@ -252,12 +327,30 @@ const char *soft_clock_source_name() {
 
 static void persist_now() {
   if (!g_prefs_ok) return;
-  g_prefs.putULong("epoch", (uint32_t)time(nullptr));
+  g_prefs.putULong(EPOCH_KEY, (uint32_t)time(nullptr));
   g_last_persist_ms = millis();
+}
+
+int32_t soft_clock_utc_offset_min() { return g_offset_min; }
+
+void soft_clock_set_utc_offset_min(int32_t minutes) {
+  if (minutes < -840 || minutes > 840) return;
+  if (minutes == g_offset_min) return;
+  g_offset_min = minutes;
+  apply_timezone();
+  if (g_prefs_ok) g_prefs.putLong(OFFSET_KEY, (int32_t)minutes);
+  Serial.printf("[clock] utc offset %+ld min\n", (long)minutes);
+
+  // The SNTP client caches nothing zone-related, but re-arming it costs a
+  // packet and puts the new offset on the display without waiting for the next
+  // poll -- which is up to an hour away.
+  if (g_ntp_running) soft_clock_network_begin();
 }
 
 void soft_clock_set(const struct tm &t, ClockSource source) {
   struct tm copy = t;
+  // The zone is a fixed offset with no DST rule, so this only ever resolves to
+  // "not in DST" -- but saying so explicitly keeps mktime() from guessing.
   copy.tm_isdst = 0;
   const time_t epoch = mktime(&copy);
   if (epoch == (time_t)-1) return;
@@ -275,6 +368,7 @@ void soft_clock_set(const struct tm &t, ClockSource source) {
 }
 
 void soft_clock_tick() {
+  if (g_ntp_fresh) adopt_network_time();
   const uint32_t now = millis();
   if (now - g_last_persist_ms >= PERSIST_EVERY_MS) persist_now();
 }

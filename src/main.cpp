@@ -664,7 +664,7 @@ static void service_bluetooth_identity() {
   cod.minor = BT_COD_MINOR_LOUDSPEAKER;
   cod.service = ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO;
   const esp_err_t err = esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
-  Serial.printf("[bt] class of device: %s@N", esp_err_to_name(err));
+  Serial.printf("[bt] class of device: %s\n", esp_err_to_name(err));
 
   // And belt-and-braces: say out loud that we want to be findable. Nothing
   // above should have left us hidden, but "the speaker is invisible" is an
