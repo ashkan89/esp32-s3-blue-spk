@@ -143,7 +143,7 @@ So the speaker does one thing at a time:
 
 | Mode | Wi-Fi | Bluetooth |
 |------|-------|-----------|
-| **Wi-Fi** | station if a network is configured, setup hotspot if not; dashboard and OTA available | not started at all |
+| **Wi-Fi** | station if a network is configured, setup hotspot if not; dashboard and OTA available | not started at all, and its reserved DRAM goes back to the heap |
 | **Bluetooth** | never initialised | A2DP sink owns the antenna |
 
 The mode is remembered across restarts, so a power cut brings the speaker back
@@ -361,11 +361,14 @@ handshake that could not be allocated.
 The memory was never missing, only reserved. The Bluetooth controller and
 Bluedroid own several fixed regions of DRAM that the linker sets aside whether
 or not they are ever initialised, and in Wi-Fi mode they never are.
-`esp_bt_mem_release(ESP_BT_MODE_BTDM)` at the top of Wi-Fi mode hands those back
-— about 65 KB — and the boot log prints the before and after:
+`esp_bt_mem_release(ESP_BT_MODE_BTDM)` at the top of Wi-Fi mode hands those back.
+Adding up what the build actually reserves — `CONFIG_BTDM_RESERVE_DRAM` is
+`0xdb5c`, and the ELF puts `_bt_data`, `_bt_bss` and the two `_bt_controller_*`
+regions at another 17 KB — that is about **72 KB**. The boot log prints the real
+before and after, which is the number to trust:
 
 ```
-[mode] bluetooth memory released: ESP_OK (heap 49436 -> 114892)
+[mode] bluetooth memory released: ESP_OK (heap <before> -> <after>)
 ```
 
 The memory does not come back until a reset, which costs nothing here: switching
