@@ -7,7 +7,7 @@
 // Keep this in sync with GitHub release tags. A leading "v" on the release is
 // ignored when the dashboard compares versions.
 #ifndef FW_VERSION
-#define FW_VERSION "2.0.1"
+#define FW_VERSION "2.0.2"
 #endif
 
 // Can be overridden with build flags, for example:
