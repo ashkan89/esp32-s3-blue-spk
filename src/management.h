@@ -10,26 +10,62 @@ class BluetoothA2DPSink;
  * Radio mode.
  *
  * This chip has one 2.4 GHz front end shared by Wi-Fi and Bluetooth Classic.
- * Espressif's coexistence scheduler covers Wi-Fi *station* plus Bluetooth; a
- * SoftAP alongside an A2DP sink is not a supported combination, and in practice
- * neither side works properly -- the access point cannot be joined, and the
- * sink is not reliably discoverable. Trying to referee that contest with
- * coexistence preferences and quiet windows was worse than choosing.
- *
- * So the speaker does one thing at a time:
+ * What Espressif's coexistence scheduler supports is Wi-Fi *station* alongside
+ * Bluetooth. A SoftAP alongside an A2DP sink is not a supported combination,
+ * and in practice neither side works properly -- the access point cannot be
+ * joined, and the sink is not reliably discoverable. That is the line these
+ * three modes are drawn along: the setup access point is exclusive, a station
+ * is not.
  *
  *   MANAGEMENT  Wi-Fi is up -- station if a network is configured, the setup
  *               access point if not -- and the dashboard is reachable.
- *               Bluetooth is not started at all.
+ *               Bluetooth is not started at all, and its RAM is handed back.
  *   BLUETOOTH   the A2DP sink owns the antenna. Wi-Fi is never initialised.
+ *   COMBO       station plus A2DP sink, sharing the radio under coexistence.
+ *               The dashboard stays reachable while music plays, which is what
+ *               makes its media controls worth having. No setup access point
+ *               ever comes up here, so the mode needs a network already saved:
+ *               management_begin() demotes it to MANAGEMENT when there is none.
+ *   NET         station plus BLE. Audio arrives over Wi-Fi instead of
+ *               Bluetooth -- a DLNA/UPnP renderer anything can cast to, or a
+ *               URL -- and BLE carries status, transport control and Wi-Fi
+ *               provisioning. Bluetooth Classic is never started, so the setup
+ *               access point is allowed here exactly as in MANAGEMENT.
  *
- * Switching is a deliberate act (hold BOOT, or the dashboard button) and takes
- * effect through a restart, so each mode always begins from a clean radio.
+ * Switching is a deliberate act (hold BOOT, or the dashboard) and takes effect
+ * through a restart, so every mode begins from a clean radio.
+ *
+ * On BLE and audio: this is a classic ESP32, Bluetooth 4.2. LE Audio -- the
+ * profile that carries music over Bluetooth Low Energy -- needs 5.2 silicon and
+ * does not exist on this chip, and BLE 4.2 here sustains a small fraction of
+ * what stereo music costs. So BLE is never an audio path in any mode: audio is
+ * either A2DP (BR/EDR) or Wi-Fi. Each mode hands back the half of the
+ * controller it does not use, which is where the heap for the updater's TLS
+ * handshake comes from.
  */
 enum RadioMode : uint8_t {
   RADIO_MODE_MANAGEMENT = 0,
   RADIO_MODE_BLUETOOTH = 1,
+  RADIO_MODE_COMBO = 2,
+  RADIO_MODE_NET = 3,
+  RADIO_MODE_COUNT
 };
+
+/// Whether a mode brings up the Wi-Fi driver and the dashboard.
+inline bool radio_mode_has_wifi(RadioMode mode) {
+  return mode != RADIO_MODE_BLUETOOTH;
+}
+
+/// Whether a mode starts Bluetooth Classic and the A2DP sink. Deliberately not
+/// "has Bluetooth": NET has Bluetooth too, just not the half that carries audio.
+inline bool radio_mode_has_a2dp(RadioMode mode) {
+  return mode == RADIO_MODE_BLUETOOTH || mode == RADIO_MODE_COMBO;
+}
+
+/// Whether a mode starts the BLE control service and the network audio player.
+inline bool radio_mode_has_ble(RadioMode mode) {
+  return mode == RADIO_MODE_NET;
+}
 
 #if MANAGEMENT_ENABLED
 
@@ -40,8 +76,9 @@ const char *management_device_name(const char *fallback);
 /// The mode this boot is running in. Available after management_begin().
 RadioMode management_radio_mode();
 
-/// The other one, for prompts and toggles.
-RadioMode management_other_mode();
+/// The next one in the cycle, for the BOOT button and the console:
+/// Wi-Fi -> Bluetooth -> Wi-Fi + BT -> Wi-Fi.
+RadioMode management_next_mode();
 
 /// Human-readable, for the console and the display.
 const char *management_mode_name(RadioMode mode);
@@ -68,13 +105,18 @@ void management_factory_reset();
 // Told by main.cpp so the dashboard can report whether Bluetooth is live.
 void management_set_bt_active(bool active);
 
+// Saves a network and restarts into it. Used by the BLE provisioning
+// characteristic, which is the way back in when the dashboard is unreachable
+// because the saved credentials are wrong. Does not return.
+void management_provision_wifi(const char *ssid, const char *password);
+
 // True when the network or update layer has something to show on the status LED
 // that outranks anything Bluetooth has to say, in which case *out is filled in.
 bool management_led_state(StatusLedState *out);
 #else
 inline const char *management_device_name(const char *fallback) { return fallback; }
 inline RadioMode management_radio_mode() { return RADIO_MODE_BLUETOOTH; }
-inline RadioMode management_other_mode() { return RADIO_MODE_BLUETOOTH; }
+inline RadioMode management_next_mode() { return RADIO_MODE_BLUETOOTH; }
 inline const char *management_mode_name(RadioMode) { return "Bluetooth"; }
 inline void management_switch_mode(RadioMode) {}
 inline void management_begin(BluetoothA2DPSink &) {}
@@ -82,5 +124,6 @@ inline void management_loop() {}
 inline bool management_ap_running() { return false; }
 inline void management_factory_reset() {}
 inline void management_set_bt_active(bool) {}
+inline void management_provision_wifi(const char *, const char *) {}
 inline bool management_led_state(StatusLedState *) { return false; }
 #endif

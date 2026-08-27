@@ -129,48 +129,124 @@ console is available at the IP printed on the serial monitor, at
 working, the setup network comes back after 15 seconds, so the speaker cannot be
 locked out by a router change.
 
-### One radio, one job: Wi-Fi mode and Bluetooth mode
+### Four radio modes
 
-This chip has a single 2.4 GHz front end shared by Wi-Fi and Bluetooth Classic.
-Espressif's coexistence scheduler covers Wi-Fi *station* plus Bluetooth; a
-SoftAP alongside an A2DP sink is **not** a supported combination, and in
-practice neither side works — the access point cannot be joined, and the sink is
-not reliably discoverable. Earlier versions tried to referee that contest with
-coexistence preferences, beacon tuning and a "quiet window". Choosing turned out
-to be better than refereeing.
+This chip has a single 2.4 GHz front end shared by Wi-Fi and Bluetooth. What
+Espressif's coexistence scheduler supports is Wi-Fi *station* alongside
+Bluetooth. A SoftAP beside an A2DP sink is **not** a supported combination, and
+in practice neither side works — the access point cannot be joined, and the sink
+is not reliably discoverable. Earlier versions tried to referee that contest
+with coexistence preferences, beacon tuning and a "quiet window", and gave up.
+That line — *a station is fine, a hotspot next to Bluetooth Classic is not* — is
+what the modes are drawn along:
 
-So the speaker does one thing at a time:
-
-| Mode | Wi-Fi | Bluetooth |
-|------|-------|-----------|
-| **Wi-Fi** | station if a network is configured, setup hotspot if not; dashboard and OTA available | not started at all, and its reserved DRAM goes back to the heap |
-| **Bluetooth** | never initialised | A2DP sink owns the antenna |
+| Mode | Wi-Fi | Bluetooth | Audio arrives over |
+|------|-------|-----------|--------------------|
+| **Wi-Fi only** | station, or setup hotspot if no network is saved | not started at all; its DRAM goes back to the heap | nothing |
+| **Bluetooth only** | never initialised | A2DP sink owns the antenna | A2DP |
+| **Wi-Fi + Bluetooth** | station only; never raises the setup hotspot | A2DP sink, sharing the radio under coexistence | A2DP |
+| **Wi-Fi + BLE** | station, or setup hotspot; both are fine here | BLE only — Classic is never started | **Wi-Fi** (DLNA or a URL) |
 
 The mode is remembered across restarts, so a power cut brings the speaker back
-doing whatever it was doing. A factory-fresh board starts in Wi-Fi mode with the
-setup hotspot up, which is where configuration happens.
+doing whatever it was doing. A factory-fresh board starts in Wi-Fi only mode
+with the setup hotspot up, which is where configuration happens.
 
-**From the speaker:** hold BOOT for three seconds. The panel offers *Bluetooth
-mode?* (or *Wi-Fi mode?*); let go and press BOOT once within eight seconds to
-confirm. Ignore it and it goes away. On a board with no display, a three-second
-hold released before six seconds switches immediately — there is nothing to show
-an offer on, and a deliberate three-second hold is confirmation enough.
+#### Wi-Fi + Bluetooth
 
-**From the dashboard:** **Overview → Bluetooth → Switch to Bluetooth mode**.
-Wi-Fi shuts down and the page goes with it, so it asks first.
+The mode that makes the dashboard's media controls worth having: play, pause,
+skip, seek and volume act on the phone that is streaming right now, because the
+Bluetooth stack and the web server are both up at the same time. Three things
+make it work rather than merely start:
 
-**From the console:** `mode` toggles, `bt` and `wifi` go somewhere specific,
-`radio` prints where you are.
+- **Station only.** `startAccessPoint()` refuses to run in this mode, at the
+  call sites and inside the function itself. A speaker with no saved network is
+  demoted to Wi-Fi only at boot, and the demotion is persisted, because
+  otherwise it would have no dashboard and no way to be given one.
+- **Bluetooth keeps its RAM.** The `esp_bt_mem_release(ESP_BT_MODE_BTDM)` that
+  Wi-Fi only mode performs is skipped. ESP32-A2DP starts the controller in
+  `ESP_BT_MODE_CLASSIC_BT` and releases the BLE half itself (~30 KB).
+- **The scheduler is told who matters.** `esp_coex_preference_set(ESP_COEX_PREFER_BT)`
+  before either stack starts, and Wi-Fi modem sleep left on so there are windows
+  to hand over.
+
+The trade is heap: both stacks resident at once leaves noticeably less free than
+either alone, and the updater's TLS handshake is the deepest allocation this
+firmware makes. If an update fails for memory here, do it from Wi-Fi only mode
+and switch back.
+
+#### Wi-Fi + BLE
+
+The other way to answer "both radios at once", and the only one where the audio
+does **not** come over Bluetooth.
+
+**Why not BLE audio.** This is a classic ESP32: Bluetooth 4.2, no BLE 5 features
+and no isochronous channels. LE Audio — the profile that carries music over
+Bluetooth Low Energy — requires Bluetooth 5.2 silicon, and this build's
+`sdkconfig` ships no LE Audio profile for the target at all (`CONFIG_BT_A2DP_ENABLE`
+is the only audio profile present). The bandwidth says the same thing
+independently: BLE 4.2 here sustains roughly 100–300 kbps in practice, against
+about 1,411 kbps for CD-quality stereo. And no phone will stream media to a
+generic BLE peripheral — iOS and Android only offer A2DP for that. So BLE is not
+an audio path on this hardware, on any firmware.
+
+What it is good at is control. So in this mode the audio comes over Wi-Fi and
+BLE does the rest:
+
+- **DLNA / UPnP MediaRenderer.** The speaker advertises itself by SSDP and
+  anything that can cast to a network speaker finds it — BubbleUPnP, VLC, Hi-Fi
+  Cast, foobar2000, Windows' own *Cast to Device*. No app to write and nothing
+  to pair. The renderer serves its description and SOAP endpoints on port 9000;
+  the dashboard stays on 80.
+- **A stream URL.** Paste one into the Overview page, send it over BLE, or type
+  `play <url>` on the console. Internet radio, or any HTTP audio on the network.
+- **BLE control service.** Three characteristics on one custom service: `status`
+  (read + notify, compact JSON), `command` (write: `play`, `pause`, `stop`,
+  `vol N`, `url U`) and `wifi` (write: `<ssid>\n<password>`).
+
+That last one is the reason BLE earns its place. Wi-Fi + Bluetooth mode never
+raises the setup hotspot, so a speaker whose router password changed is
+unreachable until somebody walks over and holds BOOT. Here there are two ways
+back in: the setup hotspot — allowed in this mode, because the combination this
+chip cannot do is a hotspot beside *Classic*, and BLE is not that — and BLE
+provisioning, which works from across the room with any GATT app.
+
+Decoding is MP3, AAC and WAV, via the fixed-point Helix decoders. FLAC and Opus
+decoders exist in AudioTools but do not fit the heap budget next to Wi-Fi, BLE
+and the web server. The Classic half of the controller is released before BLE
+starts, which is the mirror image of what the A2DP sink does in the Bluetooth
+modes.
+
+Two honest limits. There is no skip or seek: a stream URL is not a playlist, and
+the dashboard disables those buttons rather than pretending. And a DLNA control
+point that sends a format outside those three gets an error rather than silence.
+
+#### Switching
+
+**From the speaker:** hold BOOT for three seconds. The panel offers the next
+mode in the cycle — Wi-Fi → Bluetooth → Wi-Fi + BT → Wi-Fi + BLE → Wi-Fi — so
+let go and press BOOT once within eight seconds to confirm. Ignore it and it
+goes away; keep holding and you are into the factory-reset countdown instead. On
+a board with no display, a three-second hold released before six seconds
+switches immediately.
+
+**From the dashboard:** **Overview → Radio mode**, which lists all four and
+marks the current one. Switching to *Bluetooth only* takes Wi-Fi and the page
+with it, so it asks first; the others come back in a few seconds. *Wi-Fi +
+Bluetooth* stays greyed out until a network has been saved.
+
+**From the console:** `mode` steps to the next one; `wifi`, `bt`, `both` and
+`net` go somewhere specific; `radio` prints where you are and what each half is
+doing.
 
 Every switch goes through a restart. Both stacks own controller state, DMA
 channels and tasks, and ESP32-A2DP's `end()` also forgets the last paired
 device — a reboot costs about a second and guarantees each mode starts from a
 clean radio.
 
-In Wi-Fi mode the dashboard says so rather than pretending: the Bluetooth card
-reads *Wi-Fi mode*, the Devices page explains why the list is empty, and the
-media and device endpoints answer `409` instead of poking a stack that is not
-running. The OLED pairing screen reads *Wi-Fi mode — hold BOOT to switch*.
+In Wi-Fi only mode the dashboard says so rather than pretending: the Bluetooth
+card reads *Off*, the transport buttons are disabled with the reason written
+underneath them, the Devices page explains why the list is empty, and the media
+and device endpoints answer `409` instead of poking a stack that is not running.
 
 **The Class of Device is set.** ESP32-A2DP never calls `esp_bt_gap_set_cod()`,
 so the sink inherited Bluedroid's default and phones listed it as a nondescript
@@ -372,7 +448,19 @@ before and after, which is the number to trust:
 ```
 
 The memory does not come back until a reset, which costs nothing here: switching
-modes already persists the choice and reboots. The updater also refuses in words
+modes already persists the choice and reboots.
+
+None of this happens in **Wi-Fi + Bluetooth** mode, where both stacks have to be
+resident: the release is skipped and only the BLE half goes back, freed by
+ESP32-A2DP's own `start()`. That mode therefore runs with materially less heap
+than Wi-Fi only, and this handshake is the first thing to feel it. If a GitHub
+check or install fails there, do it from Wi-Fi only mode and switch back.
+
+**Wi-Fi + BLE** splits the difference: it releases the Classic half only (in
+`ble_control_begin()`, before the controller initialises) and keeps BLE, then
+spends part of what it saved on the decoders and the DLNA renderer. The boot log
+prints the heap either side of both the BLE start and the network player start,
+which between them are the numbers to watch in that mode. The updater also refuses in words
 now, rather than as `-1`, when the heap or the largest free block is too small
 before it starts.
 
@@ -481,7 +569,7 @@ time.
 | short (< 600 ms) | next screen, or confirm a pending mode switch |
 | long (600 ms – 1.5 s) | pin the current screen / release it |
 | hold 1.5 s | brightness: low → mid → high |
-| hold 3 s | offer to switch radio mode — release, then press once to confirm |
+| hold 3 s | offer the next radio mode — release, then press once to confirm |
 | hold 6 s | factory reset countdown — release to cancel |
 
 Keep holding past the mode offer and the panel starts a five-second countdown with a shrinking progress bar. Let go at any point and it says
@@ -506,10 +594,14 @@ auto                   resume the carousel
 bright 0..255          fix the contrast (0 = back to automatic)
 ui                     current screen, frame rate, style
 radio                  current mode and radio state
-mode                   switch mode (Wi-Fi <-> Bluetooth), reboots
-bt                     switch to Bluetooth mode, reboots
-wifi                   switch to Wi-Fi mode, reboots
+mode                   next radio mode, reboots
+bt                     switch to Bluetooth only mode, reboots
+wifi                   switch to Wi-Fi only mode, reboots
+both                   switch to Wi-Fi + Bluetooth mode, reboots
+net                    switch to Wi-Fi + BLE mode, reboots
 pair                   force Bluetooth discoverable again
+play <url>             play a network stream (Wi-Fi + BLE mode)
+stop                   stop network playback
 ```
 
 ### The status LED
@@ -564,9 +656,10 @@ has an address, it starts SNTP and keeps the clock on network time for as long
 as the link is up. That covers boot and every reconnection after it; there is
 nothing to configure and no build flag involved.
 
-Bluetooth mode has no Wi-Fi at all — one antenna, one radio — so the clock there
-runs on what the last sync left behind in NVS and the RTC, and it is right again
-the next time you switch back.
+Bluetooth only mode has no Wi-Fi at all, so the clock there runs on what the
+last sync left behind in NVS and the RTC, and it is right again the next time
+you switch back. Both Wi-Fi + Bluetooth and Wi-Fi + BLE keep SNTP running like
+Wi-Fi only mode does, so a speaker left in either never drifts.
 
 ### Time zone
 

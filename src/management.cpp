@@ -19,6 +19,8 @@
 #include <esp_wifi.h>
 
 #include "BluetoothA2DPSink.h"
+#include "ble_control.h"
+#include "net_audio.h"
 #include "player_state.h"
 #include "soft_clock.h"
 #include "status_led.h"
@@ -87,6 +89,30 @@ uint8_t apClients;
 // Which radio owns the antenna this boot. Persisted, so a power cut brings the
 // speaker back doing whatever it was doing.
 RadioMode radioMode = RADIO_MODE_MANAGEMENT;
+// Combo mode has no setup access point to fall back on, so a station that never
+// arrives is a dead end the user has to be told about. Said once, not per loop.
+bool comboOfflineWarned;
+
+/*
+ * The boot sentinel.
+ *
+ * A mode that crashes during start-up takes the dashboard and the serial
+ * console down with it, and the BOOT button needs the UI task to be running to
+ * offer anything -- so a speaker that reboot-loops in one mode has no way back
+ * to a mode that works. That is not an acceptable failure for a setting the
+ * user can change from a web page.
+ *
+ * So each boot into a mode other than Wi-Fi writes a strike to NVS before it
+ * tries anything, and clears it once the speaker has been up long enough to
+ * call it stable. Two boots that never reach that point and the next one falls
+ * back to Wi-Fi mode, where the dashboard is reachable and the mode can be
+ * changed again. The count survives a reset by construction: that is the whole
+ * point of keeping it in flash rather than in RAM.
+ */
+constexpr uint8_t BOOT_STRIKES_MAX = 2;
+constexpr uint32_t BOOT_STABLE_MS = 20000;
+uint8_t bootStrikes;
+bool bootStrikePending;
 uint8_t mutedFrom = 80;
 bool browserUploadAccepted;
 bool browserUploadOk;
@@ -790,6 +816,10 @@ void parkStation() {
 
 void startAccessPoint() {
   if (apRunning) return;
+  // The one combination the coexistence scheduler does not support. Combo mode
+  // exists precisely to avoid it; refuse here as well as at every call site, so
+  // a future caller cannot reintroduce it by accident.
+  if (radioMode == RADIO_MODE_COMBO) return;
 
   // AP_STA is only worth its cost when the station is actually associated --
   // then the channel is settled and the AP simply shares it. Any other time the
@@ -954,6 +984,18 @@ void handleStatus() {
   wifi["apChannel"] = apRunning ? WiFi.channel() : 0;
   wifi["radioMode"] = management_mode_name(radioMode);
 
+  // Which radios this boot is running, so the dashboard can explain itself
+  // rather than guessing from whether Bluetooth happens to be up.
+  JsonObject mode = doc["mode"].to<JsonObject>();
+  mode["id"] = (int)radioMode;
+  mode["name"] = management_mode_name(radioMode);
+  mode["wifi"] = radio_mode_has_wifi(radioMode);
+  mode["bluetooth"] = radio_mode_has_a2dp(radioMode);
+  mode["ble"] = radio_mode_has_ble(radioMode);
+  // Combo mode cannot raise the setup access point, so it is only offerable
+  // once a network has been saved. The dashboard greys it out until then.
+  mode["comboReady"] = settings.ssid.length() > 0;
+
   JsonObject bt = doc["bluetooth"].to<JsonObject>();
   bt["active"] = btActive;
   bt["connected"] = p.connected;
@@ -976,6 +1018,32 @@ void handleStatus() {
   media["state"] = playbackName(p.playback);
   media["volume"] = p.volume;
 
+  // Wi-Fi + BLE mode only. The dashboard uses `running` to decide whether to
+  // draw the network player at all, so the block is always present and always
+  // honest rather than appearing and disappearing.
+  JsonObject net = doc["network"].to<JsonObject>();
+  net["running"] = net_audio_running();
+  net["ble"] = ble_control_running();
+  net["bleClients"] = ble_control_clients();
+  if (net_audio_running()) {
+    NetAudioStatus n;
+    net_audio_snapshot(&n);
+    const char *state = "idle";
+    switch (n.state) {
+      case NET_AUDIO_OPENING: state = "opening"; break;
+      case NET_AUDIO_PLAYING: state = net_audio_active() ? "playing" : "buffering"; break;
+      case NET_AUDIO_PAUSED: state = "paused"; break;
+      case NET_AUDIO_ERROR: state = "error"; break;
+      default: break;
+    }
+    net["state"] = state;
+    net["url"] = n.url;
+    net["origin"] = n.origin;
+    net["error"] = n.error;
+    net["renderer"] = n.renderer_up;
+    net["sampleRate"] = n.sample_rate;
+  }
+
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
 }
@@ -988,10 +1056,71 @@ void handleAuth() {
   sendJson(doc);
 }
 
+/*
+ * Playback control, whichever source is running.
+ *
+ * The two paths answer the same verbs so the dashboard does not need a second
+ * set of buttons: the Bluetooth one forwards them to the phone over AVRCP, the
+ * network one drives the player directly. Where they differ is what they can
+ * do -- there is no "next track" on a single stream URL -- and the difference
+ * is reported rather than faked.
+ */
+void handleNetworkMedia(const String &action, JsonDocument &body) {
+  if (action == "play") {
+    net_audio_play();
+  } else if (action == "pause") {
+    net_audio_pause();
+  } else if (action == "stop") {
+    net_audio_stop();
+  } else if (action == "toggle") {
+    NetAudioStatus n;
+    net_audio_snapshot(&n);
+    n.state == NET_AUDIO_PLAYING ? net_audio_pause() : net_audio_play();
+  } else if (action == "volume") {
+    const int volume = constrain(body["value"] | 0, 0, 127);
+    if (volume > 0) mutedFrom = (uint8_t)volume;
+    net_audio_set_volume((uint8_t)volume);
+  } else if (action == "mute") {
+    net_audio_set_volume(net_audio_volume() ? 0
+                                            : (mutedFrom ? mutedFrom : 80));
+  } else if (action == "url") {
+    const String url = body["value"] | "";
+    if (!url.length()) {
+      sendError(400, "No stream address given");
+      return;
+    }
+    if (!net_audio_play_url(url.c_str(), "url")) {
+      sendError(400, "That address is empty or longer than the player accepts");
+      return;
+    }
+  } else {
+    // next / previous / forward / rewind. A single stream has nothing to skip
+    // to, and pretending otherwise makes the buttons look broken instead of
+    // inapplicable.
+    sendError(409, "Network playback is a single stream: there is nothing to "
+                   "skip to. Use play, pause, stop or volume.");
+    return;
+  }
+  JsonDocument reply;
+  reply["ok"] = true;
+  sendJson(reply);
+}
+
 void handleMedia() {
   if (!requireAuth()) return;
+  if (net_audio_running()) {
+    JsonDocument body;
+    if (!readBody(body)) return;
+    handleNetworkMedia(body["action"] | "", body);
+    return;
+  }
+  if (radio_mode_has_ble(radioMode)) {
+    sendError(409, "The network player is still waiting for a Wi-Fi address");
+    return;
+  }
   if (!btActive) {
-    sendError(409, "Bluetooth is off in Wi-Fi mode");
+    sendError(409, "Bluetooth is off in Wi-Fi mode. Switch to Wi-Fi + BT to "
+                   "control playback from here.");
     return;
   }
   JsonDocument body;
@@ -1039,7 +1168,9 @@ void handleDevices() {
   // Bluedroid is not running in Wi-Fi mode, so there is nothing to enumerate
   // and its API would fail anyway. Answer honestly rather than erroring.
   if (!btActive) {
-    doc["unavailable"] = "Bluetooth is off in Wi-Fi mode";
+    doc["unavailable"] = radio_mode_has_ble(radioMode)
+                             ? "Wi-Fi + BLE mode runs no A2DP sink"
+                             : "Bluetooth is off in Wi-Fi mode";
     sendJson(doc);
     return;
   }
@@ -1067,7 +1198,11 @@ void handleDevices() {
 void handleDeviceAction() {
   if (!requireAuth()) return;
   if (!btActive) {
-    sendError(409, "Bluetooth is off in Wi-Fi mode");
+    sendError(409, radio_mode_has_ble(radioMode)
+                       ? "Wi-Fi + BLE mode runs no A2DP sink, so there are no "
+                         "pairings to manage. Switch to a Bluetooth mode first."
+                       : "Bluetooth is off in Wi-Fi mode. Switch to Wi-Fi + BT "
+                         "to manage devices from here.");
     return;
   }
   JsonDocument body;
@@ -1389,16 +1524,48 @@ void handleSystem() {
     sendJson(reply);
     ui_show_system_status(UI_STATUS_RESTART, "Restarting", "Please wait", -1, 0);
     scheduleReboot(700);
-  } else if (action == "startBluetooth") {
-    // Switching modes shuts Wi-Fi down, so answer before the reboot lands.
+  } else if (action == "mode" || action == "startBluetooth") {
+    // "startBluetooth" is what older dashboards send; it means the same thing
+    // as {"action":"mode","mode":1} and is kept so a cached page still works.
+    const int wanted = action == "startBluetooth"
+                           ? (int)RADIO_MODE_BLUETOOTH
+                           : (body["mode"] | (int)RADIO_MODE_MANAGEMENT);
+    if (wanted < 0 || wanted >= (int)RADIO_MODE_COUNT) {
+      sendError(400, "Unknown radio mode");
+      return;
+    }
+    const RadioMode target = (RadioMode)wanted;
+    if (target == management_radio_mode()) {
+      sendError(409, String("Already in ") + management_mode_name(target) +
+                         " mode");
+      return;
+    }
+    // Combo mode never raises the setup access point, so sending the speaker
+    // there without a saved network strands it: no dashboard, and no way to
+    // give it one except the BOOT button. Refuse while it would.
+    if (target == RADIO_MODE_COMBO && !settings.ssid.length()) {
+      sendError(409, "Save a Wi-Fi network first: Wi-Fi + BT joins your "
+                     "network and does not open the setup hotspot.");
+      return;
+    }
+    // Every switch reboots, and the two that leave Wi-Fi behind take this
+    // dashboard with them. Answer while there is still a connection to answer
+    // on, and say which of the two just happened.
     JsonDocument reply;
     reply["ok"] = true;
-    reply["message"] = "Switching to Bluetooth mode; Wi-Fi and this dashboard "
-                       "go away. Hold BOOT on the speaker to come back.";
+    reply["mode"] = (int)target;
+    reply["message"] =
+        radio_mode_has_wifi(target)
+            ? String("Switching to ") + management_mode_name(target) +
+                  " mode; the speaker restarts and this dashboard comes back "
+                  "in a few seconds."
+            : String("Switching to ") + management_mode_name(target) +
+                  " mode; Wi-Fi and this dashboard go away. Hold BOOT on the "
+                  "speaker to cycle back.";
     sendJson(reply);
     server.client().flush();
     delay(150);
-    management_switch_mode(RADIO_MODE_BLUETOOTH);  // does not return
+    management_switch_mode(target);  // does not return
   } else if (action == "factoryReset") {
     factoryReset();
     JsonDocument reply;
@@ -1471,13 +1638,20 @@ const char *management_device_name(const char *fallback) {
 
 RadioMode management_radio_mode() { return radioMode; }
 
-RadioMode management_other_mode() {
-  return radioMode == RADIO_MODE_BLUETOOTH ? RADIO_MODE_MANAGEMENT
-                                           : RADIO_MODE_BLUETOOTH;
+RadioMode management_next_mode() {
+  return (RadioMode)((radioMode + 1) % RADIO_MODE_COUNT);
 }
 
+// Short on purpose: these land in a 24-character OLED title ("<name> mode") and
+// in one-line serial logs. The dashboard builds its own longer labels from the
+// mode id.
 const char *management_mode_name(RadioMode mode) {
-  return mode == RADIO_MODE_BLUETOOTH ? "Bluetooth" : "Wi-Fi";
+  switch (mode) {
+    case RADIO_MODE_BLUETOOTH: return "Bluetooth";
+    case RADIO_MODE_COMBO: return "Wi-Fi + BT";
+    case RADIO_MODE_NET: return "Wi-Fi + BLE";
+    default: return "Wi-Fi";
+  }
 }
 
 void management_switch_mode(RadioMode mode) {
@@ -1486,17 +1660,33 @@ void management_switch_mode(RadioMode mode) {
   // ESP32-A2DP's end() also forgets the last paired device; a reboot costs a
   // second and guarantees each mode starts from a clean radio.
   if (!stableDeviceName.length()) loadSettings(APP_NAME);
+  if (mode >= RADIO_MODE_COUNT) mode = RADIO_MODE_MANAGEMENT;
   prefs.putUChar("radioMode", (uint8_t)mode);
+  // Asking for a mode is a fresh start: it gets its full allowance of attempts
+  // even if the last thing in that slot fell over.
+  prefs.putUChar("bootFail", 0);
   Serial.printf("[mode] switching to %s mode\n", management_mode_name(mode));
-  ui_show_system_status(UI_STATUS_RESTART,
-                        mode == RADIO_MODE_BLUETOOTH ? "Bluetooth mode"
-                                                     : "Wi-Fi mode",
-                        "Restarting", -1, 0);
+  char title[24];
+  snprintf(title, sizeof(title), "%s mode", management_mode_name(mode));
+  ui_show_system_status(UI_STATUS_RESTART, title, "Restarting", -1, 0);
   scheduleReboot(700);  // long enough for the panel to land on the message
   while (true) delay(50);
 }
 
 bool management_ap_running() { return apRunning; }
+
+void management_provision_wifi(const char *ssid, const char *password) {
+  if (ssid == nullptr || *ssid == 0) return;
+  if (!stableDeviceName.length()) loadSettings(APP_NAME);
+  settings.ssid = ssid;
+  settings.wifiPassword = password != nullptr ? password : "";
+  saveSettings();
+  Serial.printf("[web] network saved over BLE: %s; restarting\n", ssid);
+  ui_show_system_status(UI_STATUS_RESTART, "Wi-Fi saved", "Restarting speaker",
+                        -1, 0);
+  scheduleReboot(900);
+  while (true) delay(50);
+}
 
 void management_factory_reset() {
   factoryReset();
@@ -1519,6 +1709,21 @@ bool management_led_state(StatusLedState *out) {
     *out = LED_FAULT;
     return true;
   }
+  // In the two modes that play audio *and* run Wi-Fi, the network only gets the
+  // LED while it is still finding its feet. Once the station is home, what the
+  // speaker is doing is playing, so decline here and let main.cpp show that
+  // instead -- for combo that is the A2DP state, for Wi-Fi + BLE the network
+  // player's. (Combo never raises an access point, so only NET needs the
+  // setup-AP case; it is written once for both because the answer is the same.)
+  if (radioMode == RADIO_MODE_COMBO || radioMode == RADIO_MODE_NET) {
+    if (apRunning && WiFi.status() != WL_CONNECTED) {
+      *out = LED_SETUP_AP;
+      return true;
+    }
+    if (WiFi.status() == WL_CONNECTED) return false;
+    *out = LED_WIFI_CONNECTING;
+    return true;
+  }
   // In Wi-Fi mode the LED is entirely the network's to talk about: Bluetooth
   // has nothing to say because it is not running.
   if (apRunning && WiFi.status() != WL_CONNECTED) {
@@ -1533,7 +1738,39 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   sink = &a2dp;
   if (!stableDeviceName.length()) loadSettings(APP_NAME);
   radioMode = (RadioMode)prefs.getUChar("radioMode", RADIO_MODE_MANAGEMENT);
-  if (radioMode > RADIO_MODE_BLUETOOTH) radioMode = RADIO_MODE_MANAGEMENT;
+  if (radioMode >= RADIO_MODE_COUNT) radioMode = RADIO_MODE_MANAGEMENT;
+
+  // See the boot sentinel note above. Wi-Fi mode is the fallback, so it never
+  // takes a strike -- it just clears whatever the last mode left behind.
+  bootStrikes = prefs.getUChar("bootFail", 0);
+  if (radioMode == RADIO_MODE_MANAGEMENT) {
+    if (bootStrikes) prefs.putUChar("bootFail", 0);
+  } else if (bootStrikes >= BOOT_STRIKES_MAX) {
+    Serial.printf("[mode] %s mode failed to stay up %u times in a row. Falling "
+                  "back to Wi-Fi mode so the dashboard is reachable; pick a "
+                  "mode again from there once you know why.\n",
+                  management_mode_name(radioMode), (unsigned)bootStrikes);
+    ui_show_system_status(UI_STATUS_ERROR, "Mode failed", "Back to Wi-Fi", -1,
+                          10000);
+    radioMode = RADIO_MODE_MANAGEMENT;
+    prefs.putUChar("radioMode", (uint8_t)radioMode);
+    prefs.putUChar("bootFail", 0);
+  } else {
+    prefs.putUChar("bootFail", (uint8_t)(bootStrikes + 1));
+    bootStrikePending = true;
+  }
+
+  // Combo mode is a station and a sink; it never raises the setup access point,
+  // because that is the pairing the coexistence scheduler does not support. So
+  // without a saved network there is nothing for it to join and no way left to
+  // configure one. Demote to Wi-Fi mode -- and persist the demotion, or the
+  // BOOT button would keep cycling out of a mode the speaker never entered.
+  if (radioMode == RADIO_MODE_COMBO && !settings.ssid.length()) {
+    radioMode = RADIO_MODE_MANAGEMENT;
+    prefs.putUChar("radioMode", (uint8_t)radioMode);
+    Serial.println("[mode] Wi-Fi + BT needs a saved network; starting the setup "
+                   "access point in Wi-Fi mode instead.");
+  }
 
   if (radioMode == RADIO_MODE_BLUETOOTH) {
     // Not one Wi-Fi call. Leaving the driver uninitialised is the point: the
@@ -1543,7 +1780,72 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     return;
   }
 
-  Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
+  if (radioMode == RADIO_MODE_COMBO) {
+    /*
+     * Both radios at once, refereed by the software coexistence scheduler.
+     *
+     * Three things make this work rather than merely start:
+     *
+     *   - Station only. startAccessPoint() refuses to run in this mode. An AP
+     *     beaconing on a fixed channel beside an A2DP link is the combination
+     *     that fails, and it is the only one.
+     *   - Bluetooth keeps its RAM. The esp_bt_mem_release() below belongs to
+     *     Wi-Fi mode and must not happen here. The sink's own start() hands
+     *     back the BLE half (~30 KB) instead, which is memory this chip could
+     *     not have used for audio anyway -- LE Audio is 5.2 hardware.
+     *   - The scheduler is left to Bluedroid. There used to be an
+     *     esp_coex_preference_set(ESP_COEX_PREFER_BT) here, before either stack
+     *     started. It is gone for two reasons: this build has
+     *     CONFIG_BT_BLUEDROID_ESP_COEX_VSC=y, which means Bluedroid already
+     *     tells the scheduler when A2DP is streaming and gets the priority
+     *     right on its own; and the call is deprecated, lives in a binary blob,
+     *     and was being made before anything it might touch existed. If audio
+     *     ever does need help here, esp_coex_status_bit_set() is the supported
+     *     way and it belongs after the sink is up, not before.
+     */
+    Serial.println("[mode] Wi-Fi + BT mode: station plus A2DP sink, sharing the "
+                   "radio under coexistence.");
+
+    WiFi.persistent(false);
+    WiFi.setHostname(settings.hostname.c_str());
+    WiFi.onEvent(onWifiEvent);
+    WiFi.mode(WIFI_STA);
+    // As in Wi-Fi mode: adopt the router's regulatory domain from its beacons,
+    // or channels 12-13 are visible in a scan and impossible to associate with.
+    esp_wifi_set_country_code("01", true);
+    // Modem sleep is what leaves the coexistence scheduler windows to hand to
+    // Bluetooth between beacons. It is the Arduino default, but this is the one
+    // mode where switching it off would be audible, so say it out loud.
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);
+    WiFi.begin(settings.ssid.c_str(), settings.wifiPassword.c_str());
+    wifiStartedAt = millis();
+    ui_show_system_status(UI_STATUS_NETWORK, "Connecting Wi-Fi",
+                          settings.ssid.c_str(), -1, 0);
+    Serial.printf("[web] connecting Wi-Fi: %s\n", settings.ssid.c_str());
+    configureRoutes();
+    Serial.println("[web] dashboard login: admin (change the default password)");
+    return;
+  }
+
+  if (radioMode == RADIO_MODE_NET) {
+    // Everything below this point is shared with Wi-Fi mode: the same station
+    // bring-up, the same setup access point, the same dashboard. Only two
+    // things differ, and both are about who owns the Bluetooth memory.
+    //
+    // The release further down hands back the *whole* controller, BLE included,
+    // which is right in Wi-Fi mode and fatal here -- BLE is the control channel
+    // this mode is built around. So it is skipped, and ble_control_begin()
+    // gives back only the Classic half instead, which nothing here uses.
+    //
+    // The access point is allowed. The combination this chip cannot do is a
+    // SoftAP beside an A2DP sink; BLE is not that, and coexists with an access
+    // point perfectly well. So unlike Wi-Fi + BT, this mode can configure
+    // itself from cold -- and BLE provisioning is a second way in on top.
+    Serial.println("[mode] Wi-Fi + BLE mode: audio arrives over the network, "
+                   "BLE carries control. Bluetooth Classic is off.");
+  } else {
+    Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
+  }
 
   /*
    * Give the Bluetooth stack's RAM back before anything asks for it.
@@ -1561,11 +1863,13 @@ void management_begin(BluetoothA2DPSink &a2dp) {
    * esp_bt_* call in this file is behind btActive, which stays false all the
    * way through this mode.
    */
-  const uint32_t heapBefore = ESP.getFreeHeap();
-  const esp_err_t released = esp_bt_mem_release(ESP_BT_MODE_BTDM);
-  Serial.printf("[mode] bluetooth memory released: %s (heap %u -> %u)\n",
-                esp_err_to_name(released), (unsigned)heapBefore,
-                (unsigned)ESP.getFreeHeap());
+  if (radioMode == RADIO_MODE_MANAGEMENT) {
+    const uint32_t heapBefore = ESP.getFreeHeap();
+    const esp_err_t released = esp_bt_mem_release(ESP_BT_MODE_BTDM);
+    Serial.printf("[mode] bluetooth memory released: %s (heap %u -> %u)\n",
+                  esp_err_to_name(released), (unsigned)heapBefore,
+                  (unsigned)ESP.getFreeHeap());
+  }
 
   WiFi.persistent(false);
   WiFi.setHostname(settings.hostname.c_str());
@@ -1598,7 +1902,15 @@ void management_begin(BluetoothA2DPSink &a2dp) {
 }
 
 void management_loop() {
-  if (radioMode == RADIO_MODE_BLUETOOTH) return;
+  // Before the mode check: every mode has to be able to clear its own strike,
+  // including the ones that return immediately below.
+  if (bootStrikePending && millis() > BOOT_STABLE_MS) {
+    bootStrikePending = false;
+    prefs.putUChar("bootFail", 0);
+    Serial.printf("[mode] %s mode is stable\n", management_mode_name(radioMode));
+  }
+
+  if (!radio_mode_has_wifi(radioMode)) return;
 
   server.handleClient();
   if (WiFi.status() == WL_CONNECTED && !announcedIp) {
@@ -1631,6 +1943,26 @@ void management_loop() {
     wifiStartedAt = millis();
     ui_show_system_status(UI_STATUS_NETWORK, "Wi-Fi disconnected",
                           "Reconnecting", -1, 4000);
+  }
+  // Combo mode has no access point to fall back on, so a station that never
+  // arrives leaves a working Bluetooth speaker with no dashboard on it. The
+  // core keeps retrying by itself; say once where the way out is, because from
+  // the outside this looks like the dashboard has simply vanished.
+  if (radioMode == RADIO_MODE_COMBO) {
+    if (WiFi.status() == WL_CONNECTED) {
+      comboOfflineWarned = false;
+    } else if (!comboOfflineWarned &&
+               millis() - wifiStartedAt > FIRST_CONNECT_GRACE_MS) {
+      comboOfflineWarned = true;
+      Serial.printf("[mode] no Wi-Fi yet (%s). Bluetooth audio still works, the "
+                    "dashboard does not. Hold BOOT to cycle round to Wi-Fi mode "
+                    "for the setup access point.\n",
+                    settings.ssid.c_str());
+      ui_show_system_status(UI_STATUS_ERROR, "No Wi-Fi", "Bluetooth only", -1,
+                            5000);
+    }
+    serviceStartupUpdateCheck();
+    return;
   }
   // Raise the setup AP once the station has settled -- associated, if the AP is
   // configured to stay up alongside it, or clearly failed. Never mid-scan.

@@ -664,15 +664,19 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
   static uint32_t network_at;
   if (now - network_at >= 2000 || network_at == 0) {
     network_at = now;
-    if (management_radio_mode() == RADIO_MODE_BLUETOOTH) {
+    const RadioMode mode = management_radio_mode();
+    if (!radio_mode_has_wifi(mode)) {
       // The Wi-Fi driver was never initialised in this mode; do not ask it.
       strlcpy(network_line, "bluetooth mode  wifi off", sizeof(network_line));
     } else if (WiFi.status() == WL_CONNECTED) {
       const IPAddress ip = WiFi.localIP();
       const String ssid = WiFi.SSID();
       snprintf(network_line, sizeof(network_line),
-               "wifi %s  %u.%u.%u.%u  %ddBm", ssid.c_str(), ip[0], ip[1],
-               ip[2], ip[3], WiFi.RSSI());
+               "%s%s  %u.%u.%u.%u  %ddBm",
+               mode == RADIO_MODE_COMBO  ? "wifi+bt "
+               : mode == RADIO_MODE_NET  ? "wifi+ble "
+                                         : "wifi ",
+               ssid.c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.RSSI());
     } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
       const IPAddress ip = WiFi.softAPIP();
       snprintf(network_line, sizeof(network_line), "setup AP  %u.%u.%u.%u", ip[0],
@@ -701,9 +705,14 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   PlayerInfo s;
   ps_snapshot(&s);
 
+  // "Waiting for something to play" is the same screen whichever mode we are
+  // in; only the words change. The beacon animates whenever a source is
+  // actually listening -- an advertising A2DP sink, or a DLNA renderer.
+  const bool listening = s.bt_active || s.source == PS_SRC_NETWORK;
+
   const int cx = 12, cy = 16;
   u8g2.drawXBMP(cx - 8, cy - 8, 16, 16, ICON_BT_BIG);
-  for (int k = 0; s.bt_active && k < 2; k++) {
+  for (int k = 0; listening && k < 2; k++) {
     // now % 4096 rather than now: a float loses its fractional bits once the
     // millisecond count gets large, and the animation would start to stutter
     // after a few weeks of uptime.
@@ -721,12 +730,16 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   }
 
   u8g2.setFont(FONT_TITLE);
-  // In Wi-Fi mode the Bluetooth stack is not running at all, so do not claim to
-  // be pairable -- this screen is the first place anyone looks.
-  u8g2.drawUTF8(32, 11, s.bt_active ? "Ready to pair" : "Wi-Fi mode");
+  // This screen is the first place anyone looks, so it never claims a capability
+  // the running mode does not have: no "ready to pair" without an A2DP sink, and
+  // no "cast to me" without a network renderer.
+  const char *headline = s.bt_active            ? "Ready to pair"
+                         : s.source == PS_SRC_NETWORK ? "Ready to cast"
+                                                      : "Wi-Fi mode";
+  u8g2.drawUTF8(32, 11, headline);
 
   u8g2.setFont(FONT_TEXT);
-  if (s.bt_active) {
+  if (s.bt_active || s.source == PS_SRC_NETWORK) {
     draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
   } else {
     draw_marquee(MQ_NAME, 32, 21, W - 32,
@@ -1113,7 +1126,7 @@ static void poll_button(uint32_t now) {
     btn_mode_until = now + UI_BTN_MODE_CONFIRM_MS;
     char title[24];
     snprintf(title, sizeof(title), "%s mode?",
-             management_mode_name(management_other_mode()));
+             management_mode_name(management_next_mode()));
     ui_show_system_status(UI_STATUS_NETWORK, title, "Let go, then press BOOT",
                           -1, UI_BTN_MODE_CONFIRM_MS);
     status_led_blip(2);

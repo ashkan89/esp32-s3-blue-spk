@@ -13,8 +13,14 @@
  * the counter again: if it moved, the copy might be a mix of two versions, so it
  * retries. The writer never waits for anything -- which is the whole point.
  *
- * Single writer only. Every ps_set_* below must be called from the Bluetooth
- * task (or setup()), never from two tasks at once.
+ * Single writer only. Every ps_set_* below must be called from one task and one
+ * task only. Which task that is depends on the radio mode, and the modes are
+ * mutually exclusive so the two never overlap:
+ *
+ *   Bluetooth / Wi-Fi + BT   the Bluetooth task, in line with the audio path.
+ *   Wi-Fi + BLE              the Arduino loop task, via net_audio_loop(). The
+ *                            decoder and DLNA tasks only set plain flags in
+ *                            net_audio.cpp; loop() is what publishes them here.
  */
 
 #pragma once
@@ -26,6 +32,15 @@
 static const size_t PS_TITLE_MAX = 64;
 static const size_t PS_TEXT_MAX = 40;
 static const size_t PS_NAME_MAX = 32;
+
+/// Where the audio being played is arriving from. The screens word themselves
+/// differently for each: there is no "pair your phone" in a network mode, and
+/// no "open the dashboard" in a Bluetooth one.
+enum PsSource : uint8_t {
+  PS_SRC_NONE = 0,   ///< no audio path is running at all (Wi-Fi only mode)
+  PS_SRC_BLUETOOTH,  ///< A2DP sink
+  PS_SRC_NETWORK,    ///< DLNA renderer or a URL the dashboard handed us
+};
 
 /// What the phone is doing, as far as AVRCP has told us.
 enum PsPlayback : uint8_t {
@@ -62,6 +77,9 @@ struct PlayerInfo {
   // --- link -------------------------------------------------------------
   char peer[PS_NAME_MAX];  ///< the phone's Bluetooth name, "" until it arrives
   esp_bd_addr_t peer_addr;
+  /// Which audio path is live this boot. Fixed at startup by the radio mode;
+  /// it never changes while running, because switching modes reboots.
+  PsSource source;
   bool connected;
   /// The Bluetooth stack is actually running. False while the setup access
   /// point holds the antenna: nothing can pair, and the screens should say so
@@ -80,6 +98,10 @@ struct PlayerInfo {
 
 void ps_init(const char *device_name);
 
+/// Declares which audio path this boot is running. Call once from setup(),
+/// before the source starts producing anything.
+void ps_set_source(PsSource source);
+
 /// The local device name, for the pairing screen. Never changes after init.
 const char *ps_device_name();
 
@@ -96,6 +118,16 @@ void ps_set_connection(bool connected, const esp_bd_addr_t addr);
 
 /// Whether the Bluetooth stack is up at all. Written from setup()/loop().
 void ps_set_bt_active(bool active);
+
+/// The network equivalent of ps_set_connection(): something is sending us audio
+/// and here is what to call it. `who` may be nullptr to leave the name alone.
+/// There is no address to record, which is the only reason this is separate.
+void ps_set_net_connection(bool connected, const char *who);
+
+/// Sets the track text directly, for sources that hand over plain strings
+/// rather than AVRCP attribute ids (ICY stream titles, DLNA DIDL metadata).
+/// Any argument may be nullptr to leave that field untouched.
+void ps_set_track_text(const char *title, const char *artist, const char *album);
 void ps_set_peer_name(const char *name);
 void ps_set_avrc(bool up);
 void ps_set_streaming(bool on);

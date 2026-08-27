@@ -105,6 +105,12 @@ void ps_init(const char *device_name) {
 
 const char *ps_device_name() { return g_device_name; }
 
+void ps_set_source(PsSource source) {
+  begin_write();
+  g_info.source = source;
+  end_write();
+}
+
 void ps_snapshot(PlayerInfo *out) {
   // Bounded retry: a torn read only happens if a write lands in the middle of
   // the memcpy, and a write holds the sequence for microseconds. The bound is
@@ -163,6 +169,54 @@ void ps_set_avrc(bool up) {
 void ps_set_bt_active(bool active) {
   begin_write();
   g_info.bt_active = active;
+  end_write();
+}
+
+// The network twin of ps_set_connection(). Same clearing rules on the way down:
+// everything on the screen came from whoever just went away, and leaving a dead
+// track title up is worse than showing nothing.
+void ps_set_net_connection(bool connected, const char *who) {
+  begin_write();
+  g_info.connected = connected;
+  if (connected) {
+    if (who != nullptr) copy_sanitised(g_info.peer, sizeof(g_info.peer), who);
+    g_info.connected_at = millis();
+  } else {
+    g_info.title[0] = g_info.artist[0] = g_info.album[0] = 0;
+    g_info.genre[0] = g_info.peer[0] = 0;
+    g_info.track_ms = g_info.pos_ms = 0;
+    g_info.track_num = g_info.track_count = 0;
+    g_info.playback = PS_STOPPED;
+    g_info.streaming = false;
+  }
+  end_write();
+}
+
+// ICY and DIDL hand over finished strings rather than AVRCP attribute ids, so
+// this is ps_set_metadata() without the id dispatch. The track counter is only
+// bumped when the title actually changes: an ICY stream repeats the same title
+// every few seconds, and a toast per repeat would be unbearable.
+void ps_set_track_text(const char *title, const char *artist,
+                       const char *album) {
+  begin_write();
+  if (title != nullptr) {
+    char clean[PS_TITLE_MAX];
+    copy_sanitised(clean, sizeof(clean), title);
+    if (strcmp(clean, g_info.title) != 0) {
+      memcpy(g_info.title, clean, sizeof(clean));
+      g_info.track_seq++;
+      // A new title is a new track: the position restarts whether or not the
+      // source bothers to tell us.
+      g_info.pos_ms = 0;
+      g_info.pos_at = millis();
+    }
+  }
+  if (artist != nullptr) {
+    copy_sanitised(g_info.artist, sizeof(g_info.artist), artist);
+  }
+  if (album != nullptr) {
+    copy_sanitised(g_info.album, sizeof(g_info.album), album);
+  }
   end_write();
 }
 
