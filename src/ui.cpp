@@ -11,6 +11,8 @@
 #include "app_config.h"
 #include "management.h"
 #include "audio_probe.h"
+#include "battery.h"
+#include "df_player.h"
 #include "player_state.h"
 #include "soft_clock.h"
 #include "status_led.h"
@@ -42,6 +44,49 @@ static U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE,
 #endif
 
 static bool g_present;
+
+/*
+ * The battery glyph.
+ *
+ * Drawn rather than stored as a bitmap because the interesting part is the fill
+ * level, and 14x7 pixels of outline plus a variable-width box is less code than
+ * eleven bitmaps would be. Nine pixels of interior means the fill has ten
+ * distinguishable states, which is as much as anybody reads off an icon.
+ *
+ * Charging is a diagonal stroke through the middle rather than an animation: the
+ * screens redraw at 30 fps and a pulsing icon on a 128x32 panel next to a
+ * spectrum analyser is one moving thing too many.
+ */
+static void draw_battery(int x, int y, const BatteryStatus &b) {
+  const int bw = 12, bh = 7;
+  u8g2.drawFrame(x, y, bw, bh);
+  u8g2.drawBox(x + bw, y + 2, 2, 3);  // the terminal nub
+
+  if (!b.present) {
+    // Two diagonal strokes: "no cell", which is different from "empty cell" and
+    // has to look different or a broken sense wire reads as a flat battery.
+    u8g2.drawLine(x + 2, y + 1, x + bw - 3, y + bh - 2);
+    u8g2.drawLine(x + 2, y + bh - 2, x + bw - 3, y + 1);
+    return;
+  }
+
+  const int inner = bw - 4;  // 1 px frame plus 1 px air on each side
+  int fill = (b.percent * inner + 50) / 100;
+  // A cell that is present but nearly empty still shows one pixel: a completely
+  // hollow icon is how the "no cell" case above reads.
+  if (fill < 1 && b.percent > 0) fill = 1;
+  if (fill > 0) u8g2.drawBox(x + 2, y + 2, fill, bh - 4);
+
+  if (b.charging) {
+    // A bolt through the icon, in the inverse of whatever is under it, so it is
+    // legible over both the filled and the empty part.
+    u8g2.setDrawColor(2);
+    u8g2.drawLine(x + 7, y + 1, x + 4, y + 3);
+    u8g2.drawLine(x + 4, y + 3, x + 7, y + 3);
+    u8g2.drawLine(x + 7, y + 3, x + 4, y + bh - 2);
+    u8g2.setDrawColor(1);
+  }
+}
 
 // Fonts. "_tf" carries the full Latin-1 range, which is what drawUTF8 needs for
 // accented track titles; "_tn" is digits only, which is all the clock wants.
@@ -648,14 +693,27 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
     u8g2.drawUTF8(0, 15, "waiting for a phone");
   }
 
-  // --- row 3: volume ---
+  // --- row 3: volume, and the battery on the right when there is one ---
   u8g2.setFont(FONT_SMALL);
   const int pct = (s.volume * 100 + 63) / 127;
   snprintf(line, sizeof(line), "%d%%", pct);
   const int pw = u8g2.getUTF8Width(line);
   u8g2.drawUTF8(0, 22, "VOL");
-  draw_right(W, 22, line);
-  draw_seg_bar(16, 17, W - 16 - pw - 4, 5, s.volume / 127.0f, 3, 1);
+
+  BatteryStatus bat;
+  battery_snapshot(&bat);
+  int right_edge = W;
+  if (bat.enabled) {
+    char bpct[8];
+    if (bat.present) snprintf(bpct, sizeof(bpct), "%u%%", (unsigned)bat.percent);
+    else strlcpy(bpct, "--", sizeof(bpct));
+    const int bpw = u8g2.getUTF8Width(bpct);
+    draw_battery(W - 14, 16, bat);
+    u8g2.drawUTF8(W - 14 - bpw - 2, 22, bpct);
+    right_edge = W - 14 - bpw - 5;
+  }
+  draw_right(right_edge, 22, line);
+  draw_seg_bar(16, 17, right_edge - 16 - pw - 4, 5, s.volume / 127.0f, 3, 1);
 
   // --- row 4: the numbers you want when something is odd ---
   char up[12];
@@ -673,9 +731,10 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
       const String ssid = WiFi.SSID();
       snprintf(network_line, sizeof(network_line),
                "%s%s  %u.%u.%u.%u  %ddBm",
-               mode == RADIO_MODE_COMBO  ? "wifi+bt "
-               : mode == RADIO_MODE_NET  ? "wifi+ble "
-                                         : "wifi ",
+               mode == RADIO_MODE_COMBO      ? "wifi+bt "
+               : mode == RADIO_MODE_NET      ? "wifi+ble "
+               : mode == RADIO_MODE_DFPLAYER ? "sd+wifi "
+                                             : "wifi ",
                ssid.c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.RSSI());
     } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
       const IPAddress ip = WiFi.softAPIP();
@@ -685,12 +744,53 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
       strlcpy(network_line, "wifi offline", sizeof(network_line));
     }
   }
-  if ((now / 5000) & 1) {
+  /*
+   * Three lines, not two, when there is a DFPlayer to talk about: what the
+   * module is doing is the thing you would look at this screen for in that mode,
+   * and it has no home on any other screen.
+   */
+  static char df_line[72] = "dfplayer  starting";
+  static uint32_t df_at;
+  const bool have_df = radio_mode_has_dfplayer(management_radio_mode());
+  DfStatus d;
+  // The snapshot's return value matters here: a failed one is zero-filled, and
+  // acting on it would put "no reply - check TX/RX" on screen about a module
+  // that is answering perfectly well. Keep the last line instead.
+  if (have_df && (df_at == 0 || now - df_at >= 1000) && df_player_snapshot(&d)) {
+    df_at = now | 1;  // never 0: that is the "not yet" sentinel
+    if (!d.running) {
+      strlcpy(df_line, "dfplayer  driver off", sizeof(df_line));
+    } else if (d.asleep) {
+      // Before the offline test: nothing is asked of a sleeping module, so it
+      // answers nothing, and "no reply" would be the wrong diagnosis.
+      strlcpy(df_line, "dfplayer  standby - wake it to play", sizeof(df_line));
+    } else if (!d.online) {
+      strlcpy(df_line, "dfplayer  no reply - check TX/RX", sizeof(df_line));
+    } else if (d.pcLink) {
+      strlcpy(df_line, "dfplayer  card mounted on a computer", sizeof(df_line));
+    } else {
+      snprintf(df_line, sizeof(df_line), "%s  %s  trk %u/%u  vol %u/%u  eq %s",
+               df_source_name(d.source), df_state_name(d.state),
+               (unsigned)d.track, (unsigned)d.totalTracks, (unsigned)d.volume,
+               (unsigned)DF_VOLUME_MAX, df_eq_name(d.eq));
+    }
+  }
+
+  const uint32_t slot = (now / 5000) % (have_df ? 3 : 2);
+  if (slot == 0) {
     strlcpy(line, network_line, sizeof(line));
+  } else if (slot == 1) {
+    int n = snprintf(line, sizeof(line),
+                     "up %s  heap %uk  %ufps  agc %ddB  clk %s", up,
+                     (unsigned)(ESP.getFreeHeap() / 1024),
+                     (unsigned)(fps_avg + 0.5f), (int)v.agc_db,
+                     soft_clock_source_name());
+    if (bat.present && n > 0 && (size_t)n < sizeof(line)) {
+      snprintf(line + n, sizeof(line) - n, "  bat %.2fV %s", bat.volts,
+               battery_state_name(bat.state));
+    }
   } else {
-    snprintf(line, sizeof(line), "up %s  heap %uk  %ufps  agc %ddB  clk %s", up,
-             (unsigned)(ESP.getFreeHeap() / 1024), (unsigned)(fps_avg + 0.5f),
-             (int)v.agc_db, soft_clock_source_name());
+    strlcpy(line, df_line, sizeof(line));
   }
   u8g2.setFont(FONT_SMALL);
   draw_marquee(MQ_STATS, 0, 30, W, line, dt);
@@ -708,7 +808,8 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   // "Waiting for something to play" is the same screen whichever mode we are
   // in; only the words change. The beacon animates whenever a source is
   // actually listening -- an advertising A2DP sink, or a DLNA renderer.
-  const bool listening = s.bt_active || s.source == PS_SRC_NETWORK;
+  const bool listening = s.bt_active || s.source == PS_SRC_NETWORK ||
+                         (s.source == PS_SRC_DFPLAYER && s.connected);
 
   const int cx = 12, cy = 16;
   u8g2.drawXBMP(cx - 8, cy - 8, 16, 16, ICON_BT_BIG);
@@ -733,13 +834,22 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   // This screen is the first place anyone looks, so it never claims a capability
   // the running mode does not have: no "ready to pair" without an A2DP sink, and
   // no "cast to me" without a network renderer.
-  const char *headline = s.bt_active            ? "Ready to pair"
-                         : s.source == PS_SRC_NETWORK ? "Ready to cast"
-                                                      : "Wi-Fi mode";
+  const char *headline = s.bt_active                     ? "Ready to pair"
+                         : s.source == PS_SRC_NETWORK   ? "Ready to cast"
+                         : s.source == PS_SRC_DFPLAYER  ? (s.connected
+                                                              ? "Card ready"
+                                                              : "No module")
+                                                        : "Wi-Fi mode";
   u8g2.drawUTF8(32, 11, headline);
 
   u8g2.setFont(FONT_TEXT);
-  if (s.bt_active || s.source == PS_SRC_NETWORK) {
+  if (s.source == PS_SRC_DFPLAYER) {
+    // The title line already carries the module's own words ("Nothing playing",
+    // "Card mounted on a computer"), which is more useful here than the device
+    // name -- nothing is going to connect to it in this mode.
+    draw_marquee(MQ_NAME, 32, 21, W - 32,
+                 s.title[0] ? s.title : "Waiting for the module", dt);
+  } else if (s.bt_active || s.source == PS_SRC_NETWORK) {
     draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
   } else {
     draw_marquee(MQ_NAME, 32, 21, W - 32,

@@ -31,6 +31,13 @@ class BluetoothA2DPSink;
  *               URL -- and BLE carries status, transport control and Wi-Fi
  *               provisioning. Bluetooth Classic is never started, so the setup
  *               access point is allowed here exactly as in MANAGEMENT.
+ *   DFPLAYER    Wi-Fi exactly as in MANAGEMENT -- station if a network is
+ *               saved, the setup access point if not, dashboard either way --
+ *               and the audio comes from a DFPlayer Mini instead of the radio.
+ *               The whole Bluetooth controller is released, because neither
+ *               half of it is used: the DFPlayer speaks 9600 baud serial and
+ *               produces its own analog output, so nothing about this mode
+ *               wants the antenna and Wi-Fi gets all of it.
  *
  * Switching is a deliberate act (hold BOOT, or the dashboard) and takes effect
  * through a restart, so every mode begins from a clean radio.
@@ -48,6 +55,7 @@ enum RadioMode : uint8_t {
   RADIO_MODE_BLUETOOTH = 1,
   RADIO_MODE_COMBO = 2,
   RADIO_MODE_NET = 3,
+  RADIO_MODE_DFPLAYER = 4,
   RADIO_MODE_COUNT
 };
 
@@ -67,6 +75,12 @@ inline bool radio_mode_has_ble(RadioMode mode) {
   return mode == RADIO_MODE_NET;
 }
 
+/// Whether a mode drives the DFPlayer Mini. Nothing else in the firmware talks
+/// to it, so this is also "is the DFPlayer the audio source".
+inline bool radio_mode_has_dfplayer(RadioMode mode) {
+  return mode == RADIO_MODE_DFPLAYER;
+}
+
 #if MANAGEMENT_ENABLED
 
 // Reads the persisted Bluetooth name. The returned pointer remains valid for
@@ -77,7 +91,7 @@ const char *management_device_name(const char *fallback);
 RadioMode management_radio_mode();
 
 /// The next one in the cycle, for the BOOT button and the console:
-/// Wi-Fi -> Bluetooth -> Wi-Fi + BT -> Wi-Fi.
+/// Wi-Fi -> Bluetooth -> Wi-Fi + BT -> Wi-Fi + BLE -> DFPlayer -> Wi-Fi.
 RadioMode management_next_mode();
 
 /// Human-readable, for the console and the display.
@@ -105,6 +119,21 @@ void management_factory_reset();
 // Told by main.cpp so the dashboard can report whether Bluetooth is live.
 void management_set_bt_active(bool active);
 
+/*
+ * The DFPlayer's stored start-up values, for main.cpp to hand to the driver.
+ *
+ * The module keeps nothing across a power cycle -- not the volume, not the
+ * source, not the EQ -- so every boot has to tell it again, and these are what
+ * the dashboard's "save as startup defaults" button stored. Plain integers
+ * rather than the driver's enums so management.h does not have to include
+ * df_player.h, which would drag hw_config.h into every mode.
+ *
+ * Any pointer may be null. Values are on the module's own scales: source is a
+ * DfSource, volume is 0..DF_VOLUME_MAX, loop is a DfLoop.
+ */
+void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
+                           uint8_t *loop, uint8_t *loopFolder, bool *autoplay);
+
 // Saves a network and restarts into it. Used by the BLE provisioning
 // characteristic, which is the way back in when the dashboard is unreachable
 // because the saved credentials are wrong. Does not return.
@@ -124,6 +153,8 @@ inline void management_loop() {}
 inline bool management_ap_running() { return false; }
 inline void management_factory_reset() {}
 inline void management_set_bt_active(bool) {}
+inline void management_df_defaults(uint8_t *, uint8_t *, uint8_t *, uint8_t *,
+                                   uint8_t *, bool *) {}
 inline void management_provision_wifi(const char *, const char *) {}
 inline bool management_led_state(StatusLedState *) { return false; }
 #endif

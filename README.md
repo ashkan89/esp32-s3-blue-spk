@@ -10,6 +10,15 @@ from, the volume, a clock, and a live spectrum analyser fed from the actual audi
 on its way to the DAC. The display is optional — with nothing on the I2C bus the
 firmware notices at boot and behaves exactly as it did without one.
 
+Audio does not have to arrive over the air. A **DFPlayer Mini** on the second
+UART turns the speaker into a standalone player: a microSD card or a USB flash
+drive, driven entirely from the dashboard, with Bluetooth switched off and Wi-Fi
+kept for the dashboard. Plug the module's USB port into a computer and the card
+mounts as a drive, so loading it needs no card reader. There is also an optional
+**battery gauge** — percentage, voltage, charge state and a low-battery
+indicator on the display, the LED and the dashboard. Both are absent-tolerant in
+the same way the display is.
+
 ## Hardware requirement
 
 This needs a **classic ESP32** (WROOM-32, -32D, -32E, or a WROVER). Bluetooth
@@ -23,6 +32,11 @@ what the folder is named.
 | PCM5102A I2S DAC board | the usual purple breakout with a 3.5 mm jack |
 | 0.91" 128×32 I2C OLED  | SSD1306, 4 pins (VCC/GND/SDA/SCL) — optional |
 | DS3231 RTC module      | optional, shares the OLED's two I2C wires |
+| DFPlayer Mini (MP3-TF-16P) | optional; YX5200 or the AA104/GD3200B clones. Adds *DFPlayer mode* |
+| microSD card, FAT32    | for the DFPlayer. 32 GB or less; ≤ 3000 files per folder |
+| USB-A socket           | optional, for a flash drive on the DFPlayer's host port |
+| USB-B / micro-B socket | optional, so the card mounts on a computer as a drive |
+| 1S Li-ion / LiPo cell + TP4056 board | optional; two 100k resistors make the divider |
 
 ## Wiring
 
@@ -47,6 +61,155 @@ for an external master clock and you get silence or noise. Tie it to GND.
 Power: the PCM5102A only draws ~20 mA, so USB power off the dev board is fine.
 If you hear a hiss or whine that tracks the CPU, give the DAC its own supply and
 join the grounds.
+
+### DFPlayer Mini → ESP32
+
+Optional, and only used in *DFPlayer mode*. Every pin the module brings out is
+either wired or accounted for — the point of this mode is that nothing on the
+module is out of reach from the dashboard.
+
+| DFPlayer | ESP32 | Notes |
+|----------|-------|-------|
+| 1 VCC     | 5V (VIN) | 4.0–5.0 V. 3.3 V works but is quiet and browns out on card access |
+| 7, 10 GND | GND      | both, and share ground with the DAC |
+| 2 RX      | GPIO17 **through 1k** | the resistor is not optional in practice — see below |
+| 3 TX      | GPIO16   | 3.3 V logic, connect directly |
+| 4 DAC_R   | output stage R | line level, ~1 Vrms — **not** the PCM5102A's input |
+| 5 DAC_L   | output stage L |  |
+| 6 SPK2    | — | the on-board 3 W amp is unused; this build drives a line output |
+| 8 SPK1    | — |  |
+| 9 IO1     | GPIO32 | the module's own *previous* button input |
+| 11 IO2    | GPIO33 | the module's own *next* button input |
+| 12 ADKEY1 | GPIO14 | ADC key bank 1 — plays track 1 when grounded |
+| 13 ADKEY2 | GPIO27 | ADC key bank 2 — plays track 11 when grounded |
+| 14 USB+   | USB socket D+ | see *USB* below |
+| 15 USB−   | USB socket D− |  |
+| 16 BUSY   | GPIO35 | LOW while a file is playing |
+
+**The 1k on RX.** Without it the module picks up switching noise off the ESP32's
+output and answers frames that were never sent — which looks like a module with
+a mind of its own rather than a wiring problem. Every DFPlayer application note
+says to fit it; fit it.
+
+**IO1, IO2, ADKEY1 and ADKEY2 are inputs on the module**, held high by its own
+pull-ups and acted on when pulled to ground. The firmware drives them
+*open-drain*: high-impedance inputs at rest, outputs driven low for the length
+of a press. So real buttons wired in parallel still work, nothing fights over
+the line, and the dashboard's hardware-pin buttons are a second control path
+that works even when the serial link does not.
+
+GPIO14 emits a brief pulse during boot on the ESP32. It is far too short for the
+module's ADC key sampler to see, but it is the reason ADKEY1 is on 14 rather
+than something the firmware drives.
+
+#### Audio wiring: the DFPlayer does not feed the PCM5102A
+
+DAC_L and DAC_R are **analog line outputs**. The PCM5102A's input is **digital
+I2S**. Nothing turns one into the other, so the DFPlayer joins the signal chain
+*after* the PCM5102A, at the output jack:
+
+```
+  DFPlayer DAC_L ---||--- 10k ---+
+                   10uF          |
+  PCM5102A  LOUT ------- 10k ----+---- jack tip (left)
+
+  DFPlayer DAC_R ---||--- 10k ---+
+                   10uF          |
+  PCM5102A  ROUT ------- 10k ----+---- jack ring (right)
+```
+
+and grounds joined. The series resistors make it a passive summing node; the
+10 µF blocks the DFPlayer's DC bias, which sits at about half its supply and
+would otherwise be pushed into whatever is downstream.
+
+This is safe precisely **because the radio modes are mutually exclusive**.
+DFPlayer mode never starts the A2DP sink or the network player, and no other
+mode starts the DFPlayer, so only one of the two sources is ever producing
+anything — the other contributes its output impedance and nothing else. The
+~6 dB the resistors cost is recovered on the DFPlayer's own 31-step volume and
+on the ESP32's soft-clipped gain path.
+
+If you would rather not solder a summing network, give the DFPlayer its own jack.
+Nothing in the firmware cares.
+
+#### USB: a flash drive, or the card on a computer
+
+Pins 14/15 are the module's USB data lines, and they do two different jobs
+depending on what is on the other end.
+
+- **A USB flash drive.** The module is the host and plays from the stick. Wire a
+  USB-A socket — D+ to pin 14, D− to pin 15, 5 V and GND from the same supply as
+  VCC — and pick source *USB drive* on the dashboard's Media page. It appears as
+  a second library alongside the card, with its own file count.
+- **A computer.** The module becomes a card reader and the microSD shows up as a
+  mass storage volume, which is how the card gets loaded without taking it out.
+  Wire a USB-B or micro-B socket the same way. The module reports the event over
+  the serial link (`0x3A`/`0x3B` with device 4), so the dashboard says *card
+  mounted on a computer*, the status LED shows the no-media pattern, and playback
+  from the card stops until the cable is unplugged — the card belongs to the
+  computer while it is there, and that is the module's behaviour, not a policy
+  this firmware invented.
+
+One OTG-style connector can do both. Two sockets wired in parallel is simpler
+and is what the table above assumes — do not plug both in at once.
+
+`PIN_DF_USB_DETECT` can sense VBUS on that socket through a divider, so a
+computer is visible even if the module missed its own event. It defaults to `-1`
+because an input-only pin with nothing on it floats, and a floating pin invents
+events.
+
+#### Card layout
+
+The YX5200 reports counts and indices and **never a filename**, so the dashboard
+works in numbers. Three ways to address a file, in decreasing order of
+reliability:
+
+| Addressing | Path | Notes |
+|------------|------|-------|
+| folder + track | `/01/003.mp3` … `/99/255.mp3` | stable; the one to use |
+| MP3 folder | `/MP3/0007.mp3` | flat playlist, up to 3000, survives re-copying |
+| flat index | *n*-th file on the card | follows FAT directory order, which changes when you re-copy the card |
+
+Zero-pad exactly as shown — the module's own firmware parses those names and
+will not find `/1/3.mp3`. FAT32, 32 GB or smaller. Copy files in the order you
+want the flat index to run, and delete the `.Trashes` / `._*` files a Mac leaves
+behind: the module counts them.
+
+### Battery gauge → ESP32
+
+Optional. One divider is the whole requirement; the charger pins add charge
+detection.
+
+```
+  BAT+ --- 100k ---+--- 100k --- GND
+                   |
+                GPIO34 (ADC1_CH6)
+```
+
+| Signal | ESP32 | Notes |
+|--------|-------|-------|
+| divider tap | GPIO34 | **ADC1**, and input-only — see below. Configured, but the gauge is off until enabled in Settings |
+| TP4056 CHRG  | GPIO36 (`PIN_BATTERY_CHARGING`, default `-1`) | open drain, needs its own 10k to 3V3 |
+| TP4056 STDBY | GPIO39 (`PIN_BATTERY_FULL`, default `-1`) | likewise |
+
+**ADC1, not ADC2.** ADC2 shares hardware with the Wi-Fi radio and reads garbage
+whenever the driver is up, which in this firmware is nearly always. That leaves
+GPIO32–39, and 34/35/36/39 are input-only, which is exactly what a sense pin
+wants. 100k/100k halves 4.2 V to 2.1 V, inside the ~2.45 V the 11 dB attenuator
+can read.
+
+The two charger pins default to off, so a speaker with only the divider still
+reports voltage and percentage correctly — it just cannot tell charging from
+resting, and says so rather than guessing. GPIO34–39 have no internal pull-ups,
+so each charger pin needs an external 10k to 3V3; wire them and the dashboard
+gains *Charging* and *Full*.
+
+Divider ratio, trim, cell count, full/empty voltages (**per cell**) and both
+warning thresholds are stored in NVS and editable from **Settings → Battery**, so
+one firmware serves a 1S and a 2S build — for 2S, set *Series cells* to 2 and the
+divider to 4, and leave full/empty at 4.20/3.30 because they describe one cell.
+Defaults live in [src/hw_config.h](src/hw_config.h), and the gauge itself is off
+until switched on there.
 
 ### OLED → ESP32
 
@@ -129,7 +292,15 @@ console is available at the IP printed on the serial monitor, at
 working, the setup network comes back after 15 seconds, so the speaker cannot be
 locked out by a router change.
 
-### Four radio modes
+Six pages: **Overview** (the transport, the source card for whichever mode is
+running, the battery, the radio mode picker, firmware), **Devices** (Bluetooth
+pairings), **Media** (the DFPlayer library and every one of its controls),
+**Wi-Fi**, **Updates** and **Settings**. Pages that do not apply to the running
+mode say so and explain how to get to one where they do, rather than showing
+dead controls — the Devices page in a mode with no A2DP sink, the Media page in a
+mode with no DFPlayer.
+
+### Five radio modes
 
 This chip has a single 2.4 GHz front end shared by Wi-Fi and Bluetooth. What
 Espressif's coexistence scheduler supports is Wi-Fi *station* alongside
@@ -146,10 +317,16 @@ what the modes are drawn along:
 | **Bluetooth only** | never initialised | A2DP sink owns the antenna | A2DP |
 | **Wi-Fi + Bluetooth** | station only; never raises the setup hotspot | A2DP sink, sharing the radio under coexistence | A2DP |
 | **Wi-Fi + BLE** | station, or setup hotspot; both are fine here | BLE only — Classic is never started | **Wi-Fi** (DLNA or a URL) |
+| **DFPlayer + Wi-Fi** | station, or setup hotspot; identical to Wi-Fi only mode | neither half is started; the *whole* controller goes back to the heap | **a microSD card or USB drive**, over serial |
 
 The mode is remembered across restarts, so a power cut brings the speaker back
 doing whatever it was doing. A factory-fresh board starts in Wi-Fi only mode
 with the setup hotspot up, which is where configuration happens.
+
+A mode that fails to stay up twice in a row falls back to Wi-Fi only mode, where
+the dashboard is reachable and the mode can be changed again. That sentinel lives
+in NVS, so it survives the reboot loop it exists to break; DFPlayer mode is
+covered by it like every other non-default mode.
 
 #### Wi-Fi + Bluetooth
 
@@ -220,23 +397,106 @@ Two honest limits. There is no skip or seek: a stream URL is not a playlist, and
 the dashboard disables those buttons rather than pretending. And a DLNA control
 point that sends a format outside those three gets an error rather than silence.
 
+#### DFPlayer + Wi-Fi
+
+The only mode where nothing arrives over the air. A DFPlayer Mini holds the card,
+decodes the file and produces its own analog output; the ESP32 does not touch the
+audio at all. What it does is *control* — a 9600 baud serial link and six GPIOs —
+and report what it learns.
+
+That is also why this is a Wi-Fi mode rather than a third radio arrangement.
+Nothing about it wants the antenna, so Wi-Fi gets all of it: station when a
+network is saved, the setup hotspot when not, and the dashboard either way,
+behaving exactly as it does in Wi-Fi only mode. Both halves of the Bluetooth
+controller are released at boot, which is the largest heap saving any mode makes
+and leaves the most room the OTA updater's TLS handshake ever gets.
+
+**What the dashboard drives.** Everything the module's protocol exposes, on the
+**Media** page:
+
+- **Source** — SD card, USB drive, on-board flash, AUX. Switching re-reads the
+  file count, and each source's presence is reported from the module's own
+  insert/remove notifications, so pulling the card out shows up.
+- **Playback** — the Overview transport works as it does for every other source:
+  play, pause, stop, next, previous, volume, mute. Next and previous are real
+  here, because the module has a real playlist. Forward and rewind are disabled
+  with the reason written underneath: the YX5200 reports no position and takes no
+  seek command, so there is nothing to seek with.
+- **Track selection** — folder + track, flat index, `/MP3/nnnn.mp3`, and the
+  `/ADVERT/` announcement channel that interrupts the current track and resumes
+  afterwards. Type a folder number and the module is asked how many tracks it
+  holds, so the range is known before anything plays.
+- **Sound** — the module's 31-step volume (the Overview slider is the same
+  setting on a 0–100% scale), all six EQ presets, all four repeat modes plus off,
+  and the module's own DAC mute.
+- **Hardware pins** — IO1 and IO2 pressed short or long, ADKEY1 and ADKEY2
+  triggered, the BUSY pin's state, and the dedicated DFPlayer LED (follow BUSY /
+  on / off / blink). Pins the board does not wire are greyed out with a tooltip
+  rather than hidden, so the page describes the hardware rather than pretending.
+- **The module** — firmware version, file and folder counts, tracks finished this
+  boot, the last protocol error in plain words, and reset / standby / wake.
+  Standby powers the decoder down, worth about 20 mA, which matters on a battery.
+
+**Standby is a state, not a silence.** A sleeping YX5200 answers every query with
+"I am in standby", so the firmware stops asking — which means no frame arrives,
+which is indistinguishable from a dead module unless somebody says otherwise. So
+standby is carried through the whole stack as its own state: the offline timeout
+is suspended, the BUSY pin is not allowed to overwrite it, the status LED shows
+*idle* rather than the fault pattern, and the dashboard, the OLED and the console
+all say *standby* and tell you to wake it. A command sent to a sleeping module
+comes back with "wake it first" rather than a protocol error code.
+
+**Startup defaults.** The module forgets everything at power-off — volume, source
+and EQ included — so the firmware sends them again at every boot. *Save as
+startup defaults* on the Media page stores what is set now; **Settings → DFPlayer
+startup defaults** edits them by hand and adds *start playing at power-on*, which
+waits for the card to mount and report a file count before sending anything and
+gives up after fifteen seconds rather than sitting on a command the module would
+refuse.
+
+**Two honest limits.** The module never reports a filename, a duration or a
+position, so the dashboard works in track numbers and the OLED's progress bar
+stays empty — the same case it already handles for phones that send no AVRCP
+metadata. And the spectrum, VU, scope and waterfall screens never appear in this
+mode: the analyser is fed from samples on their way through the ESP32's I2S, and
+in this mode there are none. The screens simply drop out of the carousel, which
+is the existing rule for "nothing to show" rather than anything new.
+
+**How the state is decided.** BUSY is a hardware output of the decoder, so it is
+a second ahead of anything the serial poll can say, and it wins — immediately
+when it says *playing*, and after 400 ms when it says *not playing*. The delay is
+there because the pin also goes high in the gap **between** two tracks, while the
+module closes one file and seeks the next; without it, every auto-advance in a
+repeat-all playlist would flicker the badge and the display through *stopped* and
+back. With BUSY unwired (`PIN_DF_BUSY = -1`) the driver falls back on the poll
+alone, which is a second slower and cannot see a track boundary at all.
+
+**Diagnosing it.** `df` on the console prints the whole picture in one line, and
+`df` with no argument also lists its own subcommands. The single most common
+failure is TX and RX not crossed over, which looks exactly like a dead module —
+the dashboard says *not answering* and names that cause, and the hardware-pin
+buttons keep working regardless, which is how you tell a wiring fault from a
+dead module.
+
 #### Switching
 
 **From the speaker:** hold BOOT for three seconds. The panel offers the next
-mode in the cycle — Wi-Fi → Bluetooth → Wi-Fi + BT → Wi-Fi + BLE → Wi-Fi — so
+mode in the cycle — Wi-Fi → Bluetooth → Wi-Fi + BT → Wi-Fi + BLE → DFPlayer →
+Wi-Fi — so
 let go and press BOOT once within eight seconds to confirm. Ignore it and it
 goes away; keep holding and you are into the factory-reset countdown instead. On
 a board with no display, a three-second hold released before six seconds
 switches immediately.
 
-**From the dashboard:** **Overview → Radio mode**, which lists all four and
+**From the dashboard:** **Overview → Radio mode**, which lists all five and
 marks the current one. Switching to *Bluetooth only* takes Wi-Fi and the page
 with it, so it asks first; the others come back in a few seconds. *Wi-Fi +
-Bluetooth* stays greyed out until a network has been saved.
+Bluetooth* stays greyed out until a network has been saved, and *DFPlayer +
+Wi-Fi* is greyed out only in a build compiled with `-DDFPLAYER_ENABLED=0`.
 
-**From the console:** `mode` steps to the next one; `wifi`, `bt`, `both` and
-`net` go somewhere specific; `radio` prints where you are and what each half is
-doing.
+**From the console:** `mode` steps to the next one; `wifi`, `bt`, `both`, `net`
+and `sd` go somewhere specific; `radio` prints where you are and what each half
+is doing.
 
 Every switch goes through a restart. Both stacks own controller state, DMA
 channels and tasks, and ESP32-A2DP's `end()` also forgets the last paired
@@ -599,10 +859,28 @@ bt                     switch to Bluetooth only mode, reboots
 wifi                   switch to Wi-Fi only mode, reboots
 both                   switch to Wi-Fi + Bluetooth mode, reboots
 net                    switch to Wi-Fi + BLE mode, reboots
+sd                     switch to DFPlayer mode, reboots
 pair                   force Bluetooth discoverable again
 play <url>             play a network stream (Wi-Fi + BLE mode)
 stop                   stop network playback
+df                     DFPlayer status in one line
+df play [n]            resume, or play track n
+df pause | stop | next | prev
+df vol 0-30            module volume
+df folder F T          play /0F/00T.mp3
+df source sd|usb|flash|aux
+df eq 0-5              normal pop rock jazz classic bass
+df loop off|track|folderN|all|random
+df io1[long] | io2[long] | key1 | key2   press the module's own inputs
+df led auto|on|off|blink
+df reset | standby | wake | refresh
+bat                    battery voltage, percentage and state
+bat calib <volts>      trim the gauge to a meter reading (not saved)
 ```
+
+`bat calib` applies the trim but does not store it, because the console has no
+password on it; **Settings → Battery → Calibrate against a meter** does the same
+calculation and saves the result.
 
 ### The status LED
 
@@ -619,6 +897,14 @@ pattern repeats every two seconds:
 | three quick blinks, then dark | the setup hotspot is open and waiting for you |
 | fast strobe | writing flash — do not remove power |
 | two double blinks | an update failed |
+| two slow winks | the source has nothing to play from — no card, or the card is mounted on a computer |
+| long flash then a short one | the battery is below the critical threshold |
+
+The battery pattern outranks everything, in every mode including *Bluetooth
+only* where the LED otherwise belongs entirely to the audio state — a cell about
+to cut out is the one fact that matters more than what is playing. It is
+suppressed while the charger says it is charging, so a speaker being fixed stops
+shouting about it.
 
 Events are shown as a short burst of fast blinks over whatever pattern is
 running: two on a phone connecting or a Wi-Fi client joining, three on a
@@ -709,6 +995,81 @@ different key, so the first boot after upgrading falls back to the build stamp
 until the first sync lands.
 
 `-DCLOCK_24H=0` switches the clock screen to 12-hour with AM/PM.
+
+## The battery gauge
+
+Reading a battery with an ADC is easy; getting a number worth showing is not, so
+it is worth being clear about which of the two this is.
+
+**What it does well: resting voltage.** The divider is read nine times, the
+*median* is taken — the ESP32's SAR ADC produces the occasional wild sample and a
+mean carries it through — and the result is smoothed with a slow EMA.
+`analogReadMilliVolts()` applies the chip's factory ADC calibration, worth about
+40 mV over converting the raw count by hand. That gives a voltage good to a few
+tens of millivolts once the trim is set, which is the accuracy limit of the
+resistors rather than of the converter.
+
+**What no voltage gauge does well: percentage under load.** A Li-ion cell's
+terminal voltage sags with current, so a speaker that starts playing looks like
+it lost 10% and gets it back when the track ends. That is physics, not a bug — a
+coulomb counter is the fix and this board does not have one. Two things keep it
+presentable: the curve is the *loaded discharge* shape rather than the
+open-circuit one, and the smoothing is slow enough that the number does not jump
+around. Read it as "roughly how full", which is what a battery indicator is for.
+
+**The curve.** A straight line from empty to full is the obvious thing and is
+wrong in the way that matters: a Li-ion cell spends most of its charge between
+3.9 V and 3.6 V, so a linear gauge shows 50% for an hour and then falls off a
+cliff. [src/battery.cpp](src/battery.cpp) instead interpolates between fourteen
+knees of a moderately loaded 18650 discharge — each one a number you can check
+against a datasheet curve rather than a polynomial nobody can audit.
+
+The table is fixed and the configurable end points are applied *afterwards*, by
+rescaling: the curve is evaluated at the cell voltage, at `full` and at `empty`,
+and the answer is where the first sits between the other two. So a pack
+deliberately charged to 4.10 V — or to 3.90 V, which is where longevity really
+lives — reads 100% when it is as full as it gets and 98% just below, rather than
+jumping from 100% straight to whatever the raw curve happens to say. Full and
+empty are **per cell**, because that is what the curve consumes; the divider
+reports pack volts and the cell count converts between them.
+
+**Charge state comes from the charger, not from the voltage.** A cell resting at
+4.15 V and a cell being topped up at 4.15 V are indistinguishable from the
+voltage alone, so without the TP4056's CHRG and STDBY pins the state is reported
+as *unknown* and the dashboard says why. Guessing would mean the indicator lies
+at the one moment anybody is watching it.
+
+**It starts switched off.** A sense pin with no divider on it floats, a floating
+input invents readings, and one that happened to settle inside a cell's voltage
+window would have the speaker insisting on a critically flat battery — flashing
+the status LED about it, in every mode, on a board with no battery in it. So the
+firmware never assumes a pack is fitted. The pin is configured, the Overview card
+shows *Gauge off* and points at the switch, and **Settings → Battery → Battery
+gauge enabled** starts it reading. Nothing has to be rebuilt, and turning it off
+again clears the reading rather than leaving a stale *critical* behind.
+
+**Where it shows up.** The Overview page gains a battery card — percentage, a
+bar, voltage, state, and the reason when something is off. The OLED's Info screen
+draws a battery glyph with a fill level, and the rotating stats line carries the
+voltage and state; a broken sense wire draws a crossed-out battery rather than an
+empty one, because "no cell" and "flat cell" are different problems. The status
+LED gets its own pattern below the critical threshold. `bat` on the console
+prints everything including the raw millivolts at the pin, which is the number
+you want when the divider is wrong.
+
+**Calibration.** Put a meter across the pack, type what it reads into **Settings
+→ Battery → Calibrate against a meter**, and the trim that makes the firmware
+agree is computed and stored. A target more than twice what the divider suggests
+is refused rather than stored, because that is a wrong divider ratio rather than
+a tolerance to trim out.
+
+**Nothing is switched off automatically at any threshold.** That is deliberate: a
+reading that sagged under load should not cut the speaker out mid-track, and a
+firmware that powers down a speaker on an ADC reading is a firmware that
+sometimes powers it down for no reason. The gauge warns — on the display, the LED
+and the dashboard — and leaves the decision to whoever is listening. Cell
+protection belongs to the protection circuit on the pack, which is where it can
+actually be trusted.
 
 ## Melodies
 
@@ -820,6 +1181,35 @@ Other things it might be:
 - **A whine that changes pitch with activity** is supply noise coupling in — give
   the DAC its own 5 V supply and join the grounds.
 
+## Troubleshooting the DFPlayer
+
+| Symptom | Cause |
+|---------|-------|
+| dashboard says *not answering*, nothing plays | TX/RX not crossed over. The module's TX goes to `PIN_DF_RX` (GPIO16) and its RX to `PIN_DF_TX` (GPIO17). This is the failure, most of the time |
+| answers, then stops answering | no 1k in series with the module's RX. It picks up switching noise and acts on frames that were never sent |
+| the dashboard says *standby* and nothing plays | somebody pressed Standby. Press Wake, or Reset |
+| plays for a second and cuts out, or resets the ESP32 | powered from 3.3 V, or from a supply that cannot carry the card's peak draw. The module wants 4–5 V and a real 500 mA |
+| *No files found on this source* | not FAT32, larger than 32 GB, or the files are not zero-padded the way the module's own parser needs (`/01/003.mp3`, not `/1/3.mp3`) |
+| the file count is higher than the number of songs | a Mac wrote `._*` and `.Trashes`. The module counts them; delete them |
+| the flat track index plays the wrong song | that index follows FAT directory order, which changes when you re-copy the card. Use folder + track |
+| *card mounted on a computer* and playback stops | a USB cable to a PC is plugged into the module. The card belongs to the computer while it is there; eject and unplug |
+| no sound but the module says *playing* | the summing network. Check the 10 µF and the 10k on each channel, and that the module's grounds are joined to the DAC's. Also check *Module output enabled* on the Media page — it is the module's own DAC mute |
+| audible hum only in this mode | the DFPlayer and the ESP32 sharing a thin ground. Star-ground both to the supply rather than daisy-chaining |
+| hardware pin buttons work, serial does not | the module is alive and the UART is not. Confirms a wiring fault rather than a dead module |
+
+## Troubleshooting the battery gauge
+
+| Symptom | Cause |
+|---------|-------|
+| *Not detected*, and the hint shows a low millivolt reading | no divider, wrong pin, or the pack is disconnected. `bat` on the console prints the raw millivolts |
+| the voltage is about half or double what the meter says | the divider ratio does not match the resistors. 100k/100k is 2.0; fix the ratio before calibrating |
+| the percentage is 30–60 mV out | 5% resistors. Calibrate against a meter |
+| the percentage drops sharply when playback starts and recovers after | the cell sagging under load. Expected; see *The battery gauge* above |
+| the state is always *On battery*, even on a charger | the CHRG and STDBY pins are not wired. Voltage and percentage are still right |
+| the card says *Gauge off* | that is the default. **Settings → Battery → Battery gauge enabled** |
+| a 2S pack reads 100% at every voltage | full/empty were typed as pack voltage. They are **per cell**: 4.20 and 3.30 for a 2S pack too, with *Series cells* set to 2 |
+| the reading wanders while Wi-Fi is up | a sense pin on ADC2. Use GPIO32–39, which are ADC1 |
+
 ## Troubleshooting the display
 
 **Nothing on the panel, and the log says `[ui] no SSD1306 at 0x3C or 0x3D`.**
@@ -878,6 +1268,37 @@ Display knobs live in [src/ui_config.h](src/ui_config.h), all commented in place
   `VIS_PEAK_FALL_PER_S`, `VIS_PEAK_HANG_MS`, `VIS_AGC_RELEASE_S`
 - `CLOCK_24H`, `CLOCK_TZ_OFFSET_MIN`
 
+DFPlayer and battery knobs live in [src/hw_config.h](src/hw_config.h), whose
+header comment carries the full wiring for both. All of them are `#ifndef`-
+guarded, so a variant board needs no source edit:
+
+```ini
+build_flags =
+    -DPIN_DF_BUSY=34          ; BUSY moved
+    -DPIN_DF_LED=-1           ; no DFPlayer LED fitted
+    -DPIN_BATTERY_CHARGING=36 ; TP4056 CHRG wired, with its 10k pull-up
+    -DPIN_BATTERY_FULL=39     ; TP4056 STDBY likewise
+    -DDFPLAYER_ENABLED=0      ; drop the driver, the mode and the Media page
+    -DBATTERY_ENABLED=0       ; drop the gauge
+```
+
+- `PIN_DF_TX` / `PIN_DF_RX` / `PIN_DF_BUSY`, `PIN_DF_IO1` / `IO2`,
+  `PIN_DF_ADKEY1` / `ADKEY2`, `PIN_DF_LED`, `PIN_DF_USB_DETECT` — `-1` disables
+  any individual pin, and the dashboard greys out what it cannot drive.
+- `DF_COMMAND_GAP_MS`, `DF_POLL_MS`, `DF_PRESS_SHORT_MS`, `DF_PRESS_LONG_MS`,
+  `DF_ONLINE_TIMEOUT_MS`, `DF_VOLUME_DEFAULT`
+- `PIN_BATTERY_SENSE`, `PIN_BATTERY_CHARGING`, `PIN_BATTERY_FULL`,
+  `BATTERY_STAT_ACTIVE_LOW`
+- `BATTERY_DIVIDER_DEFAULT`, `BATTERY_CALIBRATION_DEFAULT`,
+  `BATTERY_FULL_V_DEFAULT`, `BATTERY_EMPTY_V_DEFAULT`,
+  `BATTERY_LOW_PCT_DEFAULT`, `BATTERY_CRITICAL_PCT_DEFAULT` — only the
+  factory-fresh values; everything here is editable from **Settings → Battery**
+  and stored in NVS, so one firmware serves a 1S and a 2S build. The two voltages
+  are per cell.
+- `BATTERY_OVERSAMPLE`, `BATTERY_SMOOTHING`, `BATTERY_SAMPLE_MS`,
+  `BATTERY_MIN_PLAUSIBLE_V` / `BATTERY_MAX_PLAUSIBLE_V` — the window a reading
+  has to fall inside to count as a cell rather than as a floating pin
+
 To make the ESP32 forget the paired phone, call
 `a2dp_sink.clean_last_connection()` once in `setup()`, flash, then remove it again.
 
@@ -887,6 +1308,9 @@ To make the ESP32 forget the paired phone, call
 |------|---------------|
 | [src/main.cpp](src/main.cpp) | A2DP sink, volume control, melodies, serial console |
 | [src/status_led.h](src/status_led.h) / [.cpp](src/status_led.cpp) | the on-board LED: one blink pattern per state, plus event blips |
+| [src/df_player.h](src/df_player.h) / [.cpp](src/df_player.cpp) | the DFPlayer Mini: the YX5200 protocol, its GPIOs, and the driver task that owns the UART |
+| [src/battery.h](src/battery.h) / [.cpp](src/battery.cpp) | the battery gauge: median-filtered ADC, the discharge curve, charger pins |
+| [src/hw_config.h](src/hw_config.h) | every DFPlayer and battery pin and tunable, with the wiring in the header comment |
 | [src/management.h](src/management.h) / [.cpp](src/management.cpp) | Wi-Fi, authenticated API, Bluetooth/media control, OTA and GitHub updater |
 | [src/web_assets.h](src/web_assets.h) | responsive dashboard source, gzip-embedded at build time; its `<script>` is syntax-checked by [scripts/embed_web.py](scripts/embed_web.py) before every build |
 | [src/ui_config.h](src/ui_config.h) | every display, analyser and clock knob |

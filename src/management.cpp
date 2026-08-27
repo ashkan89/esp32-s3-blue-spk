@@ -19,7 +19,9 @@
 #include <esp_wifi.h>
 
 #include "BluetoothA2DPSink.h"
+#include "battery.h"
 #include "ble_control.h"
+#include "df_player.h"
 #include "net_audio.h"
 #include "player_state.h"
 #include "soft_clock.h"
@@ -40,6 +42,29 @@ struct Settings {
   String githubAsset;
   String githubToken;
   bool apAlways;
+
+  // DFPlayer boot defaults. The module forgets everything at power-off, so the
+  // firmware has to hand it a source, a volume and an EQ every time; these are
+  // the values the dashboard's "Save as startup defaults" button stores.
+  uint8_t dfSource;
+  uint8_t dfVolume;  // module scale, 0..DF_VOLUME_MAX
+  uint8_t dfEq;
+  uint8_t dfLoop;
+  uint8_t dfLoopFolder;
+  bool dfAutoplay;   // start playing as soon as the card is found
+
+  // The battery pack. These describe hardware, not preference: the divider and
+  // the trim are what turn an ADC reading into a voltage, and getting them from
+  // NVS rather than from a build flag is what lets one firmware serve a 1S and
+  // a 2S build.
+  bool batteryEnabled;
+  float batteryDivider;
+  float batteryCalibration;
+  float batteryFull;
+  float batteryEmpty;
+  uint8_t batteryCells;
+  uint8_t batteryLow;
+  uint8_t batteryCritical;
 };
 
 struct UpdateState {
@@ -197,7 +222,38 @@ void loadSettings(const char *fallbackName) {
   settings.githubAsset = prefs.getString("ghAsset", DEFAULT_GITHUB_ASSET);
   settings.githubToken = prefs.getString("ghToken", "");
   settings.apAlways = prefs.getBool("apAlways", false);
+
+  settings.dfSource = prefs.getUChar("dfSrc", (uint8_t)DF_SRC_SD);
+  settings.dfVolume = prefs.getUChar("dfVol", DF_VOLUME_DEFAULT);
+  settings.dfEq = prefs.getUChar("dfEq", 0);
+  settings.dfLoop = prefs.getUChar("dfLoop", (uint8_t)DF_LOOP_OFF);
+  settings.dfLoopFolder = prefs.getUChar("dfLoopF", 1);
+  settings.dfAutoplay = prefs.getBool("dfAuto", false);
+  if (settings.dfVolume > DF_VOLUME_MAX) settings.dfVolume = DF_VOLUME_MAX;
+  if (settings.dfEq > 5) settings.dfEq = 0;
+  if (settings.dfLoop > (uint8_t)DF_LOOP_RANDOM) settings.dfLoop = DF_LOOP_OFF;
+
+  // Off until asked for: see the note on PIN_BATTERY_SENSE in hw_config.h. The
+  // pin is ready, the settings card is there, and one switch starts it.
+  settings.batteryEnabled = prefs.getBool("batOn", false);
+  settings.batteryDivider = prefs.getFloat("batDiv", BATTERY_DIVIDER_DEFAULT);
+  settings.batteryCalibration = prefs.getFloat("batCal", BATTERY_CALIBRATION_DEFAULT);
+  settings.batteryCells = prefs.getUChar("batCells", 1);
+  settings.batteryFull = prefs.getFloat("batFull", BATTERY_FULL_V_DEFAULT);
+  settings.batteryEmpty = prefs.getFloat("batEmpty", BATTERY_EMPTY_V_DEFAULT);
+  settings.batteryLow = prefs.getUChar("batLow", BATTERY_LOW_PCT_DEFAULT);
+  settings.batteryCritical = prefs.getUChar("batCrit", BATTERY_CRITICAL_PCT_DEFAULT);
+
   stableDeviceName = settings.deviceName;
+}
+
+/// Hands the stored pack description to the gauge. Called from
+/// management_begin() before the gauge starts, and again on every settings save.
+void applyBatterySettings() {
+  battery_configure(settings.batteryEnabled, settings.batteryDivider,
+                    settings.batteryCalibration, settings.batteryFull,
+                    settings.batteryEmpty, settings.batteryCells,
+                    settings.batteryLow, settings.batteryCritical);
 }
 
 void saveSettings() {
@@ -211,6 +267,22 @@ void saveSettings() {
   prefs.putString("ghAsset", settings.githubAsset);
   prefs.putString("ghToken", settings.githubToken);
   prefs.putBool("apAlways", settings.apAlways);
+
+  prefs.putUChar("dfSrc", settings.dfSource);
+  prefs.putUChar("dfVol", settings.dfVolume);
+  prefs.putUChar("dfEq", settings.dfEq);
+  prefs.putUChar("dfLoop", settings.dfLoop);
+  prefs.putUChar("dfLoopF", settings.dfLoopFolder);
+  prefs.putBool("dfAuto", settings.dfAutoplay);
+
+  prefs.putBool("batOn", settings.batteryEnabled);
+  prefs.putFloat("batDiv", settings.batteryDivider);
+  prefs.putFloat("batCal", settings.batteryCalibration);
+  prefs.putUChar("batCells", settings.batteryCells);
+  prefs.putFloat("batFull", settings.batteryFull);
+  prefs.putFloat("batEmpty", settings.batteryEmpty);
+  prefs.putUChar("batLow", settings.batteryLow);
+  prefs.putUChar("batCrit", settings.batteryCritical);
 }
 
 bool authenticated() {
@@ -992,6 +1064,11 @@ void handleStatus() {
   mode["wifi"] = radio_mode_has_wifi(radioMode);
   mode["bluetooth"] = radio_mode_has_a2dp(radioMode);
   mode["ble"] = radio_mode_has_ble(radioMode);
+  mode["dfplayer"] = radio_mode_has_dfplayer(radioMode);
+  // The mode is offerable only if the driver was compiled in. Reported rather
+  // than assumed, so a -DDFPLAYER_ENABLED=0 build greys the button out instead
+  // of rebooting into a mode with no audio source in it.
+  mode["dfBuilt"] = DFPLAYER_ENABLED ? true : false;
   // Combo mode cannot raise the setup access point, so it is only offerable
   // once a network has been saved. The dashboard greys it out until then.
   mode["comboReady"] = settings.ssid.length() > 0;
@@ -1043,6 +1120,89 @@ void handleStatus() {
     net["renderer"] = n.renderer_up;
     net["sampleRate"] = n.sample_rate;
   }
+
+  /*
+   * DFPlayer mode only, and always present for the same reason the network block
+   * is: the dashboard decides whether to draw the page from `running`, and a key
+   * that appears and disappears is harder to write against than one that is
+   * always there and sometimes false.
+   */
+  JsonObject df = doc["dfplayer"].to<JsonObject>();
+  df["running"] = df_player_running();
+  if (df_player_running()) {
+    DfStatus d;
+    // A stale copy is reported as stale rather than dressed up as an offline
+    // module: the dashboard leaves the last values on screen for one poll
+    // instead of flashing "not answering" at a mutex that was merely busy.
+    df["stale"] = !df_player_snapshot(&d);
+    df["online"] = d.online;
+    df["asleep"] = d.asleep;
+    df["state"] = df_state_name(d.state);
+    df["busy"] = d.busy;
+    df["source"] = (int)d.source;
+    df["sourceName"] = df_source_name(d.source);
+    df["reported"] = (int)d.reported;
+    df["sd"] = d.sdPresent;
+    df["usb"] = d.usbPresent;
+    df["flash"] = d.flashPresent;
+    df["pc"] = d.pcLink;
+    df["track"] = d.track;
+    df["totalTracks"] = d.totalTracks;
+    df["folders"] = d.folders;
+    df["folder"] = d.folder;
+    df["folderTracks"] = d.folderTracks;
+    df["queriedFolder"] = d.queriedFolder;
+    df["volume"] = d.volume;
+    df["volumeMax"] = DF_VOLUME_MAX;
+    df["eq"] = d.eq;
+    df["eqName"] = df_eq_name(d.eq);
+    df["loop"] = (int)d.loop;
+    df["loopName"] = df_loop_name(d.loop);
+    df["dac"] = d.dacOn;
+    df["version"] = d.version;
+    df["finished"] = d.finished;
+    df["error"] = d.error;
+    df["led"] = (int)d.ledMode;
+    df["ledOn"] = d.ledOn;
+    // Which of the module's own pins this board actually wired, so the hardware
+    // buttons on the dashboard are only offered when they would do something.
+    JsonObject pins = df["pins"].to<JsonObject>();
+    pins["io1"] = df_player_pin_available(DF_PIN_IO1);
+    pins["io2"] = df_player_pin_available(DF_PIN_IO2);
+    pins["adkey1"] = df_player_pin_available(DF_PIN_ADKEY1);
+    pins["adkey2"] = df_player_pin_available(DF_PIN_ADKEY2);
+    pins["busy"] = PIN_DF_BUSY >= 0;
+    pins["led"] = PIN_DF_LED >= 0;
+    pins["usbDetect"] = PIN_DF_USB_DETECT >= 0;
+  }
+
+  // The battery is not mode-specific: it powers the whole speaker, so it is
+  // reported in every mode, and `enabled` is false rather than absent when no
+  // pack is wired.
+  BatteryStatus b;
+  battery_snapshot(&b);
+  JsonObject bat = doc["battery"].to<JsonObject>();
+  // "wired" is about the build, "enabled" about the setting. The dashboard needs
+  // both: a board with no sense pin should not show a battery card at all, but a
+  // board that has one and has the gauge switched off should show the card and
+  // say where the switch is -- otherwise the feature leaves no trace of itself.
+  bat["wired"] = PIN_BATTERY_SENSE >= 0;
+  bat["enabled"] = b.enabled;
+  bat["present"] = b.present;
+  bat["state"] = battery_state_name(b.state);
+  bat["percent"] = b.percent;
+  bat["volts"] = serialized(String(b.volts, 3));
+  bat["cellVolts"] = serialized(String(b.cellVolts, 3));
+  bat["cells"] = b.cells;
+  bat["low"] = b.low;
+  bat["critical"] = b.critical;
+  bat["charging"] = b.charging;
+  bat["chargeDone"] = b.chargeDone;
+  bat["chargePins"] = b.haveChargePins;
+  bat["pinMillivolts"] = b.millivoltsAtPin;
+  bat["samples"] = b.samples;
+  bat["lowPercent"] = b.lowPercent;
+  bat["criticalPercent"] = b.criticalPercent;
 
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
@@ -1106,8 +1266,64 @@ void handleNetworkMedia(const String &action, JsonDocument &body) {
   sendJson(reply);
 }
 
+/*
+ * The same verbs again, for the DFPlayer.
+ *
+ * This one can do more of them than the network player: the module has a real
+ * playlist, so next and previous mean something. What it cannot do is seek --
+ * the YX5200 has no position, forwards or backwards -- so fast forward and
+ * rewind are refused with a reason rather than wired to something approximate.
+ */
+void handleDfMedia(const String &action, JsonDocument &body) {
+  bool ok = true;
+  if (action == "play") ok = df_player_play();
+  else if (action == "pause") ok = df_player_pause();
+  else if (action == "toggle") ok = df_player_toggle();
+  else if (action == "stop") ok = df_player_stop();
+  else if (action == "next") ok = df_player_next();
+  else if (action == "previous") ok = df_player_previous();
+  else if (action == "volume") {
+    const int volume = constrain(body["value"] | 0, 0, 127);
+    if (volume > 0) mutedFrom = (uint8_t)volume;
+    ok = df_player_set_volume((uint8_t)volume);
+  } else if (action == "mute") {
+    ok = df_player_set_volume(df_player_volume() ? 0
+                                                : (mutedFrom ? mutedFrom : 80));
+  } else if (action == "forward" || action == "rewind") {
+    sendError(409, "The DFPlayer cannot seek within a track: it reports no "
+                   "position and takes no seek command. Use next and previous.");
+    return;
+  } else if (action == "url") {
+    sendError(409, "The DFPlayer plays from its own card or USB drive, not from "
+                   "a network address. Pick a track on the Media page.");
+    return;
+  } else {
+    sendError(400, "Unknown media action");
+    return;
+  }
+  if (!ok) {
+    sendError(503, "The DFPlayer command queue is full; the module is not "
+                   "keeping up. Try again in a moment.");
+    return;
+  }
+  JsonDocument reply;
+  reply["ok"] = true;
+  sendJson(reply);
+}
+
 void handleMedia() {
   if (!requireAuth()) return;
+  if (df_player_running()) {
+    JsonDocument body;
+    if (!readBody(body)) return;
+    handleDfMedia(body["action"] | "", body);
+    return;
+  }
+  if (radio_mode_has_dfplayer(radioMode)) {
+    sendError(409, "The DFPlayer driver did not start in this boot; check the "
+                   "serial log.");
+    return;
+  }
   if (net_audio_running()) {
     JsonDocument body;
     if (!readBody(body)) return;
@@ -1170,6 +1386,8 @@ void handleDevices() {
   if (!btActive) {
     doc["unavailable"] = radio_mode_has_ble(radioMode)
                              ? "Wi-Fi + BLE mode runs no A2DP sink"
+                         : radio_mode_has_dfplayer(radioMode)
+                             ? "DFPlayer mode runs no A2DP sink"
                              : "Bluetooth is off in Wi-Fi mode";
     sendJson(doc);
     return;
@@ -1201,6 +1419,9 @@ void handleDeviceAction() {
     sendError(409, radio_mode_has_ble(radioMode)
                        ? "Wi-Fi + BLE mode runs no A2DP sink, so there are no "
                          "pairings to manage. Switch to a Bluetooth mode first."
+                   : radio_mode_has_dfplayer(radioMode)
+                       ? "DFPlayer mode runs no A2DP sink, so there are no "
+                         "pairings to manage. Switch to a Bluetooth mode first."
                        : "Bluetooth is off in Wi-Fi mode. Switch to Wi-Fi + BT "
                          "to manage devices from here.");
     return;
@@ -1231,6 +1452,223 @@ void handleDeviceAction() {
   JsonDocument reply;
   reply["ok"] = true;
   sendJson(reply);
+}
+
+/*
+ * Everything about the DFPlayer that is not a transport verb.
+ *
+ * One endpoint rather than a dozen, because the module's controls are a flat set
+ * of independent settings and the dashboard sends whichever one the user
+ * touched. Each action maps onto exactly one driver call; the driver does the
+ * range checking, and a rejected value comes back as a 400 with the reason
+ * rather than being silently clamped -- a track number the card does not have is
+ * worth telling somebody about.
+ */
+void handleDfPlayer() {
+  if (!requireAuth()) return;
+  if (!df_player_running()) {
+    sendError(409, radio_mode_has_dfplayer(radioMode)
+                       ? "The DFPlayer driver did not start; check the serial "
+                         "log for a UART or memory failure."
+                       : "The DFPlayer only runs in DFPlayer mode. Switch to it "
+                         "under Radio mode on the Overview page.");
+    return;
+  }
+  JsonDocument body;
+  if (!readBody(body)) return;
+  const String action = body["action"] | "";
+
+  /*
+    * `ok` is "the driver accepted it" and `failure` is why the *value* was
+    * wrong. Keeping them apart matters for the error message: folding the range
+    * test into the same expression made a full command queue report itself as
+    * "track number must be between 1 and 2999", which is the least helpful
+    * possible answer in the one place somebody is trying to work out what went
+    * wrong. `bad` is set instead when the value itself is out of range.
+    */
+  bool ok = true;
+  bool bad = false;
+  String failure;
+
+  if (action == "refresh") {
+    ok = df_player_refresh();
+  } else if (action == "source") {
+    const String want = body["value"] | "";
+    const DfSource source = want == "usb"     ? DF_SRC_USB
+                            : want == "flash" ? DF_SRC_FLASH
+                            : want == "aux"   ? DF_SRC_AUX
+                            : want == "sd"    ? DF_SRC_SD
+                                              : (DfSource)0;
+    if (source == (DfSource)0) {
+      sendError(400, "Source must be sd, usb, flash or aux");
+      return;
+    }
+    ok = df_player_set_source(source);
+  } else if (action == "track") {
+    // Checked as an int before it is narrowed. Casting first turns 65537 into 1
+    // and accepts it as track 1, which is a request nobody made.
+    const int track = body["value"] | 0;
+    bad = track < 1 || track > 2999;
+    ok = bad || df_player_play_track((uint16_t)track);
+    failure = "Track number must be between 1 and 2999";
+  } else if (action == "folder") {
+    const int folder = body["folder"] | 0;
+    const int file = body["file"] | 0;
+    bad = folder < 1 || folder > 99 || file < 1 || file > 255;
+    ok = bad || df_player_play_folder((uint8_t)folder, (uint8_t)file);
+    failure = "Folder must be 1-99 and track 1-255, matching the zero-padded "
+              "names the module needs (/01/003.mp3)";
+  } else if (action == "mp3") {
+    const int track = body["value"] | 0;
+    bad = track < 1 || track > 3000;
+    ok = bad || df_player_play_mp3((uint16_t)track);
+    failure = "The MP3 folder holds tracks 1-3000 (/MP3/0007.mp3)";
+  } else if (action == "advert") {
+    const int track = body["value"] | 0;
+    bad = track < 1 || track > 3000;
+    ok = bad || df_player_advertise((uint16_t)track);
+    failure = "The ADVERT folder holds tracks 1-3000, and something has to be "
+              "playing for an announcement to interrupt";
+  } else if (action == "advertStop") {
+    ok = df_player_advertise_stop();
+  } else if (action == "volumeRaw") {
+    ok = df_player_set_volume_raw(
+        (uint8_t)constrain(body["value"] | 0, 0, (int)DF_VOLUME_MAX));
+  } else if (action == "volumeStep") {
+    ok = df_player_volume_step(body["up"] | true);
+  } else if (action == "eq") {
+    const int eq = body["value"] | -1;
+    bad = eq < 0 || eq > 5;
+    ok = bad || df_player_set_eq((uint8_t)eq);
+    failure = "EQ must be 0-5 (normal, pop, rock, jazz, classic, bass)";
+  } else if (action == "loop") {
+    const String want = body["value"] | "off";
+    const DfLoop loop = want == "track"    ? DF_LOOP_TRACK
+                        : want == "folder" ? DF_LOOP_FOLDER
+                        : want == "all"    ? DF_LOOP_ALL
+                        : want == "random" ? DF_LOOP_RANDOM
+                                           : DF_LOOP_OFF;
+    // Only folder-repeat takes a folder, so only folder-repeat can be refused
+    // for a bad one. A dashboard sending "folder": 0 alongside "loop off" was
+    // being told to fix a field that mode never reads.
+    const int folder = body["folder"] | 1;
+    bad = loop == DF_LOOP_FOLDER && (folder < 1 || folder > 99);
+    ok = bad || df_player_set_loop(loop, (uint8_t)(bad ? 1 : folder));
+    failure = "Folder repeat needs a folder between 1 and 99";
+  } else if (action == "dac") {
+    ok = df_player_set_dac(body["value"] | true);
+  } else if (action == "reset") {
+    ok = df_player_reset();
+  } else if (action == "standby") {
+    ok = df_player_standby();
+  } else if (action == "wake") {
+    ok = df_player_wake();
+  } else if (action == "queryFolder") {
+    const int folder = body["folder"] | 0;
+    bad = folder < 1 || folder > 99;
+    ok = bad || df_player_query_folder((uint8_t)folder);
+    failure = "Folder must be between 1 and 99";
+  } else if (action == "pin") {
+    const String which = body["pin"] | "";
+    const DfPin pin = which == "io1"      ? DF_PIN_IO1
+                      : which == "io2"    ? DF_PIN_IO2
+                      : which == "adkey1" ? DF_PIN_ADKEY1
+                      : which == "adkey2" ? DF_PIN_ADKEY2
+                                          : DF_PIN_COUNT;
+    if (pin == DF_PIN_COUNT) {
+      sendError(400, "Pin must be io1, io2, adkey1 or adkey2");
+      return;
+    }
+    bad = !df_player_pin_available(pin);
+    ok = bad || df_player_pulse(pin, body["long"] | false);
+    failure = "That pin is not wired on this board; see hw_config.h";
+  } else if (action == "led") {
+    const String want = body["value"] | "auto";
+    df_player_set_led(want == "on"      ? DF_LED_ON
+                      : want == "off"   ? DF_LED_OFF
+                      : want == "blink" ? DF_LED_BLINK
+                                        : DF_LED_AUTO);
+  } else if (action == "saveDefaults") {
+    // The module keeps nothing across a power cycle, so "remember this" means
+    // storing it here and sending it again at every boot.
+    //
+    // Which is exactly why a snapshot that is not a reading cannot be stored: a
+    // timed-out copy is all zeroes, and writing it would set the next boot's
+    // volume to 0 and its source to something the driver then silently
+    // substitutes. Refuse and say so; the caller can try again.
+    DfStatus d;
+    if (!df_player_snapshot(&d)) {
+      sendError(503, "Could not read the module's current settings just now. "
+                     "Nothing was saved; try again in a moment.");
+      return;
+    }
+    settings.dfSource = (uint8_t)d.source;
+    settings.dfVolume = d.volume;
+    settings.dfEq = d.eq;
+    settings.dfLoop = (uint8_t)d.loop;
+    if (d.folder) settings.dfLoopFolder = (uint8_t)d.folder;
+    if (!body["autoplay"].isNull()) settings.dfAutoplay = body["autoplay"].as<bool>();
+    saveSettings();
+  } else {
+    sendError(400, "Unknown DFPlayer action");
+    return;
+  }
+
+  if (bad) {
+    sendError(400, failure.length() ? failure : "That value is out of range");
+    return;
+  }
+  if (!ok) {
+    sendError(503, "The DFPlayer command queue is full; the module is not "
+                   "keeping up. Try again in a moment.");
+    return;
+  }
+  JsonDocument reply;
+  reply["ok"] = true;
+  sendJson(reply);
+}
+
+/*
+ * Battery actions that are not settings.
+ *
+ * Calibration is the only interesting one, and it is here rather than in the
+ * settings form because it is not a number the user knows -- it is a number
+ * derived from one they can measure. Put a meter on the pack, type what it says,
+ * and the trim that makes the firmware agree is computed and stored.
+ */
+void handleBattery() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+  const String action = body["action"] | "";
+
+  if (action == "calibrate") {
+    const float actual = body["volts"] | 0.0f;
+    const float trim = battery_calibration_for(actual);
+    if (trim <= 0.0f) {
+      sendError(400, "Cannot calibrate against that. Either nothing plausible "
+                     "is on the sense pin, or the reading you gave is more than "
+                     "twice what the divider suggests -- check the divider "
+                     "ratio first.");
+      return;
+    }
+    settings.batteryCalibration = trim;
+    saveSettings();
+    applyBatterySettings();
+    JsonDocument reply;
+    reply["ok"] = true;
+    reply["calibration"] = serialized(String(trim, 4));
+    sendJson(reply);
+    return;
+  }
+  if (action == "refresh") {
+    applyBatterySettings();  // re-samples as a side effect
+    JsonDocument reply;
+    reply["ok"] = true;
+    sendJson(reply);
+    return;
+  }
+  sendError(400, "Unknown battery action");
 }
 
 void handleWifiScan() {
@@ -1295,6 +1733,31 @@ void handleSettingsGet() {
   doc["clockSource"] = soft_clock_source_name();
   doc["clockOffsetMinutes"] = soft_clock_utc_offset_min();
   doc["clockNetworkSynced"] = soft_clock_network_synced();
+
+  JsonObject df = doc["dfplayer"].to<JsonObject>();
+  df["source"] = settings.dfSource;
+  df["volume"] = settings.dfVolume;
+  df["volumeMax"] = DF_VOLUME_MAX;
+  df["eq"] = settings.dfEq;
+  df["loop"] = settings.dfLoop;
+  df["loopFolder"] = settings.dfLoopFolder;
+  df["autoplay"] = settings.dfAutoplay;
+
+  JsonObject bat = doc["battery"].to<JsonObject>();
+  bat["enabled"] = settings.batteryEnabled;
+  bat["divider"] = serialized(String(settings.batteryDivider, 3));
+  bat["calibration"] = serialized(String(settings.batteryCalibration, 4));
+  bat["cells"] = settings.batteryCells;
+  bat["full"] = serialized(String(settings.batteryFull, 2));
+  bat["empty"] = serialized(String(settings.batteryEmpty, 2));
+  bat["low"] = settings.batteryLow;
+  bat["critical"] = settings.batteryCritical;
+  // Whether there is any hardware behind the form at all, so the page can say
+  // "not wired on this board" instead of offering a divider ratio for a pin
+  // that does not exist.
+  bat["sensePin"] = PIN_BATTERY_SENSE;
+  bat["chargePins"] = PIN_BATTERY_CHARGING >= 0 || PIN_BATTERY_FULL >= 0;
+
   sendJson(doc);
 }
 
@@ -1328,7 +1791,89 @@ void handleSettingsSave() {
     if (token.length()) settings.githubToken = token;
   }
   if (body["clearGithubToken"] | false) settings.githubToken = "";
+
+  // DFPlayer start-up defaults. Stored only; they are sent to the module at the
+  // next boot, because changing them mid-session would move the volume under
+  // somebody who is listening. The live controls on the Media page are the way
+  // to change what is playing now.
+  if (!body["dfSource"].isNull()) {
+    const int want = body["dfSource"].as<int>();
+    if (want == DF_SRC_USB || want == DF_SRC_SD || want == DF_SRC_FLASH ||
+        want == DF_SRC_AUX) {
+      settings.dfSource = (uint8_t)want;
+    }
+  }
+  if (!body["dfVolume"].isNull()) {
+    settings.dfVolume =
+        (uint8_t)constrain(body["dfVolume"].as<int>(), 0, (int)DF_VOLUME_MAX);
+  }
+  if (!body["dfEq"].isNull()) {
+    settings.dfEq = (uint8_t)constrain(body["dfEq"].as<int>(), 0, 5);
+  }
+  if (!body["dfLoop"].isNull()) {
+    settings.dfLoop = (uint8_t)constrain(body["dfLoop"].as<int>(), 0,
+                                        (int)DF_LOOP_RANDOM);
+  }
+  if (!body["dfLoopFolder"].isNull()) {
+    settings.dfLoopFolder =
+        (uint8_t)constrain(body["dfLoopFolder"].as<int>(), 1, 99);
+  }
+  if (!body["dfAutoplay"].isNull()) settings.dfAutoplay = body["dfAutoplay"].as<bool>();
+
+  // The battery pack. Applied immediately rather than at the next boot: these
+  // describe the hardware, and a wrong divider showing 8.4 V should be fixable
+  // without a restart.
+  bool batteryChanged = false;
+  if (!body["batteryEnabled"].isNull()) {
+    settings.batteryEnabled = body["batteryEnabled"].as<bool>();
+    batteryChanged = true;
+  }
+  if (!body["batteryDivider"].isNull()) {
+    settings.batteryDivider = body["batteryDivider"].as<float>();
+    batteryChanged = true;
+  }
+  if (!body["batteryCalibration"].isNull()) {
+    settings.batteryCalibration = body["batteryCalibration"].as<float>();
+    batteryChanged = true;
+  }
+  if (!body["batteryCells"].isNull()) {
+    settings.batteryCells = (uint8_t)constrain(body["batteryCells"].as<int>(), 1, 4);
+    batteryChanged = true;
+  }
+  if (!body["batteryFull"].isNull()) {
+    settings.batteryFull = body["batteryFull"].as<float>();
+    batteryChanged = true;
+  }
+  if (!body["batteryEmpty"].isNull()) {
+    settings.batteryEmpty = body["batteryEmpty"].as<float>();
+    batteryChanged = true;
+  }
+  if (!body["batteryLow"].isNull()) {
+    settings.batteryLow = (uint8_t)constrain(body["batteryLow"].as<int>(), 1, 90);
+    batteryChanged = true;
+  }
+  if (!body["batteryCritical"].isNull()) {
+    settings.batteryCritical =
+        (uint8_t)constrain(body["batteryCritical"].as<int>(), 1, 50);
+    batteryChanged = true;
+  }
+
   saveSettings();
+  if (batteryChanged) {
+    applyBatterySettings();
+    // The gauge clamps what it cannot use, so read back what it settled on
+    // rather than storing a value the dashboard would then show as accepted.
+    BatteryStatus b;
+    battery_snapshot(&b);
+    settings.batteryDivider = b.divider;
+    settings.batteryCalibration = b.calibration;
+    settings.batteryFull = b.fullVolts;
+    settings.batteryEmpty = b.emptyVolts;
+    settings.batteryCells = b.cells;
+    settings.batteryLow = b.lowPercent;
+    settings.batteryCritical = b.criticalPercent;
+    saveSettings();
+  }
   JsonDocument reply;
   reply["ok"] = true;
   reply["restartRequired"] = true;
@@ -1616,6 +2161,8 @@ void configureRoutes() {
   server.on("/api/wifi", HTTP_POST, handleWifiSave);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsSave);
+  server.on("/api/dfplayer", HTTP_POST, handleDfPlayer);
+  server.on("/api/battery", HTTP_POST, handleBattery);
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/clock", HTTP_POST, handleClock);
   server.on("/api/update/check", HTTP_POST, [] { handleUpdateAction(false); });
@@ -1650,6 +2197,7 @@ const char *management_mode_name(RadioMode mode) {
     case RADIO_MODE_BLUETOOTH: return "Bluetooth";
     case RADIO_MODE_COMBO: return "Wi-Fi + BT";
     case RADIO_MODE_NET: return "Wi-Fi + BLE";
+    case RADIO_MODE_DFPLAYER: return "DFPlayer";
     default: return "Wi-Fi";
   }
 }
@@ -1696,7 +2244,33 @@ void management_factory_reset() {
 
 void management_set_bt_active(bool active) { btActive = active; }
 
+void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
+                           uint8_t *loop, uint8_t *loopFolder, bool *autoplay) {
+  if (!stableDeviceName.length()) loadSettings(APP_NAME);
+  if (source) *source = settings.dfSource;
+  if (volume) *volume = settings.dfVolume;
+  if (eq) *eq = settings.dfEq;
+  if (loop) *loop = settings.dfLoop;
+  if (loopFolder) *loopFolder = settings.dfLoopFolder;
+  if (autoplay) *autoplay = settings.dfAutoplay;
+}
+
 bool management_led_state(StatusLedState *out) {
+  /*
+   * The battery outranks everything, including Bluetooth mode where the rest of
+   * this function declines to say anything. A cell about to cut out is the one
+   * fact that matters more than what is playing -- and unlike the network
+   * states below, it is true in every mode, so the early return for Bluetooth
+   * mode comes after this rather than before it.
+   *
+   * `battery_critical()` is already "critical and not charging", so a speaker on
+   * a charger stops flashing about it and goes back to showing the audio state.
+   */
+  if (battery_critical()) {
+    *out = LED_BATTERY_LOW;
+    return true;
+  }
+
   if (radioMode == RADIO_MODE_BLUETOOTH) return false;
 
   const UpdateState u = updateSnapshot();
@@ -1715,7 +2289,8 @@ bool management_led_state(StatusLedState *out) {
   // instead -- for combo that is the A2DP state, for Wi-Fi + BLE the network
   // player's. (Combo never raises an access point, so only NET needs the
   // setup-AP case; it is written once for both because the answer is the same.)
-  if (radioMode == RADIO_MODE_COMBO || radioMode == RADIO_MODE_NET) {
+  if (radioMode == RADIO_MODE_COMBO || radioMode == RADIO_MODE_NET ||
+      radioMode == RADIO_MODE_DFPLAYER) {
     if (apRunning && WiFi.status() != WL_CONNECTED) {
       *out = LED_SETUP_AP;
       return true;
@@ -1772,6 +2347,18 @@ void management_begin(BluetoothA2DPSink &a2dp) {
                    "access point in Wi-Fi mode instead.");
   }
 
+  /*
+   * The battery gauge, before any mode-specific bring-up.
+   *
+   * It is the one block here that belongs to every mode: it powers the speaker
+   * whatever the radio is doing, and Bluetooth mode returns from this function
+   * a few lines below without ever reaching the Wi-Fi code. Configured from NVS
+   * and started in one go, because the stored divider and trim are what make the
+   * first reading meaningful rather than a number to be corrected later.
+   */
+  applyBatterySettings();
+  battery_begin();
+
   if (radioMode == RADIO_MODE_BLUETOOTH) {
     // Not one Wi-Fi call. Leaving the driver uninitialised is the point: the
     // antenna, the coexistence scheduler and ~50 KB of heap all stay with the
@@ -1827,6 +2414,24 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     return;
   }
 
+  if (radioMode == RADIO_MODE_DFPLAYER) {
+    /*
+     * Wi-Fi gets the radio to itself, exactly as in Wi-Fi only mode, and for a
+     * better reason: there is no second radio in this mode to share it with.
+     * The audio source is a serial peripheral, so the setup access point is
+     * allowed, the dashboard behaves identically, and the whole Bluetooth
+     * controller -- both halves -- is released below, which is the largest heap
+     * saving any mode makes.
+     *
+     * main.cpp starts the module; see service_dfplayer() there. It is not
+     * started here because the driver wants to log after the serial console is
+     * up and because a card that takes a second to mount should not hold up the
+     * network bring-up.
+     */
+    Serial.println("[mode] DFPlayer mode: audio comes from the DFPlayer Mini "
+                   "over serial. Both Bluetooth radios are off.");
+  }
+
   if (radioMode == RADIO_MODE_NET) {
     // Everything below this point is shared with Wi-Fi mode: the same station
     // bring-up, the same setup access point, the same dashboard. Only two
@@ -1843,7 +2448,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     // itself from cold -- and BLE provisioning is a second way in on top.
     Serial.println("[mode] Wi-Fi + BLE mode: audio arrives over the network, "
                    "BLE carries control. Bluetooth Classic is off.");
-  } else {
+  } else if (radioMode == RADIO_MODE_MANAGEMENT) {
     Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
   }
 
@@ -1863,7 +2468,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
    * esp_bt_* call in this file is behind btActive, which stays false all the
    * way through this mode.
    */
-  if (radioMode == RADIO_MODE_MANAGEMENT) {
+  if (radioMode == RADIO_MODE_MANAGEMENT || radioMode == RADIO_MODE_DFPLAYER) {
     const uint32_t heapBefore = ESP.getFreeHeap();
     const esp_err_t released = esp_bt_mem_release(ESP_BT_MODE_BTDM);
     Serial.printf("[mode] bluetooth memory released: %s (heap %u -> %u)\n",

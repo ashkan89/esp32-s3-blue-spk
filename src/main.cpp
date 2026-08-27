@@ -37,6 +37,19 @@
  * The display is optional: if nothing answers on the I2C bus the UI switches
  * itself off at boot and everything else behaves as it did before.
  *
+ * Two blocks of optional hardware live in hw_config.h rather than here, because
+ * they are pure wiring and the list is long: a DFPlayer Mini (a fifth radio
+ * mode, in which the audio comes off a microSD card or a USB stick instead of
+ * over the air) and a battery gauge. Both are absent-tolerant in the same way
+ * the display is -- no module on the UART reports itself offline, no divider on
+ * the ADC reports no battery, and nothing else changes.
+ *
+ * One thing about the DFPlayer is worth knowing before wiring it: it produces
+ * *analog* audio on its own DAC pins, so it does not feed the PCM5102A. It joins
+ * the chain at the output jack through a passive summing network, which is safe
+ * because the modes are mutually exclusive and only one source is ever running.
+ * The full wiring is in hw_config.h.
+ *
  */
 
 #include <WiFi.h>
@@ -46,7 +59,10 @@
 #include "AudioTools.h"
 #include "app_config.h"
 #include "audio_probe.h"
+#include "battery.h"
 #include "ble_control.h"
+#include "df_player.h"
+#include "hw_config.h"
 #include "management.h"
 #include "net_audio.h"
 #include "player_state.h"
@@ -170,9 +186,15 @@ static void print_help() {
       "  wifi                      switch to Wi-Fi only mode, reboots\n"
       "  both                      switch to Wi-Fi + Bluetooth mode, reboots\n"
       "  net                       switch to Wi-Fi + BLE mode, reboots\n"
+      "  sd                        switch to DFPlayer mode, reboots\n"
       "  pair                      force Bluetooth discoverable again\n"
       "  play <url>                play a network stream (Wi-Fi + BLE)\n"
       "  stop                      stop network playback\n"
+      "  df                        DFPlayer status ('df' alone lists its\n"
+      "                            own commands: play, folder, source, eq,\n"
+      "                            loop, io1, key1, led, reset, ...)\n"
+      "  bat                       battery voltage, percentage and state\n"
+      "  bat calib <volts>         trim the gauge to a meter reading\n"
       "  help"));
 }
 
@@ -198,6 +220,11 @@ static void poll_console() {
     if (soft_clock_command(buf)) continue;
     if (ui_command(buf)) continue;
     if (radio_command(buf)) continue;
+    // Before battery_command(): "bat" is a prefix of nothing here, but "df" and
+    // "bt" are one letter apart and radio_command() owns "bt", so the order of
+    // these three is what keeps them from shadowing each other.
+    if (df_player_command(buf)) continue;
+    if (battery_command(buf)) continue;
     if (strcmp(buf, "help") == 0 || strcmp(buf, "?") == 0) {
       print_help();
       continue;
@@ -338,6 +365,12 @@ static bool bt_identity_applied;
 // as the mode is known, the network player only once there is an IP address.
 static bool net_started;
 static bool ble_started;
+
+// DFPlayer mode: see service_dfplayer(). One attempt, at the first loop, so the
+// serial console is up to log into and the network bring-up is not held behind
+// a card that takes a second to mount.
+static bool df_started;
+static bool df_autoplay_pending;
 
 static const uint32_t TONE_CHUNK_FRAMES = 128;
 
@@ -497,7 +530,41 @@ void on_sample_rate(uint16_t rate) { ps_set_sample_rate(rate); }
 static void update_status_led() {
   StatusLedState state;
   if (!management_led_state(&state)) {
-    if (radio_mode_has_ble(management_radio_mode())) {
+    if (radio_mode_has_dfplayer(management_radio_mode())) {
+      /*
+       * The DFPlayer reuses the same vocabulary as the two radio sources --
+       * solid means audio is flowing, a lone flash means up and waiting -- with
+       * one addition it genuinely needs: a module with no card in it, or with
+       * its card mounted on a computer, is a state the other sources have no
+       * equivalent of and the one thing you would actually go and fix.
+       */
+      // update_status_led() runs every loop and the snapshot takes a mutex, so
+      // it is cached: none of these states is worth re-deciding at 100 Hz, and
+      // the pattern itself only advances every 125 ms.
+      // Only replaced when the read succeeded: a timed-out snapshot comes back
+      // zero-filled, which reads as an offline module, and one busy mutex would
+      // otherwise flash the fault pattern for a fifth of a second.
+      static DfStatus d;
+      static uint32_t d_at;
+      if (d_at == 0 || millis() - d_at >= 200) {
+        DfStatus fresh;
+        if (df_player_snapshot(&fresh)) {
+          d = fresh;
+          d_at = millis() | 1;
+        }
+      }
+      if (!df_started) state = LED_BOOT;
+      // Standby before the offline test: a sleeping module answers nothing on
+      // purpose, and the fault pattern is for things that went wrong.
+      else if (d.asleep) state = LED_IDLE;
+      else if (!d.online) state = LED_FAULT;
+      else if (d.busy) state = LED_BT_STREAMING;
+      else if (d.pcLink) state = LED_NO_MEDIA;
+      else if (d.source == DF_SRC_SD && !d.sdPresent) state = LED_NO_MEDIA;
+      else if (d.source == DF_SRC_USB && !d.usbPresent) state = LED_NO_MEDIA;
+      else if (d.state == DF_PAUSED) state = LED_BT_CONNECTED;
+      else state = LED_IDLE;
+    } else if (radio_mode_has_ble(management_radio_mode())) {
       // Network audio reuses the Bluetooth patterns rather than inventing two
       // more: "solid" still means audio is flowing and a lone flash still means
       // up and waiting. What is on the other end of the link is not something
@@ -524,7 +591,15 @@ static void update_status_led() {
 
 static bool dac_busy() {
   if (a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) return true;
-  return net_audio_active();
+  if (net_audio_active()) return true;
+  /*
+   * The DFPlayer does not share the I2S channel -- its audio is analog and joins
+   * further downstream -- so a melody here cannot interleave samples with it the
+   * way it could with A2DP. It can still talk over it, because both land on the
+   * same jack, and that is reason enough: the chimes exist to be noticed, not to
+   * be played on top of a song.
+   */
+  return df_player_active();
 }
 
 /// Radio state and the mode switch, from the serial console. Handy precisely
@@ -575,6 +650,32 @@ static bool radio_command(const char *line) {
                                                   : "idle");
       if (n.url[0]) Serial.printf(" | url %s", n.url);
     }
+    if (radio_mode_has_dfplayer(mode)) {
+      DfStatus d;
+      // A failed snapshot is zero-filled; printing it would say "OFFLINE (check
+      // TX/RX)" about a module that is answering, in the command somebody types
+      // precisely to find out whether it is.
+      const bool fresh = df_player_snapshot(&d);
+      Serial.printf(" | df %s", !fresh             ? "status unreadable"
+                                : !df_started      ? "starting"
+                                : d.asleep         ? "standby"
+                                : !d.online        ? "OFFLINE (check TX/RX)"
+                                : d.busy           ? "playing"
+                                : d.state == DF_PAUSED ? "paused"
+                                                   : "idle");
+      if (fresh) {
+        Serial.printf(" %s", df_source_name(d.source));
+        if (d.totalTracks) {
+          Serial.printf(" %u/%u", (unsigned)d.track, (unsigned)d.totalTracks);
+        }
+      }
+      if (fresh && d.pcLink) Serial.print(" | card on a computer");
+      if (fresh && d.error[0]) Serial.printf(" | %s", d.error);
+    }
+    if (battery_present()) {
+      Serial.printf(" | bat %u%% %s", (unsigned)battery_percent(),
+                    battery_state_name(battery_state()));
+    }
     Serial.printf(" | heap %u\n", (unsigned)ESP.getFreeHeap());
     return true;
   }
@@ -596,6 +697,10 @@ static bool radio_command(const char *line) {
   }
   if (strcmp(line, "net") == 0 || strcmp(line, "ble") == 0) {
     management_switch_mode(RADIO_MODE_NET);  // does not return
+    return true;
+  }
+  if (strcmp(line, "sd") == 0 || strcmp(line, "dfplayer") == 0) {
+    management_switch_mode(RADIO_MODE_DFPLAYER);  // does not return
     return true;
   }
   if (strncmp(line, "play ", 5) == 0) {
@@ -623,6 +728,10 @@ static bool radio_command(const char *line) {
     if (radio_mode_has_ble(management_radio_mode())) {
       Serial.println("[bt] Wi-Fi + BLE mode has no A2DP sink to pair with. "
                      "Cast to it over DLNA, or type 'bt' / 'both' for a "
+                     "Bluetooth mode.");
+    } else if (radio_mode_has_dfplayer(management_radio_mode())) {
+      Serial.println("[bt] DFPlayer mode has no Bluetooth at all -- the whole "
+                     "controller is released at boot. Type 'bt' or 'both' for a "
                      "Bluetooth mode.");
     } else if (!radio_mode_has_a2dp(management_radio_mode())) {
       Serial.println("[bt] Wi-Fi mode; type 'bt' or 'both' to start Bluetooth");
@@ -658,12 +767,39 @@ static void log_state_changes() {
     seen_peer[sizeof(seen_peer) - 1] = 0;
     Serial.printf("[bt] peer: %s\n", seen_peer);
   }
+  /*
+   * The battery, on transitions only.
+   *
+   * The percentage moves all the time and logging it would drown everything
+   * else, but the four moments that matter -- charger on, charger off, low,
+   * critical -- are exactly the ones somebody reading the log later wants
+   * timestamped, and they are also the ones nobody is watching the dashboard
+   * for when they happen.
+   */
+  {
+    static BatteryState seen_battery = BAT_UNKNOWN;
+    static bool seen_any;
+    const BatteryState now_state = battery_state();
+    if (!seen_any || now_state != seen_battery) {
+      seen_any = true;
+      seen_battery = now_state;
+      if (battery_present()) {
+        BatteryStatus b;
+        battery_snapshot(&b);
+        Serial.printf("[bat] %s: %u%% (%.2f V)\n", battery_state_name(now_state),
+                      (unsigned)b.percent, b.volts);
+      }
+    }
+  }
+
   if (s.track_seq != seen_track_seq) {
     seen_track_seq = s.track_seq;
     // The tag says where the metadata came from: AVRCP off a phone, or ICY /
     // DIDL off the network. Worth the two characters when the question being
     // asked of the log is usually "is the source sending me anything at all".
-    const char *tag = s.source == PS_SRC_NETWORK ? "net" : "avrc";
+    const char *tag = s.source == PS_SRC_NETWORK    ? "net"
+                      : s.source == PS_SRC_DFPLAYER ? "df"
+                                                    : "avrc";
     if (s.title[0]) {
       if (s.artist[0]) {
         Serial.printf("[%s] %s - %s\n", tag, s.artist, s.title);
@@ -837,6 +973,73 @@ static void service_network_audio() {
   }
 }
 
+/*
+ * Brings up the DFPlayer, and then leaves it alone.
+ *
+ * Started from loop() rather than setup() for two reasons. The module takes
+ * about 1.5 s to come back from the reset the driver opens with, and another
+ * second to mount a card, and there is nothing to be gained by making the
+ * network wait behind that. And starting it after the console exists means the
+ * one failure that actually happens -- TX and RX swapped, which looks exactly
+ * like a dead module -- is reported somewhere you can read it.
+ *
+ * There is no equivalent of service_bluetooth_start()'s "wait for the access
+ * point to be done with the antenna" here: the DFPlayer is a serial peripheral
+ * and does not touch the radio, so it comes up immediately whatever Wi-Fi is
+ * doing.
+ *
+ * Autoplay is deliberately not "send play at boot". The module reports the card
+ * a moment after it has mounted it, and a play command sent before that is
+ * answered with "file not found" -- so the request is held until there is a
+ * library with files in it to play from, and dropped if that never happens.
+ */
+static void service_dfplayer() {
+  if (!radio_mode_has_dfplayer(management_radio_mode())) return;
+
+  if (!df_started) {
+    df_started = true;  // set first: one attempt, success or not
+
+    uint8_t source = 0, volume = 0, eq = 0, loop = 0, loop_folder = 1;
+    bool autoplay = false;
+    management_df_defaults(&source, &volume, &eq, &loop, &loop_folder, &autoplay);
+
+    if (!df_player_begin((DfSource)source, volume, eq, (DfLoop)loop)) {
+      Serial.println("[df] driver did not start; DFPlayer mode has no audio "
+                     "source this boot. The dashboard still works -- switch to "
+                     "another mode from there.");
+      return;
+    }
+    if (loop == DF_LOOP_FOLDER) df_player_set_loop(DF_LOOP_FOLDER, loop_folder);
+    df_autoplay_pending = autoplay;
+    // Same chime the other modes play once their source is up.
+    pending_melody = MELODY_ID_NOTIFY;
+    return;
+  }
+
+  if (!df_autoplay_pending) return;
+
+  static uint32_t give_up_at;
+  if (give_up_at == 0) give_up_at = millis() + 15000;
+
+  DfStatus d;
+  // A stale copy looks like "no module, no files", which the deadline below
+  // would then report as the reason autoplay gave up. Wait for a real one; the
+  // deadline has fifteen seconds of passes to work with.
+  if (!df_player_snapshot(&d)) return;
+  if (d.online && d.totalTracks > 0) {
+    df_autoplay_pending = false;
+    df_player_play_track(1);
+    Serial.printf("[df] autoplay: starting track 1 of %u on the %s\n",
+                  (unsigned)d.totalTracks, df_source_name(d.source));
+  } else if ((int32_t)(millis() - give_up_at) >= 0) {
+    df_autoplay_pending = false;
+    Serial.printf("[df] autoplay gave up: %s\n",
+                  !d.online ? "the module never answered"
+                  : d.pcLink ? "the card is mounted on a computer"
+                             : "no files were found on the selected source");
+  }
+}
+
 /// Acts on a mode switch the BOOT button asked for. management_switch_mode()
 /// persists the choice and restarts, so this never returns when it fires.
 static void service_mode_switch() {
@@ -958,11 +1161,14 @@ void setup() {
   // different things for each -- there is no "pair your phone" on a speaker
   // that receives over the network. Fixed here and never changed again;
   // switching modes reboots.
-  ps_set_source(radio_mode_has_a2dp(management_radio_mode()) ? PS_SRC_BLUETOOTH
-                : radio_mode_has_ble(management_radio_mode()) ? PS_SRC_NETWORK
-                                                              : PS_SRC_NONE);
+  ps_set_source(radio_mode_has_a2dp(management_radio_mode())     ? PS_SRC_BLUETOOTH
+                : radio_mode_has_ble(management_radio_mode())      ? PS_SRC_NETWORK
+                : radio_mode_has_dfplayer(management_radio_mode()) ? PS_SRC_DFPLAYER
+                                                                  : PS_SRC_NONE);
   // BLE can come up now; the network player waits for an address (see there).
   service_network_audio();
+  // The DFPlayer needs nothing from the network, so it starts here too.
+  service_dfplayer();
 
   // Radio is up: hand the panel over to the UI task, which from here on owns it.
   if (have_display) ui_start();
@@ -979,13 +1185,19 @@ void loop() {
   service_bluetooth_start();
   service_bluetooth_identity();
   service_network_audio();
+  service_dfplayer();
   service_melody();
+  // Before update_status_led(): the LED asks whether the cell is critical, and a
+  // sample taken after that decision is one frame stale in the one indicator
+  // that is meant to be urgent.
+  battery_loop();
   update_status_led();
   log_state_changes();
   soft_clock_tick();
   management_loop();
   net_audio_loop();
   ble_control_loop();
+  df_player_loop();
   poll_console();
   delay(10);
 }

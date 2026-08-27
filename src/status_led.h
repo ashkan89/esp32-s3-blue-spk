@@ -26,6 +26,8 @@ enum StatusLedState : uint8_t {
   LED_BT_STREAMING,    // solid: audio is flowing
   LED_UPDATING,        // fast strobe: writing flash, do not remove power
   LED_FAULT,           // urgent double-double blink: something failed
+  LED_NO_MEDIA,        // two slow winks: the source has nothing to play from
+  LED_BATTERY_LOW,     // long-short heartbeat: charge it
   LED_STATE_COUNT
 };
 

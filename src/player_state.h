@@ -21,6 +21,9 @@
  *   Wi-Fi + BLE              the Arduino loop task, via net_audio_loop(). The
  *                            decoder and DLNA tasks only set plain flags in
  *                            net_audio.cpp; loop() is what publishes them here.
+ *   DFPlayer                 the Arduino loop task, via df_player_loop(). The
+ *                            driver task owns the serial link and keeps its own
+ *                            status behind a mutex; loop() copies it in here.
  */
 
 #pragma once
@@ -40,6 +43,7 @@ enum PsSource : uint8_t {
   PS_SRC_NONE = 0,   ///< no audio path is running at all (Wi-Fi only mode)
   PS_SRC_BLUETOOTH,  ///< A2DP sink
   PS_SRC_NETWORK,    ///< DLNA renderer or a URL the dashboard handed us
+  PS_SRC_DFPLAYER,   ///< a DFPlayer Mini playing its own card or USB stick
 };
 
 /// What the phone is doing, as far as AVRCP has told us.
