@@ -9,12 +9,17 @@
  *   VCC -> 3.3V      (NOT 5V; these modules have no regulator)
  *   GND -> GND
  *   SDA -> GPIO21
- *   SCL -> GPIO19    <-- not the usual GPIO22: that pin is I2S DIN here
+ *   SCL -> GPIO22
  *
- * The canonical ESP32 I2C pair is 21/22, but GPIO22 already carries I2S data to
- * the PCM5102A, so SCL moves to GPIO19. If you would rather keep the familiar
- * 21/22 for I2C, move PIN_I2S_DOUT in main.cpp to GPIO23 instead and rewire the
- * DAC's DIN -- either way, two signals cannot share one pin.
+ * This is the canonical ESP32 I2C pair, which is what every module's silkscreen
+ * and every tutorial assumes. It does cost the I2S data line its usual pin:
+ * PIN_I2S_DOUT in main.cpp sits on GPIO23 rather than GPIO22 for exactly this
+ * reason. Two signals cannot share one pin, so if you ever move I2C back off
+ * 21/22, move the DAC's DIN back with it.
+ *
+ * The DS3231 RTC module, if fitted, hangs off these same two wires -- I2C is a
+ * bus, and the RTC answers on 0x68 while the panel answers on 0x3C. See
+ * soft_clock.h.
  */
 
 #pragma once
@@ -32,7 +37,7 @@
 #endif
 
 static const int PIN_OLED_SDA = 21;
-static const int PIN_OLED_SCL = 19;
+static const int PIN_OLED_SCL = 22;
 
 /// 0x3C on almost every module; 0x3D on a few. Both are probed, in this order.
 static const uint8_t OLED_ADDR_PRIMARY = 0x3C;
@@ -155,10 +160,12 @@ static const float VIS_AGC_RELEASE_S = 3.0f;
 /// boot from the build timestamp (so it is never wildly wrong), and can be set
 /// exactly from the dashboard or the three sources below -- see soft_clock.h:
 ///
-///   1. network time, automatically, whenever the speaker is on Wi-Fi in
+///   1. a DS3231 module on the same two I2C wires as this display, GPIO21/22 --
+///      on by default (-DUSE_DS3231=1), and the only source that survives a
+///      power cut
+///   2. network time, automatically, whenever the speaker is on Wi-Fi in
 ///      management mode -- nothing to configure
-///   2. over the serial monitor:  time 2026-08-18 14:30:00
-///   3. a DS3231 module on the same two I2C wires:  -DUSE_DS3231=1
+///   3. over the serial monitor:  time 2026-08-18 14:30:00
 ///
 /// Whatever the source, the time is written to NVS every 10 minutes, so a
 /// reboot or a power cut comes back within minutes rather than back to 1970.

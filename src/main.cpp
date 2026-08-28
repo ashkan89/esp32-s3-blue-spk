@@ -21,7 +21,7 @@
  *   VIN  -> 5V (VIN/USB pin; the module regulates down to 3.3V)
  *   GND  -> GND
  *   BCK  -> GPIO26
- *   DIN  -> GPIO22
+ *   DIN  -> GPIO23   (not GPIO22 -- that is I2C SCL, see below)
  *   LCK  -> GPIO25
  *   SCK  -> GND      (mandatory: tells the PCM5102A to use its internal PLL)
  *   FMT  -> GND      (standard I2S framing)
@@ -32,10 +32,18 @@
  *   VCC  -> 3.3V     (these modules have no regulator; 5V kills them)
  *   GND  -> GND
  *   SDA  -> GPIO21
- *   SCL  -> GPIO19   (not GPIO22 -- that pin is already I2S DIN above)
+ *   SCL  -> GPIO22
  *
- * The display is optional: if nothing answers on the I2C bus the UI switches
- * itself off at boot and everything else behaves as it did before.
+ * I2C gets the canonical 21/22 pair, which is what the modules are labelled for,
+ * and I2S data moves to GPIO23 to make room. Two signals cannot share a pin.
+ *
+ * Wiring (DS3231 RTC -> ESP32), optional and on the same bus:
+ *   VCC  -> 3.3V     GND -> GND
+ *   SDA  -> GPIO21   SCL -> GPIO22    (in parallel with the OLED; 0x68 vs 0x3C)
+ *
+ * Both are optional: if nothing answers on the I2C bus the UI switches itself
+ * off at boot, the clock falls back to network/serial/build time, and everything
+ * else behaves as it did before.
  *
  * Two blocks of optional hardware live in hw_config.h rather than here, because
  * they are pure wiring and the list is long: a DFPlayer Mini (a fifth radio
@@ -76,7 +84,10 @@ static const char *DEVICE_NAME = APP_NAME;
 
 static const int PIN_I2S_BCLK = 26;
 static const int PIN_I2S_LRCK = 25;
-static const int PIN_I2S_DOUT = 22;
+// GPIO23, not the GPIO22 most I2S examples use: the OLED and the DS3231 share
+// the canonical I2C pair on GPIO21/22, and two signals cannot share a pin. See
+// the wiring note at the top of ui_config.h.
+static const int PIN_I2S_DOUT = 23;
 
 // The on-board LED of most WROOM-32D devkits. It is the only indicator this
 // board has, so status_led.h drives it as a real one: a distinct blink pattern

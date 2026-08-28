@@ -5,10 +5,26 @@
  * the clock from a browser, while the sources below keep it useful even when
  * the speaker has no network. The time comes from whichever is available:
  *
- *   1. DS3231 module on the same two I2C wires as the display  (-DUSE_DS3231=1)
+ *   1. DS3231 module on the same two I2C wires as the display. On by default
+ *      (-DUSE_DS3231=1 in platformio.ini); set it to 0 for a board with no RTC
+ *      fitted, though leaving it on costs only a probe of 0x68 at boot.
+ *
  *      The only option that survives a power cut properly. ~1 EUR, keeps time
  *      for years on its coin cell, and it is the same SDA/SCL pair the OLED
- *      already uses -- two extra wires, no extra GPIO.
+ *      already uses -- two extra wires, no extra GPIO:
+ *
+ *        VCC -> 3.3V      GND -> GND
+ *        SDA -> GPIO21    SCL -> GPIO22     (with the OLED, in parallel)
+ *
+ *      Both modules carry their own pull-ups, which in parallel is fine on
+ *      short leads. The RTC answers on 0x68, the panel on 0x3C, so nothing
+ *      collides. Leave SQW and 32K unconnected -- neither is used.
+ *
+ *      A word on the coin cell: the common ZS-042 board wires a charging
+ *      circuit intended for a rechargeable LIR2032. Fitted with a CR2032, as
+ *      most of them ship, that circuit trickles current into a non-rechargeable
+ *      cell. Either fit a LIR2032 or lift the charge resistor -- and either way
+ *      the timekeeping is the same.
  *
  *   2. SNTP, automatically, whenever the speaker is on Wi-Fi in management
  *      mode. Nothing to configure: management_loop() calls

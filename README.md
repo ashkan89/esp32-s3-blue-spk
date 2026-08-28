@@ -31,7 +31,7 @@ what the folder is named.
 | ESP32-WROOM-32D devkit, 16 MB flash | classic ESP32 only; this build uses the full 16 MB layout |
 | PCM5102A I2S DAC board | the usual purple breakout with a 3.5 mm jack |
 | 0.91" 128×32 I2C OLED  | SSD1306, 4 pins (VCC/GND/SDA/SCL) — optional |
-| DS3231 RTC module      | optional, shares the OLED's two I2C wires |
+| DS3231 RTC module      | shares the OLED's two I2C wires; enabled by default |
 | DFPlayer Mini (MP3-TF-16P) | optional; YX5200 or the AA104/GD3200B clones. Adds *DFPlayer mode* |
 | microSD card, FAT32    | for the DFPlayer. 32 GB or less; ≤ 3000 files per folder |
 | USB-A socket           | optional, for a flash drive on the DFPlayer's host port |
@@ -47,7 +47,7 @@ what the folder is named.
 | VIN      | 5V (VIN)    | The board has its own 3.3 V regulator            |
 | GND      | GND         |                                                  |
 | BCK      | GPIO26      | Bit clock                                        |
-| DIN      | GPIO22      | Serial data                                      |
+| DIN      | GPIO23      | Serial data — **not** GPIO22, see below           |
 | LCK      | GPIO25      | Word select / LR clock                           |
 | SCK      | **GND**     | Required — selects the internal PLL              |
 | FMT      | GND         | Standard I2S framing                             |
@@ -57,6 +57,12 @@ what the folder is named.
 
 The single most common failure is leaving **SCK floating** — the DAC then waits
 for an external master clock and you get silence or noise. Tie it to GND.
+
+Most I2S examples put DIN on GPIO22, and it is worth knowing why this one does
+not: GPIO21/22 is the canonical ESP32 I2C pair, and that is where the OLED and
+the DS3231 sit. Two signals cannot share a pin, so the data line moves one over
+to GPIO23, which is otherwise unused. If you are following an older build of
+this project, this is the wire to move.
 
 Power: the PCM5102A only draws ~20 mA, so USB power off the dev board is fine.
 If you hear a hiss or whine that tracks the CPU, give the DAC its own supply and
@@ -218,13 +224,13 @@ until switched on there.
 | VCC  | **3.3V**| These modules have no regulator — 5 V destroys them        |
 | GND  | GND     |                                                            |
 | SDA  | GPIO21  |                                                            |
-| SCL  | GPIO19  | **not** GPIO22 — see below                                 |
+| SCL  | GPIO22  |                                                            |
 
-Everyone's ESP32 I2C example uses GPIO21/22, and **GPIO22 is already I2S DIN**
-here. Two signals cannot share a pin, so SCL moves to GPIO19, which is otherwise
-unused. If you would rather keep the familiar 21/22 pair for I2C, change
-`PIN_I2S_DOUT` in [src/main.cpp](src/main.cpp) to GPIO23 and move the DAC's DIN
-wire instead — either is fine, but pick one.
+This is the canonical ESP32 I2C pair, so the module's silkscreen, every tutorial
+and every scrap of example code agree with it. The cost is paid at the DAC:
+GPIO22 is where most I2S examples put DIN, so `PIN_I2S_DOUT` in
+[src/main.cpp](src/main.cpp) is GPIO23 here instead. Two signals cannot share a
+pin — if you ever move I2C off 21/22, move the DAC's DIN wire back with it.
 
 Both the address (0x3C, falling back to 0x3D) and the pins are checked at boot;
 the serial log says which it found, or says it found nothing:
@@ -237,6 +243,36 @@ A few 0.91" modules use a Winstar panel with a different column offset, which
 shows up as the image being shifted sideways by two pixels. If yours does that,
 swap `U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C` for
 `U8G2_SSD1306_128X32_WINSTAR_F_HW_I2C` in [src/ui.cpp](src/ui.cpp).
+
+### DS3231 RTC → ESP32
+
+I2C is a bus, so the clock module costs no extra GPIO — it hangs off the same two
+wires as the panel, in parallel with it.
+
+| DS3231 | ESP32   | Notes                                                    |
+|--------|---------|-----------------------------------------------------------|
+| VCC    | 3.3V    | 5 V also works on these boards, but there is no reason    |
+| GND    | GND     |                                                           |
+| SDA    | GPIO21  | the same wire as the OLED's SDA                           |
+| SCL    | GPIO22  | the same wire as the OLED's SCL                           |
+| SQW    | —       | not used                                                  |
+| 32K    | —       | not used                                                  |
+
+The RTC answers at address 0x68 and the panel at 0x3C, so nothing collides.
+Both modules carry their own pull-up resistors; two sets in parallel is a lower
+resistance than either alone, which on short dupont leads is harmless.
+
+The driver is compiled in by default (`-DUSE_DS3231=1` in
+[platformio.ini](platformio.ini)). A board with no RTC fitted needs no change —
+`soft_clock_begin()` probes 0x68 at boot, logs `no ds3231 on the bus`, and falls
+back to the other time sources — but you can set the flag to 0 to drop the code
+entirely.
+
+One caveat about the coin cell, which is a property of the common ZS-042 board
+rather than of the chip: it wires a trickle-charge circuit meant for a
+rechargeable LIR2032, and most of them ship with a non-rechargeable CR2032 in
+the holder. Fit a LIR2032, or lift the charging resistor, or accept it — the
+timekeeping is the same either way.
 
 ## Windows note: the short toolchain path
 
@@ -936,8 +972,9 @@ animation degrades instead of the audio.
 
 ## The clock
 
-There is no built-in RTC, so the clock is a software one — but you should never
-have to set it. Whenever the speaker is in management mode and its Wi-Fi station
+The ESP32 has no battery-backed RTC of its own, so the clock is a software one
+with a DS3231 module bolted onto the display's I2C bus to give it something that
+survives a power cut — but you should never have to set it. Whenever the speaker is in management mode and its Wi-Fi station
 has an address, it starts SNTP and keeps the clock on network time for as long
 as the link is up. That covers boot and every reconnection after it; there is
 nothing to configure and no build flag involved.
@@ -976,17 +1013,23 @@ date 2026-08-18       set just the date
 time                  show it, and where it came from
 ```
 
-**3. A DS3231 module** on the same two I2C wires as the display — the only option
-that properly survives a power cut. About a euro, keeps time for years on its
-coin cell, no extra GPIO:
+**3. A DS3231 module** on GPIO21/22, the same two I2C wires as the display — the
+only option that properly survives a power cut. About a euro, keeps time for
+years on its coin cell, no extra GPIO. Wiring is under
+[DS3231 RTC → ESP32](#ds3231-rtc--esp32), and the driver is **on by default**:
 
 ```ini
 build_flags = ${env.build_flags} -DUSE_DS3231=1
 ```
 
-It is read at boot and written whenever you set the time by hand, so it only
-needs setting once ever. A chip that has lost its cell (which reads back as
-2000-01-01) is detected and seeded rather than believed.
+Set that to 0 if you have no RTC fitted and would rather not carry the code; the
+probe at boot is otherwise harmless, and a board without the module simply logs
+`no ds3231 on the bus` and carries on.
+
+It is read at boot and written whenever you set the time by hand — and after
+every network sync — so it only needs setting once ever. A chip that has lost its
+cell (which reads back as 2000-01-01) is detected and seeded rather than
+believed.
 
 Whichever it is, the current time is written to NVS every ten minutes, so a power
 cut comes back within ten minutes rather than back to the build stamp. The saved
@@ -1213,9 +1256,12 @@ Other things it might be:
 ## Troubleshooting the display
 
 **Nothing on the panel, and the log says `[ui] no SSD1306 at 0x3C or 0x3D`.**
-Nothing answered on the bus. Check SDA on **GPIO21** and SCL on **GPIO19** — not
-GPIO22, which is I2S data — and that VCC is on 3.3 V. Swapped SDA/SCL is the
-other classic; the panel simply stays silent.
+Nothing answered on the bus. Check SDA on **GPIO21** and SCL on **GPIO22**, and
+that VCC is on 3.3 V. Swapped SDA/SCL is the other classic; the panel simply
+stays silent. If you are coming from an older build of this firmware, SCL used to
+be on GPIO19 and I2S DIN on GPIO22 — both wires moved, so check that the DAC's
+DIN is on **GPIO23** as well, or you will have fixed the display and lost the
+audio.
 
 **Nothing on the panel and no `[ui]` line at all.** `UI_ENABLED` is 0.
 
