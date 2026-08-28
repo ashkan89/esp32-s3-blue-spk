@@ -1331,7 +1331,10 @@ static void ui_frame() {
 
   PlayerInfo info;
   ps_snapshot(&info);
-  const AudioVis &vis = audio_probe_analyse(dt);
+  // A copy rather than a reference into the analyser: the lighting task reads
+  // the same analysis, and a reference would be live under its feet.
+  AudioVis vis;
+  audio_probe_frame(&vis, 1000 / UI_FPS);
 
   if (vis.active || info.streaming) last_activity_ms = now;
   detect_events(info, now);

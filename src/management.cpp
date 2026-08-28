@@ -22,6 +22,7 @@
 #include "battery.h"
 #include "ble_control.h"
 #include "df_player.h"
+#include "leds.h"
 #include "net_audio.h"
 #include "player_state.h"
 #include "soft_clock.h"
@@ -65,6 +66,8 @@ struct Settings {
   uint8_t batteryCells;
   uint8_t batteryLow;
   uint8_t batteryCritical;
+
+  LedConfig leds;
 };
 
 struct UpdateState {
@@ -206,6 +209,13 @@ String defaultApName() {
   return String(buf);
 }
 
+// Deferred flash write for the lighting: set when something changes, cleared
+// by saveLedSettings() once the dashboard has stopped sending.
+bool ledsDirty;
+uint32_t ledsDirtyAt;
+constexpr uint32_t LEDS_PERSIST_QUIET_MS = 1200;
+void saveLedSettings();
+
 void loadSettings(const char *fallbackName) {
   prefs.begin("speaker-web", false);
   settings.ssid = prefs.getString("ssid", "");
@@ -243,6 +253,23 @@ void loadSettings(const char *fallbackName) {
   settings.batteryEmpty = prefs.getFloat("batEmpty", BATTERY_EMPTY_V_DEFAULT);
   settings.batteryLow = prefs.getUChar("batLow", BATTERY_LOW_PCT_DEFAULT);
   settings.batteryCritical = prefs.getUChar("batCrit", BATTERY_CRITICAL_PCT_DEFAULT);
+
+  /*
+   * The ring. Loaded in every radio mode, not just the ones with a dashboard:
+   * a Bluetooth-only speaker still has lights on it, and they should come back
+   * the colour they were left. leds_configure() only writes a struct, so this
+   * is safe before leds_begin() has claimed the pin.
+   */
+  settings.leds.enabled = prefs.getBool("ledOn", true);
+  settings.leds.effect = prefs.getUChar("ledFx", LED_DEFAULT_EFFECT);
+  settings.leds.brightness = prefs.getUChar("ledBri", LED_DEFAULT_BRIGHTNESS);
+  settings.leds.speed = prefs.getUChar("ledSpd", LED_DEFAULT_SPEED);
+  settings.leds.reactivity = prefs.getUChar("ledRct", LED_DEFAULT_REACTIVITY);
+  settings.leds.color = prefs.getULong("ledCol", LED_DEFAULT_COLOR);
+  settings.leds.color2 = prefs.getULong("ledCol2", LED_DEFAULT_COLOR2);
+  if (settings.leds.effect >= LED_FX_COUNT) settings.leds.effect = LED_DEFAULT_EFFECT;
+  if (settings.leds.reactivity > 100) settings.leds.reactivity = 100;
+  leds_configure(settings.leds);
 
   stableDeviceName = settings.deviceName;
 }
@@ -283,6 +310,53 @@ void saveSettings() {
   prefs.putFloat("batEmpty", settings.batteryEmpty);
   prefs.putUChar("batLow", settings.batteryLow);
   prefs.putUChar("batCrit", settings.batteryCritical);
+
+  saveLedSettings();
+}
+
+/*
+ * The ring's own keys, split out of saveSettings() because they are written on
+ * a different schedule from everything else: a colour picker being dragged
+ * produces a request per frame, and each one of those must not be a flash
+ * write. See handleLeds() and the flush in management_loop().
+ */
+void saveLedSettings() {
+  prefs.putBool("ledOn", settings.leds.enabled);
+  prefs.putUChar("ledFx", settings.leds.effect);
+  prefs.putUChar("ledBri", settings.leds.brightness);
+  prefs.putUChar("ledSpd", settings.leds.speed);
+  prefs.putUChar("ledRct", settings.leds.reactivity);
+  prefs.putULong("ledCol", settings.leds.color);
+  prefs.putULong("ledCol2", settings.leds.color2);
+  ledsDirty = false;
+}
+
+/*
+ * A colour as the dashboard's <input type="color"> hands it over: "#rrggbb".
+ * A plain integer is accepted too, because the serial console and any script
+ * anyone writes against this API will reach for one. Anything unparseable
+ * leaves the current colour alone rather than turning the ring black, which is
+ * the failure mode a typo in a script would otherwise have.
+ */
+uint32_t parseColor(JsonVariantConst value, uint32_t fallback) {
+  if (value.is<const char *>()) {
+    String text = value.as<String>();
+    text.trim();
+    if (text.startsWith("#")) text.remove(0, 1);
+    if (text.length() != 6) return fallback;
+    char *end = nullptr;
+    const unsigned long parsed = strtoul(text.c_str(), &end, 16);
+    if (!end || *end) return fallback;
+    return (uint32_t)parsed & 0xFFFFFFu;
+  }
+  if (value.is<uint32_t>()) return value.as<uint32_t>() & 0xFFFFFFu;
+  return fallback;
+}
+
+String colorText(uint32_t color) {
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%06lX", (unsigned long)(color & 0xFFFFFFu));
+  return String(buf);
 }
 
 bool authenticated() {
@@ -1204,6 +1278,14 @@ void handleStatus() {
   bat["lowPercent"] = b.lowPercent;
   bat["criticalPercent"] = b.criticalPercent;
 
+  JsonObject led = doc["leds"].to<JsonObject>();
+  led["wired"] = LEDS_ENABLED && PIN_LEDS >= 0;
+  led["present"] = leds_present();
+  led["enabled"] = settings.leds.enabled;
+  led["effect"] = settings.leds.effect;
+  led["effectName"] = leds_effect_name(settings.leds.effect);
+  led["hearingAudio"] = leds_hearing_audio();
+
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
 }
@@ -1671,6 +1753,54 @@ void handleBattery() {
   sendError(400, "Unknown battery action");
 }
 
+/*
+ * The lighting.
+ *
+ * Every field is optional, so the dashboard can send just the one thing that
+ * changed as a slider moves rather than the whole configuration each time.
+ * Changes apply on the ring within a frame; the flash write is deferred, and
+ * management_loop() makes it once the requests stop arriving.
+ */
+void handleLeds() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+
+  LedConfig next = settings.leds;
+  if (!body["enabled"].isNull()) next.enabled = body["enabled"].as<bool>();
+  if (!body["effect"].isNull()) {
+    const int effect = body["effect"].as<int>();
+    if (effect < 0 || effect >= LED_FX_COUNT) {
+      sendError(400, "Unknown lighting effect");
+      return;
+    }
+    next.effect = (uint8_t)effect;
+  }
+  if (!body["brightness"].isNull()) {
+    next.brightness = (uint8_t)constrain(body["brightness"].as<int>(), 0, 255);
+  }
+  if (!body["speed"].isNull()) {
+    next.speed = (uint8_t)constrain(body["speed"].as<int>(), 0, 255);
+  }
+  if (!body["reactivity"].isNull()) {
+    next.reactivity = (uint8_t)constrain(body["reactivity"].as<int>(), 0, 100);
+  }
+  next.color = parseColor(body["color"], next.color);
+  next.color2 = parseColor(body["color2"], next.color2);
+
+  settings.leds = next;
+  leds_configure(next);
+  ledsDirty = true;
+  ledsDirtyAt = millis();
+
+  JsonDocument reply;
+  reply["ok"] = true;
+  reply["effectName"] = leds_effect_name(next.effect);
+  reply["effectHint"] = leds_effect_hint(next.effect);
+  reply["hearingAudio"] = leds_hearing_audio();
+  sendJson(reply);
+}
+
 void handleWifiScan() {
   if (!requireAuth()) return;
   ui_show_system_status(UI_STATUS_NETWORK, "Scanning Wi-Fi", "Radio scan in progress",
@@ -1757,6 +1887,33 @@ void handleSettingsGet() {
   // that does not exist.
   bat["sensePin"] = PIN_BATTERY_SENSE;
   bat["chargePins"] = PIN_BATTERY_CHARGING >= 0 || PIN_BATTERY_FULL >= 0;
+
+  JsonObject led = doc["leds"].to<JsonObject>();
+  led["wired"] = LEDS_ENABLED && PIN_LEDS >= 0;
+  led["present"] = leds_present();
+  led["pin"] = PIN_LEDS;
+  led["count"] = LED_COUNT;
+  led["enabled"] = settings.leds.enabled;
+  led["effect"] = settings.leds.effect;
+  led["brightness"] = settings.leds.brightness;
+  led["speed"] = settings.leds.speed;
+  led["reactivity"] = settings.leds.reactivity;
+  led["color"] = colorText(settings.leds.color);
+  led["color2"] = colorText(settings.leds.color2);
+  led["hearingAudio"] = leds_hearing_audio();
+  // Whether there is anything for the reactive effects to react to in this
+  // mode at all. DFPlayer audio never passes through this chip, so the music
+  // sync has nothing to work with and the page should say so rather than
+  // leaving the owner to wonder why the ring is idling.
+  led["audioPath"] = !radio_mode_has_dfplayer(radioMode);
+  // The effect table comes from the firmware rather than being repeated in the
+  // dashboard, so adding an effect stays a one-file change in leds.cpp.
+  JsonArray effects = led["effects"].to<JsonArray>();
+  for (uint8_t i = 0; i < LED_FX_COUNT; ++i) {
+    JsonObject entry = effects.add<JsonObject>();
+    entry["name"] = leds_effect_name(i);
+    entry["hint"] = leds_effect_hint(i);
+  }
 
   sendJson(doc);
 }
@@ -2164,6 +2321,7 @@ void configureRoutes() {
   server.on("/api/dfplayer", HTTP_POST, handleDfPlayer);
   server.on("/api/battery", HTTP_POST, handleBattery);
   server.on("/api/display", HTTP_POST, handleDisplay);
+  server.on("/api/leds", HTTP_POST, handleLeds);
   server.on("/api/clock", HTTP_POST, handleClock);
   server.on("/api/update/check", HTTP_POST, [] { handleUpdateAction(false); });
   server.on("/api/update/install", HTTP_POST, [] { handleUpdateAction(true); });
@@ -2243,6 +2401,15 @@ void management_factory_reset() {
 }
 
 void management_set_bt_active(bool active) { btActive = active; }
+
+void management_store_leds() {
+  // Straight to flash rather than through the deferred path: this comes from a
+  // typed console command, so there is exactly one of them and no slider to
+  // debounce. Reading the live configuration back rather than trusting our own
+  // copy keeps the two in step whichever side made the change.
+  leds_get(&settings.leds);
+  saveLedSettings();
+}
 
 void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
                            uint8_t *loop, uint8_t *loopFolder, bool *autoplay) {
@@ -2513,6 +2680,12 @@ void management_loop() {
     bootStrikePending = false;
     prefs.putUChar("bootFail", 0);
     Serial.printf("[mode] %s mode is stable\n", management_mode_name(radioMode));
+  }
+
+  // Before the mode check for the same reason the strike above is: the console
+  // can change the lighting in a mode that has no dashboard at all.
+  if (ledsDirty && millis() - ledsDirtyAt >= LEDS_PERSIST_QUIET_MS) {
+    saveLedSettings();
   }
 
   if (!radio_mode_has_wifi(radioMode)) return;

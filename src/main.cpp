@@ -71,6 +71,7 @@
 #include "ble_control.h"
 #include "df_player.h"
 #include "hw_config.h"
+#include "leds.h"
 #include "management.h"
 #include "net_audio.h"
 #include "player_state.h"
@@ -206,6 +207,9 @@ static void print_help() {
       "                            loop, io1, key1, led, reset, ...)\n"
       "  bat                       battery voltage, percentage and state\n"
       "  bat calib <volts>         trim the gauge to a meter reading\n"
+      "  leds                      WS2812 ring status ('leds' alone lists its\n"
+      "                            own commands: on, off, fx, list, color,\n"
+      "                            bright, speed, react)\n"
       "  help"));
 }
 
@@ -236,6 +240,12 @@ static void poll_console() {
     // these three is what keeps them from shadowing each other.
     if (df_player_command(buf)) continue;
     if (battery_command(buf)) continue;
+    // Persisted straight away: a colour set over the console is a setting
+    // like any other, and losing it at the next reboot would be a surprise.
+    if (leds_command(buf)) {
+      management_store_leds();
+      continue;
+    }
     if (strcmp(buf, "help") == 0 || strcmp(buf, "?") == 0) {
       print_help();
       continue;
@@ -1103,6 +1113,11 @@ void setup() {
   ps_init(DEVICE_NAME);
   audio_probe_init();
 
+  // The ring is claimed here so it goes dark immediately, rather than sitting
+  // on whatever the pixels powered up holding for the two seconds the radio
+  // takes. Its task starts later, once the stored settings have been applied.
+  const bool have_leds = leds_begin();
+
   // Display first: it brings up I2C, which the DS3231 path in soft_clock also
   // uses, and it puts a splash on the panel during the seconds the radio takes.
   const bool have_display = ui_begin();
@@ -1183,6 +1198,9 @@ void setup() {
 
   // Radio is up: hand the panel over to the UI task, which from here on owns it.
   if (have_display) ui_start();
+  // management_begin() has loaded and applied the stored lighting by now, so
+  // the first frame this task draws is already the one the owner chose.
+  if (have_leds) leds_start();
 
   Serial.println("Type 'help' for the serial commands (clock, screens, radio).");
 }

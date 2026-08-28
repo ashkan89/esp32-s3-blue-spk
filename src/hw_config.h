@@ -1,6 +1,6 @@
 /*
- * hw_config.h -- the pins and knobs for the two hardware blocks that are not
- * part of the audio path: the DFPlayer Mini and the battery gauge.
+ * hw_config.h -- the pins and knobs for the hardware blocks that are not part
+ * of the audio path: the DFPlayer Mini, the battery gauge, and the WS2812 ring.
  *
  * Kept out of main.cpp for the same reason ui_config.h is: these are wiring
  * decisions, they get changed per board, and hunting for them inside a 1000
@@ -283,3 +283,106 @@ static const float BATTERY_SMOOTHING = 0.12f;
 /// likely to land above a charged pack as below an empty one.
 static const float BATTERY_MIN_PLAUSIBLE_V = 2.20f;
 static const float BATTERY_MAX_PLAUSIBLE_V = 4.45f;
+
+// ============================================================ WS2812 ring ====
+/*
+ * An addressable RGB ring, driven from one pin, reacting to the music.
+ *
+ * The board this is written for is the "WS2812 5050 RGB LED Ring 7-Bit": seven
+ * WS2812B pixels, one in the middle and six around it, on a 23 mm disc. Nothing
+ * below assumes seven, though -- LED_COUNT drives every effect, and a bare
+ * strip works by setting LED_CENTRE_INDEX to -1.
+ *
+ *   Ring pin     ESP32              Notes
+ *   -----------  -----------------  ----------------------------------------
+ *   DIN          GPIO18 via 330R    series resistor damps the edge; without it
+ *                                   a long lead rings and the first pixel
+ *                                   latches the wrong colour
+ *   5V / VCC     5V (VIN)           NOT the 3.3V rail -- see the budget below
+ *   GND          GND                shared with the ESP32, and with the DAC
+ *
+ * Power. A WS2812B is three 20 mA emitters, so seven of them at full white is
+ * about 420 mA -- more than the 3.3 V regulator on a devkit will give you, and
+ * enough to brown the board out mid-track if you take it from there. Run VCC
+ * from the same 5 V that feeds the DFPlayer, and fit a 470-1000 uF capacitor
+ * across 5 V and GND at the ring. LED_BRIGHTNESS_MAX below is the other half of
+ * that answer: it caps every effect, so the ceiling is a number you set rather
+ * than whatever the brightest frame of the brightest effect happens to draw.
+ *
+ * Logic levels. WS2812B wants its data line at 0.7*VDD, which at 5 V is 3.5 V,
+ * and the ESP32 drives 3.3 V. In practice nearly every module accepts it --
+ * the first pixel's threshold is usually lower than the datasheet promises --
+ * and this is why the resistor and a short lead matter. If the first pixel is
+ * unreliable and the rest are fine, that is exactly this problem: either put a
+ * level shifter in the data line, or feed the ring 4.5 V (a signal diode in
+ * series with its 5 V) so 3.3 V clears the threshold with room to spare.
+ *
+ * Timing. The pixels are clocked by the RMT peripheral, not bit-banged, so
+ * writing a frame costs the CPU nothing and cannot be disturbed by an audio
+ * interrupt landing in the middle of it. This matters: the WS2812 protocol
+ * encodes bits as pulse widths, and a bit-banged driver that gets preempted
+ * mid-frame writes visible garbage. RMT is otherwise unused in this firmware.
+ */
+
+/// Compile the lighting in at all. 0 removes the driver, the task, the API and
+/// the dashboard page; nothing else changes.
+#ifndef LEDS_ENABLED
+#define LEDS_ENABLED 1
+#endif
+
+/// Data pin. Any output-capable GPIO; avoid the strapping pins (0, 2, 12, 15)
+/// and the input-only ones (34-39, which cannot drive anything at all).
+/// -1 disables the lighting as surely as LEDS_ENABLED 0, but at runtime.
+#ifndef PIN_LEDS
+#define PIN_LEDS 18
+#endif
+
+/// How many pixels are on the wire.
+#ifndef LED_COUNT
+#define LED_COUNT 7
+#endif
+
+/// Which pixel is the middle one on a ring board, or -1 for a plain strip.
+/// Effects that have a centre and a rim (the VU bloom, the beat flash, fire)
+/// use it; the rest treat the strip as a loop and do not care.
+#ifndef LED_CENTRE_INDEX
+#define LED_CENTRE_INDEX 0
+#endif
+
+/// Hard ceiling on brightness, 1..255, applied after every effect and after the
+/// user's own brightness setting. This is the current budget in disguise: 255
+/// is ~420 mA for seven pixels, 96 is ~160 mA, and a devkit's USB supply with a
+/// DFPlayer already on it does not want the former.
+#ifndef LED_BRIGHTNESS_MAX
+#define LED_BRIGHTNESS_MAX 160
+#endif
+
+/// Frames per second for the lighting task. WS2812 latch time bounds this at a
+/// few hundred fps for seven pixels, so this is chosen for smooth fades rather
+/// than by what the wire can carry. Higher costs CPU on core 0 and nothing else.
+static const uint8_t LED_FPS = 60;
+
+/// Colour order. Most WS2812B modules are GRB; a few clones (and every WS2811
+/// strip) are RGB. If red and green come out swapped, this is why.
+///
+/// Named LED_STRIP_GRB rather than the obvious LED_COLOR_ORDER_GRB because the
+/// Arduino core spells that second name as an enumerator in esp32-hal-rgb-led.h,
+/// for the built-in RGB LED some boards carry. A macro of that name rewrites the
+/// enumerator to a numeric constant and the core stops compiling, with an error
+/// that points into the core rather than at us.
+#ifndef LED_STRIP_GRB
+#define LED_STRIP_GRB 1
+#endif
+
+/// Defaults for a factory-fresh speaker. Everything here is stored in NVS and
+/// editable from the dashboard, so these are only the starting point.
+static const uint8_t LED_DEFAULT_EFFECT = 3;      // LED_FX_RAINBOW
+static const uint8_t LED_DEFAULT_BRIGHTNESS = 160;
+static const uint8_t LED_DEFAULT_SPEED = 128;     // middle of the range
+static const uint8_t LED_DEFAULT_REACTIVITY = 55; // percent
+static const uint32_t LED_DEFAULT_COLOR = 0x00E0FFu;    // cyan
+static const uint32_t LED_DEFAULT_COLOR2 = 0xFF0080u;   // magenta
+
+/// How long after the last audio the reactive effects fall back to their
+/// non-reactive behaviour, so a paused speaker does not sit frozen mid-flash.
+static const uint16_t LED_AUDIO_IDLE_MS = 2500;

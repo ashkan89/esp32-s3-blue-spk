@@ -11,10 +11,26 @@
  *                          with the audio path and anything slow here is
  *                          audible. No FFT, no floats, no logs.
  *
- *   audio_probe_analyse()  UI task, once per frame. Reads the most recent
- *                          FFT_SIZE samples out of the ring and does all the
- *                          expensive work: window, FFT, log banding, auto-gain,
- *                          smoothing, peak hold, beat detection.
+ *   audio_probe_frame()    Display and lighting tasks, once per frame. Reads
+ *                          the most recent FFT_SIZE samples out of the ring and
+ *                          does all the expensive work: window, FFT, log
+ *                          banding, auto-gain, smoothing, peak hold, beat
+ *                          detection.
+ *
+ * Two consumers, one analysis. The OLED task wants this at 30 fps and the
+ * WS2812 task at 60, they run independently, and neither is guaranteed to
+ * exist -- there may be no panel, no ring, or neither. So the analysis is a
+ * *service* rather than something one task owns: whichever caller arrives
+ * first in a given window does the FFT and publishes the result, and every
+ * other caller is handed the published frame. That keeps the cost at one FFT
+ * per window however many tasks are watching, and keeps the lighting reactive
+ * on a speaker with no display at all.
+ *
+ * The published frame is copied out under a seqlock, the same trick
+ * player_state.h uses, so a reader never sees half of one frame and half of
+ * the next. The analysis itself is serialised by a mutex that callers only
+ * ever *try* to take: a task that finds the FFT already running takes the
+ * previous frame and gets on with drawing rather than waiting for it.
  *
  * The ring buffer is deliberately lock-free. The writer only ever bumps a
  * monotonic counter; the reader copies backwards from wherever that counter
@@ -73,9 +89,18 @@ void audio_probe_init();
  */
 void audio_probe_feed(const Frame *frames, uint16_t count);
 
-/// UI task. dt_ms is the time since the previous call, and drives every decay
-/// rate so the animation looks the same at any frame rate.
-const AudioVis &audio_probe_analyse(uint32_t dt_ms);
+/*
+ * Runs the analysis if it is due and copies the newest result into *out.
+ *
+ * Safe to call from any number of tasks at any rate. Decay rates are driven by
+ * the time since the last *real* analysis, not since this caller's last call,
+ * so the animation looks the same whoever is driving it and however often.
+ *
+ * `min_interval_ms` is how stale a frame this caller will accept before doing
+ * the work itself: pass the caller's frame period. A caller asking for 33 ms
+ * and one asking for 16 ms share whatever the faster one produces.
+ */
+void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms);
 
 /// millis() of the last time audio was above the noise floor. Used by the UI to
 /// decide when to stop showing visualisers and go idle.

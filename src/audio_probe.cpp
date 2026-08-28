@@ -1,6 +1,8 @@
 #include "audio_probe.h"
 
 #include <Arduino.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <math.h>
 #include <string.h>
 
@@ -40,6 +42,11 @@ static float band_tilt[VIS_BANDS];     // dB added to compensate spectral tilt
 
 // --------------------------------------------------------------- analysis ----
 static AudioVis vis;
+
+// Serialises the analysis itself, so the display and lighting tasks share one
+// FFT rather than racing to redo it. Created in audio_probe_init(); see the
+// service block at the bottom of this file for how it is used.
+static SemaphoreHandle_t analyse_gate;
 static float band_val[VIS_BANDS];   // 0..1, smoothed bar height
 static float peak_val[VIS_BANDS];   // 0..1, peak-hold cap
 static uint16_t peak_hang[VIS_BANDS];
@@ -61,6 +68,8 @@ static const float AGC_MIN_DB = -42.0f;
 static const float TILT_TOP_DB = 11.0f;
 
 void audio_probe_init() {
+  analyse_gate = xSemaphoreCreateMutex();
+
   // Hann window: the cheapest window that keeps a single tone from smearing
   // across half the display.
   for (uint16_t i = 0; i < FFT_SIZE; i++) {
@@ -230,7 +239,7 @@ static void fill_wave(uint32_t head, float norm) {
 }
 
 // ---------------------------------------------------------------- analyse ----
-const AudioVis &audio_probe_analyse(uint32_t dt_ms) {
+static void analyse_locked(uint32_t dt_ms) {
   const uint32_t now = millis();
   if (dt_ms == 0) dt_ms = 1;
   if (dt_ms > 250) dt_ms = 250;  // after a long stall, do not snap everything
@@ -416,8 +425,51 @@ const AudioVis &audio_probe_analyse(uint32_t dt_ms) {
   fill_wave(head, have_samples ? 1.0f / (window_peak < 900.0f ? 900.0f
                                                              : window_peak)
                                : 0.0f);
+}
 
-  return vis;
+// ---------------------------------------------------------------- service ----
+/*
+ * One analysis, any number of watchers. See the note at the top of the header.
+ *
+ * The published copy is written under a seqlock (odd while writing, even when
+ * settled) so a reader either gets a whole frame or notices the collision and
+ * retries. `analyse_gate` serialises the FFT itself and is only ever *tried*,
+ * never waited on -- a caller that finds it held is by definition about to be
+ * handed a frame that is at most one window old, which is not worth blocking a
+ * render task for.
+ */
+static uint32_t analysed_at;      // millis() of the last real analysis
+static AudioVis published;
+static volatile uint32_t publish_seq;
+
+static void publish() {
+  publish_seq++;                  // odd: a write is in progress
+  __sync_synchronize();
+  memcpy(&published, &vis, sizeof(published));
+  __sync_synchronize();
+  publish_seq++;                  // even: settled
+}
+
+void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
+  if (analyse_gate && xSemaphoreTake(analyse_gate, 0) == pdTRUE) {
+    const uint32_t now = millis();
+    const uint32_t age = now - analysed_at;
+    if (age >= min_interval_ms) {
+      analysed_at = now;
+      analyse_locked(age);
+      publish();
+    }
+    xSemaphoreGive(analyse_gate);
+  }
+
+  for (;;) {
+    const uint32_t before = publish_seq;
+    if (before & 1u) continue;    // a write is in flight; look again
+    __sync_synchronize();
+    memcpy(out, &published, sizeof(*out));
+    __sync_synchronize();
+    if (publish_seq == before) return;
+  }
 }
 
 uint32_t audio_probe_last_active() { return last_active_ms; }

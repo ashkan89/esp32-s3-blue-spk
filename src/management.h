@@ -139,6 +139,16 @@ void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
 // because the saved credentials are wrong. Does not return.
 void management_provision_wifi(const char *ssid, const char *password);
 
+/*
+ * Writes the live WS2812 configuration to NVS.
+ *
+ * The dashboard does not need this -- it goes through /api/leds, which persists
+ * on its own after the sliders stop moving. This is for the serial console,
+ * which reaches leds_configure() directly and would otherwise be the one way to
+ * change a setting that does not survive a reboot.
+ */
+void management_store_leds();
+
 // True when the network or update layer has something to show on the status LED
 // that outranks anything Bluetooth has to say, in which case *out is filled in.
 bool management_led_state(StatusLedState *out);
@@ -156,5 +166,6 @@ inline void management_set_bt_active(bool) {}
 inline void management_df_defaults(uint8_t *, uint8_t *, uint8_t *, uint8_t *,
                                    uint8_t *, bool *) {}
 inline void management_provision_wifi(const char *, const char *) {}
+inline void management_store_leds() {}
 inline bool management_led_state(StatusLedState *) { return false; }
 #endif

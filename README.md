@@ -32,6 +32,7 @@ what the folder is named.
 | PCM5102A I2S DAC board | the usual purple breakout with a 3.5 mm jack |
 | 0.91" 128×32 I2C OLED  | SSD1306, 4 pins (VCC/GND/SDA/SCL) — optional |
 | DS3231 RTC module      | shares the OLED's two I2C wires; enabled by default |
+| WS2812 RGB ring, 7-bit | optional; the 23 mm "5050 RGB LED Ring 7-Bit". Any WS2812B strip works |
 | DFPlayer Mini (MP3-TF-16P) | optional; YX5200 or the AA104/GD3200B clones. Adds *DFPlayer mode* |
 | microSD card, FAT32    | for the DFPlayer. 32 GB or less; ≤ 3000 files per folder |
 | USB-A socket           | optional, for a flash drive on the DFPlayer's host port |
@@ -274,6 +275,45 @@ rechargeable LIR2032, and most of them ship with a non-rechargeable CR2032 in
 the holder. Fit a LIR2032, or lift the charging resistor, or accept it — the
 timekeeping is the same either way.
 
+### WS2812 ring → ESP32
+
+Seven addressable pixels on one wire — one in the middle, six around the rim.
+Any WS2812B strip works; `LED_COUNT` and `LED_CENTRE_INDEX` in
+[src/hw_config.h](src/hw_config.h) describe what you actually fitted.
+
+| Ring | ESP32       | Notes                                                    |
+|------|-------------|-----------------------------------------------------------|
+| DIN  | GPIO18 via 330R | the resistor damps the edge; see *Logic levels* below |
+| 5V   | **5V (VIN)**| not the 3.3 V rail — see *Power* below                    |
+| GND  | GND         | shared with the ESP32 and with the DAC                    |
+
+**Power.** A WS2812B is three 20 mA emitters, so seven of them at full white is
+about **420 mA** — more than a devkit's 3.3 V regulator will give you, and enough
+to brown the board out mid-track if you take it from there. Feed VCC from the
+same 5 V that runs the DFPlayer, and fit a 470–1000 µF capacitor across 5 V and
+GND at the ring itself. The other half of the answer is `LED_BRIGHTNESS_MAX`,
+which caps every effect: it ships at 160/255, roughly 260 mA, so the ceiling is a
+number you chose rather than whatever the brightest frame happens to draw.
+
+**Logic levels.** WS2812B wants its data line at 0.7 × VDD, which at 5 V is 3.5 V,
+and the ESP32 drives 3.3 V. Nearly every module accepts it anyway — which is why
+the series resistor and a short lead matter. If the **first** pixel is unreliable
+and the rest are fine, that is exactly this: either put a level shifter in the
+data line, or feed the ring about 4.5 V (a signal diode in series with its 5 V)
+so 3.3 V clears the threshold with room to spare.
+
+**Why GPIO18.** It is free, it is not a strapping pin, and it has no boot-time
+constraints. Any output-capable GPIO works — but not 34–39, which are input-only
+and cannot drive anything, and preferably not 0/2/12/15, which are sampled at
+reset.
+
+The pixels are clocked out by the **RMT** peripheral rather than bit-banged. That
+is not a detail: the WS2812 protocol encodes each bit as a pulse width, so a
+bit-banger that gets preempted by the audio path mid-frame writes visible
+garbage, and the usual way round that is to disable interrupts for the length of
+the frame — which on a speaker is not a trade worth making. RMT is otherwise
+unused here.
+
 ## Windows note: the short toolchain path
 
 The Arduino core 3.x / IDF 5 package contains header paths close to the legacy
@@ -328,10 +368,11 @@ console is available at the IP printed on the serial monitor, at
 working, the setup network comes back after 15 seconds, so the speaker cannot be
 locked out by a router change.
 
-Six pages: **Overview** (the transport, the source card for whichever mode is
+Seven pages: **Overview** (the transport, the source card for whichever mode is
 running, the battery, the radio mode picker, firmware), **Devices** (Bluetooth
 pairings), **Media** (the DFPlayer library and every one of its controls),
-**Wi-Fi**, **Updates** and **Settings**. Pages that do not apply to the running
+**Lighting** (the WS2812 ring: effects, both colour pickers, and how much of the
+music is allowed to show), **Wi-Fi**, **Updates** and **Settings**. Pages that do not apply to the running
 mode say so and explain how to get to one where they do, rather than showing
 dead controls — the Devices page in a mode with no A2DP sink, the Media page in a
 mode with no DFPlayer.
@@ -961,14 +1002,116 @@ Two read-only sources, and no path back into the audio:
 - **[src/audio_probe.h](src/audio_probe.h)** is the analyser. The volume control
   hands it every frame on its way to the DAC; all it does there is downmix,
   average sample pairs down to 22.05 kHz, and store — no FFT, no floats, no logs.
-  The UI task does the expensive half: Hann window, 256-point FFT, log-spaced
-  banding, auto-gain, peak hold, beat detection.
+  The expensive half — Hann window, 256-point FFT, log-spaced banding, auto-gain,
+  peak hold, beat detection — happens on whichever renderer asks for it first.
+  The display and the WS2812 ring both watch it and share one FFT between them;
+  see [One analysis, two watchers](#one-analysis-two-watchers).
 
 The renderer runs on **its own task, pinned to core 0 at priority 1**. Pushing one
 512-byte frame over I2C blocks for 7–12 ms, and doing that in `loop()` would
 fight with the melody playback that also lives there. Down on core 0 at the
 bottom of the priority list, it gets preempted by anything that matters, so the
 animation degrades instead of the audio.
+
+## The RGB ring
+
+Seven WS2812 pixels on one wire, fifteen effects, both colours picked from the
+dashboard, and a music sync that runs off the same analysis the spectrum screen
+draws. Wiring and the current budget are under
+[WS2812 ring → ESP32](#ws2812-ring--esp32); this is what it does.
+
+### The effects
+
+The first six ignore the audio, the next four are decorative, and the last four
+are driven by the music outright. **Off** is an effect rather than a separate
+flag, so "off" survives a reboot like any other choice.
+
+| # | Effect | What it does |
+|---|--------|--------------|
+| 0 | Off | Dark. The ring stays configured and comes back where you left it |
+| 1 | Solid | The picked colour, steady |
+| 2 | Breathing | The picked colour, rising and falling |
+| 3 | Rainbow | The full spectrum wrapped round the ring, rotating |
+| 4 | Colour cycle | The whole ring on one hue, drifting through the wheel |
+| 5 | Strobe | Hard flashes — **on the beat** once reactivity is up, otherwise on a timer |
+| 6 | Comet | A bright head chasing round the rim, trailing a tail |
+| 7 | Chase | Theatre chase: every third pixel marching round |
+| 8 | Twinkle | Random sparks rising and fading, in both picked colours |
+| 9 | Fire | Cool/diffuse/spark flicker, in the hue you picked. Bass feeds the flare |
+| 10 | Gradient | A smooth sweep between your two colours, rotating |
+| 11 | VU meter | The rim fills with the level, the centre thumps with the bass |
+| 12 | Spectrum | One frequency band per pixel; bass red through treble violet |
+| 13 | Beat flash | Dark between beats, a burst of colour on each one |
+| 14 | Music sync | The rim is a circular spectrum, the centre is the bass, the hue steps on every beat |
+
+### How the music sync works
+
+[src/audio_probe.h](src/audio_probe.h) already produces 32 log-spaced bands,
+stereo VU levels and a beat flag for the spectrum screen. The lighting reuses
+that rather than running a second FFT, which is why it reacts identically to
+Bluetooth, to a network stream and to the start-up chimes — all three feed the
+same probe.
+
+Three signals are pulled out and smoothed again, more gently, because what reads
+well as a 32-bar graph is twitchy as a light: **loudness**, **bass**, and the
+**beat** flag, latched on its edge and used as a trigger rather than a level.
+
+**Reactivity applies to every effect, not just the reactive ones.** That is the
+slider worth understanding. At 0 each effect runs exactly as it would in silence,
+which is what you want from a lamp. Turn it up and the global brightness starts
+following the music, so even a plain rainbow breathes with the track — and the
+strobe stops running on a timer and starts firing on the beat. The four
+music-driven effects opt out of that global dimming, because they have already
+spent the audio on something more interesting than overall brightness.
+
+**One mode has nothing to react to.** In DFPlayer mode the module decodes its own
+card and hands out analog audio that never passes through the ESP32, so there is
+nothing to analyse and the reactive effects rest at an idle breath rather than
+freezing. The dashboard says so rather than leaving you to work it out.
+
+### One analysis, two watchers
+
+The display wants the FFT at 30 fps and the ring at 60, they run on separate
+tasks, and **neither is guaranteed to exist** — there may be no panel, no ring, or
+neither. So the analysis is a service rather than something one task owns:
+whichever caller arrives first in a given window does the work and publishes the
+result, and everyone else is handed the published frame. That keeps the cost at
+one FFT per window however many tasks are watching, and keeps the lighting
+reactive on a speaker with no display at all.
+
+The published frame is copied out under a **seqlock**, the same trick
+[src/player_state.h](src/player_state.h) uses, so a reader never sees half of one
+frame and half of the next. The analysis is serialised by a mutex that callers
+only ever *try* to take: a task that finds the FFT already running takes the
+previous frame and gets on with drawing, rather than blocking a renderer for it.
+
+### From the dashboard
+
+**Lighting** in the sidebar. Master switch, the effect grid, both colour pickers
+with a row of preset swatches, and brightness / speed / music-reaction sliders.
+Changes apply within a frame; the flash write is deferred until you stop moving
+the controls, so dragging a slider is not 60 NVS writes. There is nothing to
+press.
+
+The effect list the page draws comes from the firmware, not from the page, so
+adding an effect stays a one-file change in [src/leds.cpp](src/leds.cpp).
+
+### From the serial console
+
+```
+leds                     status, and the list of subcommands
+leds on | off            switch the ring on or off
+leds list                every effect with its description
+leds fx 14               choose an effect by number
+leds color 00E0FF        primary colour, hex, no leading #
+leds color2 FF0080       secondary colour
+leds bright 0..255       brightness
+leds speed 0..255        effect speed
+leds react 0..100        how much the music is allowed to show
+```
+
+Anything set here is written to NVS straight away, so it survives a reboot like a
+dashboard change would.
 
 ## The clock
 
@@ -1253,6 +1396,39 @@ Other things it might be:
 | a 2S pack reads 100% at every voltage | full/empty were typed as pack voltage. They are **per cell**: 4.20 and 3.30 for a 2S pack too, with *Series cells* set to 2 |
 | the reading wanders while Wi-Fi is up | a sense pin on ADC2. Use GPIO32–39, which are ADC1 |
 
+## Troubleshooting the RGB ring
+
+**Nothing lights, and the log says `[leds] no RMT channel`.** Another driver has
+taken every RMT channel, which in this firmware should not happen — nothing else
+uses the peripheral. Check that `PIN_LEDS` is not also assigned to something else
+in [src/hw_config.h](src/hw_config.h).
+
+**Nothing lights and there is no `[leds]` line at all.** `LEDS_ENABLED` is 0, or
+`PIN_LEDS` is -1. The Lighting page says so too.
+
+**Red and green are swapped.** The module is RGB rather than GRB. Build with
+`-DLED_STRIP_GRB=0`.
+
+**The first pixel is wrong or flickers and the rest are fine.** The classic 3.3 V
+data into a 5 V pixel problem. Fit the 330R in the data line if you have not, keep
+the lead short, and if it persists either add a level shifter or drop the ring's
+supply to about 4.5 V with a signal diode. See *Logic levels* under the wiring.
+
+**Colours are right but the board resets, or the audio crackles when the ring is
+bright.** The supply is sagging. Seven pixels at full white is about 420 mA;
+power the ring from 5 V rather than the 3.3 V rail, fit the capacitor across it,
+and lower `LED_BRIGHTNESS_MAX`.
+
+**The music effects sit at a slow, dim breath and never react.** Nothing is
+reaching the analyser. In **DFPlayer mode** that is expected and permanent — the
+module's audio never passes through the ESP32. In any other mode, check that
+something is actually playing; the Lighting page reports whether the analyser is
+hearing anything.
+
+**Everything reacts but it is too frantic, or too subtle.** That is the *Music
+reaction* slider, not a bug. It is the depth of the effect, and it applies to
+every effect rather than only the four music-driven ones.
+
 ## Troubleshooting the display
 
 **Nothing on the panel, and the log says `[ui] no SSD1306 at 0x3C or 0x3D`.**
@@ -1314,9 +1490,10 @@ Display knobs live in [src/ui_config.h](src/ui_config.h), all commented in place
   `VIS_PEAK_FALL_PER_S`, `VIS_PEAK_HANG_MS`, `VIS_AGC_RELEASE_S`
 - `CLOCK_24H`, `CLOCK_TZ_OFFSET_MIN`
 
-DFPlayer and battery knobs live in [src/hw_config.h](src/hw_config.h), whose
-header comment carries the full wiring for both. All of them are `#ifndef`-
-guarded, so a variant board needs no source edit:
+DFPlayer, battery and WS2812 knobs live in
+[src/hw_config.h](src/hw_config.h), whose header comment carries the full wiring
+for all three. All of them are `#ifndef`-guarded, so a variant board needs no
+source edit:
 
 ```ini
 build_flags =
@@ -1326,6 +1503,10 @@ build_flags =
     -DPIN_BATTERY_FULL=39     ; TP4056 STDBY likewise
     -DDFPLAYER_ENABLED=0      ; drop the driver, the mode and the Media page
     -DBATTERY_ENABLED=0       ; drop the gauge
+    -DPIN_LEDS=19             ; WS2812 data on a different pin
+    -DLED_COUNT=16            ; a 16-pixel ring
+    -DLED_CENTRE_INDEX=-1     ; a plain strip, with no middle pixel
+    -DLEDS_ENABLED=0          ; drop the lighting, its task and its page
 ```
 
 - `PIN_DF_TX` / `PIN_DF_RX` / `PIN_DF_BUSY`, `PIN_DF_IO1` / `IO2`,
@@ -1344,6 +1525,15 @@ build_flags =
 - `BATTERY_OVERSAMPLE`, `BATTERY_SMOOTHING`, `BATTERY_SAMPLE_MS`,
   `BATTERY_MIN_PLAUSIBLE_V` / `BATTERY_MAX_PLAUSIBLE_V` — the window a reading
   has to fall inside to count as a cell rather than as a floating pin
+- `PIN_LEDS`, `LED_COUNT`, `LED_CENTRE_INDEX` (`-1` for a strip with no middle
+  pixel), `LED_STRIP_GRB` (`0` if red and green come out swapped), `LED_FPS`
+- `LED_BRIGHTNESS_MAX` — the hard ceiling every effect is scaled by, which is the
+  current budget in disguise: 255 is about 420 mA for seven pixels, and the
+  default 160 about 260 mA
+- `LED_DEFAULT_EFFECT`, `LED_DEFAULT_BRIGHTNESS`, `LED_DEFAULT_SPEED`,
+  `LED_DEFAULT_REACTIVITY`, `LED_DEFAULT_COLOR` / `LED_DEFAULT_COLOR2`,
+  `LED_AUDIO_IDLE_MS` — only the factory-fresh values; everything here is stored
+  in NVS and editable from **Lighting**
 
 To make the ESP32 forget the paired phone, call
 `a2dp_sink.clean_last_connection()` once in `setup()`, flash, then remove it again.
@@ -1364,6 +1554,7 @@ To make the ESP32 forget the paired phone, call
 | [src/audio_probe.h](src/audio_probe.h) / [.cpp](src/audio_probe.cpp) | sample tap, FFT, bands, VU, waveform, beat |
 | [src/soft_clock.h](src/soft_clock.h) / [.cpp](src/soft_clock.cpp) | timekeeping: build stamp, serial, DS3231, NTP, NVS |
 | [src/ui.h](src/ui.h) / [.cpp](src/ui.cpp) | the screens, overlays, transitions, marquees, 7-segment |
+| [src/leds.h](src/leds.h) / [.cpp](src/leds.cpp) | the WS2812 ring: fifteen effects, the music sync, the RMT wire protocol |
 | [src/ui_assets.h](src/ui_assets.h) | hand-drawn XBM icons |
 
 ## Notes on the toolchain
@@ -1386,3 +1577,26 @@ To make the ESP32 forget the paired phone, call
 - The FFT is written out in [src/audio_probe.cpp](src/audio_probe.cpp) rather
   than pulled from a library: it is 20 lines, and having the window, the banding
   and the scaling in one place is what makes the display look right.
+- The WS2812 ring has no library either. Its wire protocol is forty lines of RMT
+  symbol building in [src/leds.cpp](src/leds.cpp), talking to the IDF's `rmt_tx`
+  driver rather than to Adafruit NeoPixel or to the Arduino core's
+  `rmtInit()`/`rmtWrite()` wrapper. Both of those choices are about **IRAM**, not
+  taste — see below.
+- **`build_unflags` turns off the PSRAM cache workaround.** The platform compiles
+  every board the same way, which means with the erratum workaround for ESP32
+  revisions below 3: a `memw` barrier after loads and stores, plus a matching
+  multilib of libc. That bug only exists when external SPI RAM is in use, and a
+  WROOM-32D has none — this board has 16 MB of *flash* and 520 KB of internal
+  SRAM.
+
+  It is switched off for **room**, not for speed. IRAM is the binding constraint
+  on this chip: there are 128 KB, the Bluetooth controller alone holds 32 KB of
+  them, and IDF maps the whole workaround build of libc in there as well. Adding
+  the WS2812 driver overflowed the segment by 216 bytes and would not link.
+  Dropping the barriers shrinks libc, and going straight to `rmt_tx` instead of
+  the Arduino wrapper avoids dragging `rmt_rx.c` in for a direction the speaker
+  never uses — another 523 bytes. Together that leaves about 780 bytes of IRAM
+  free, where the alternative was a build that did not link at all.
+
+  If you ever build this for a WROVER **and enable PSRAM**, delete the
+  `build_unflags` block: there the workaround is doing a real job.
