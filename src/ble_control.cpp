@@ -186,6 +186,16 @@ ServerCallbacks serverCallbacks;
 CommandCallbacks commandCallbacks;
 WifiCallbacks wifiCallbacks;
 
+/*
+ * How much free internal heap Bluedroid has to see before it is safe to ask it
+ * to come up. See the long note in ble_control_begin().
+ *
+ * The number is this board's measured failure point rounded up: the host went
+ * down with roughly 105 KB free, and starting BLE ahead of Wi-Fi leaves about
+ * 168 KB, so the threshold sits comfortably between the two.
+ */
+const uint32_t MIN_FREE_HEAP = 115000;
+
 }  // namespace
 
 bool ble_control_begin(const char *device_name) {
@@ -202,6 +212,41 @@ bool ble_control_begin(const char *device_name) {
    */
   const uint32_t heapBefore = ESP.getFreeHeap();
   btMemRelease(BT_MODE_CLASSIC_BT);
+
+  /*
+   * The pre-flight heap check, and why it is not optional.
+   *
+   * The Bluedroid in these prebuilt libraries is the full dual-mode host --
+   * CONFIG_BT_CLASSIC_ENABLED with A2DP, AVRCP, SPP, HFP and SDP all compiled
+   * in, because the Bluetooth modes need them. esp_bluedroid_enable() runs
+   * BTE_InitStack() on the Bluedroid task, and that allocates every one of
+   * those control blocks whether or not this mode will ever use them: the best
+   * part of 100 KB of internal DRAM, for a service that carries a few hundred
+   * bytes of JSON.
+   *
+   * When one of those allocations fails, BTE_InitStack() unwinds, frees what it
+   * had and returns -- void. btu_task_start_up() does not check, so
+   * bta_sys_init() runs next and does
+   *
+   *     memset(bta_sys_cb_ptr, 0, sizeof(tBTA_SYS_CB));
+   *
+   * on the pointer that was just freed and nulled. That is a StoreProhibited
+   * panic at address zero, on core 0, inside the stack -- and with
+   * CONFIG_BT_STACK_NO_LOG=y there is not one line of warning before it. Two of
+   * those in a row and the boot sentinel gives up on this mode entirely.
+   *
+   * So the question gets asked here, where there is somewhere to report the
+   * answer. Refusing costs the control channel; the dashboard and the network
+   * player are untouched.
+   */
+  const uint32_t heapReady = ESP.getFreeHeap();
+  if (heapReady < MIN_FREE_HEAP) {
+    Serial.printf("[ble] not starting: %u bytes free, %u needed. Bluedroid "
+                  "would run out mid-init and panic. Wi-Fi + BLE mode "
+                  "continues without the control service.\n",
+                  (unsigned)heapReady, (unsigned)MIN_FREE_HEAP);
+    return false;
+  }
 
   BLEDevice::init(device_name);
   // The default MTU is 23 bytes, which truncates every status notification. The

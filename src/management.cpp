@@ -2942,6 +2942,30 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     // itself from cold -- and BLE provisioning is a second way in on top.
     Serial.println("[mode] Wi-Fi + BLE mode: audio arrives over the network, "
                    "BLE carries control. Bluetooth Classic is off.");
+
+    /*
+     * BLE first, before Wi-Fi -- and this ordering is load-bearing.
+     *
+     * These prebuilt libraries carry the full dual-mode Bluedroid host, so
+     * bringing BLE up allocates the Classic control blocks too: A2DP, AVRCP,
+     * SPP, HFP, SDP, the lot, near enough 100 KB of internal DRAM, none of
+     * which this mode will ever use. Wi-Fi and the dashboard together take
+     * about 55 KB. Asking for the second one first left Bluedroid with roughly
+     * 105 KB, it ran out partway through BTE_InitStack(), and because that
+     * function returns void and nobody checks it, the stack then panicked on a
+     * null control block a few calls later. Two boots of that and the sentinel
+     * above dropped the speaker back to Wi-Fi mode.
+     *
+     * Reversed, BLE gets the whole 168 KB the boot leaves it and Wi-Fi fits in
+     * what is left, which is the way round both stacks are documented to be
+     * started anyway. ble_control_begin() gives back the Classic *controller*
+     * memory on its way in; the host half is not separable and stays resident.
+     *
+     * main.cpp calls this again from service_network_audio(); it is idempotent,
+     * and that call is what covers the mode being reached by any path that does
+     * not come through here.
+     */
+    ble_control_begin(stableDeviceName.c_str());
   } else if (radioMode == RADIO_MODE_MANAGEMENT) {
     Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
   }

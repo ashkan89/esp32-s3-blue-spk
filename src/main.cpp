@@ -966,10 +966,16 @@ static void service_bluetooth_start() {
  * Brings up Wi-Fi + BLE mode, in two steps because they are ready at different
  * times.
  *
- * BLE needs nothing but the controller, so it starts as soon as the mode is
- * known -- and starting it early is the point: if the saved network is wrong,
- * BLE provisioning is the way back in, and it has to be there before anyone
- * gives up waiting for the dashboard.
+ * BLE is normally already up by the time this runs: management_begin() starts
+ * it before Wi-Fi, because the dual-mode Bluedroid host needs more contiguous
+ * heap than is left once Wi-Fi and the dashboard have taken theirs (see the
+ * note there). The call below is the idempotent second chance -- it returns
+ * immediately when the service is already advertising, and covers the mode
+ * being entered by a path that did not go through management_begin().
+ *
+ * Starting it early is the point either way: if the saved network is wrong, BLE
+ * provisioning is the way back in, and it has to be there before anyone gives
+ * up waiting for the dashboard.
  *
  * The network player needs an IP address. The DLNA renderer bakes the local
  * address into the description document it advertises, so starting it before
@@ -1135,9 +1141,11 @@ void setup() {
   // reconfigured in the middle of an A2DP stream. Connection is asynchronous;
   // an unreachable network falls back to the setup AP after 15 seconds.
   management_begin(a2dp_sink);
-  // The number that decides whether the rest of this boot can succeed. Wi-Fi
-  // has taken its share by now and Bluetooth has not yet taken its, so this is
-  // the budget the audio stack is about to be asked to fit into.
+  // The number that decides whether the rest of this boot can succeed: what is
+  // left once Wi-Fi has taken its share, and the budget the audio stack is
+  // about to be asked to fit into. In the Bluetooth modes the sink has not
+  // taken its share yet; in Wi-Fi + BLE the Bluedroid host already has, because
+  // it cannot wait until after Wi-Fi -- see the note in management_begin().
   Serial.printf("[boot] after network start: heap %u free, %u largest block\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
