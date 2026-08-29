@@ -354,7 +354,7 @@ static const float BATTERY_MAX_PLAUSIBLE_V = 4.45f;
 /// is ~420 mA for seven pixels, 96 is ~160 mA, and a devkit's USB supply with a
 /// DFPlayer already on it does not want the former.
 #ifndef LED_BRIGHTNESS_MAX
-#define LED_BRIGHTNESS_MAX 160
+#define LED_BRIGHTNESS_MAX 200
 #endif
 
 /// Frames per second for the lighting task. WS2812 latch time bounds this at a

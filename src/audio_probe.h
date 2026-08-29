@@ -105,3 +105,9 @@ void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms);
 /// millis() of the last time audio was above the noise floor. Used by the UI to
 /// decide when to stop showing visualisers and go idle.
 uint32_t audio_probe_last_active();
+
+/// The loudest band of the last analysis in dBFS, before the display tilt. What
+/// `active` is decided from, reported so a speaker that will not go idle can be
+/// diagnosed by looking rather than by guessing: silence reads as the floor
+/// (-78), and anything playing reads well above it.
+float audio_probe_peak_db();

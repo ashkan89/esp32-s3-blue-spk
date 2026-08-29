@@ -82,6 +82,19 @@ static float vu_l_f, vu_r_f, pk_l_f, pk_r_f;
 /// Noise floor. Below this a band is drawn as nothing at all, which matters
 /// because the SBC decoder never outputs exact silence.
 static const float FLOOR_DB = -78.0f;
+
+/// How far above the floor the loudest band has to reach for the frame to count
+/// as audio. Applied to the *untilted* peak, so it is a plain dBFS threshold:
+/// FLOOR_DB + 8 is -70 dBFS, which is far below anything anybody listens to and
+/// above the dither a source puts on a silent stream. Raise it if a paused
+/// source still reads as playing on your hardware; every consumer of `active`
+/// -- the idle timers, the visualiser screens, the beat detector -- follows it.
+static const float ACTIVE_ABOVE_FLOOR_DB = 8.0f;
+
+/// The last untilted peak, in dBFS, purely so the dashboard can show what the
+/// analyser is actually hearing. "It says nothing is playing and it is" is not
+/// a thing anybody should have to guess at twice.
+static float last_peak_db = FLOOR_DB;
 /// The auto-gain ceiling is clamped here so that near-silence does not get
 /// amplified into a full-height display of dither noise.
 static const float AGC_MIN_DB = -42.0f;
@@ -317,6 +330,24 @@ static void analyse_locked(uint32_t dt_ms) {
 
   float raw_db[VIS_BANDS];
   float frame_max_db = FLOOR_DB;
+  /*
+   * The same peak with the display tilt left off, and the only thing `active`
+   * is allowed to look at.
+   *
+   * band_tilt is cosmetic: it lifts the high bands so a spectrum of real music
+   * fills the display evenly instead of sloping off to the right. But it is
+   * added *after* to_db() has already clamped at FLOOR_DB, so digital silence
+   * does not come out at the floor -- it comes out at the floor plus the tilt,
+   * which at the top band is FLOOR_DB + 11. Tested against FLOOR_DB + 8, that
+   * is louder than the threshold, so silence read as audio: `active` was true
+   * from boot, in every mode, whether or not anything was connected.
+   *
+   * Everything downstream believed it. The idle timers never counted, so the
+   * panel never blanked and the ring never rested; the visualiser screens were
+   * always eligible. The tilt stays where it is for the bars, and the test now
+   * reads the untilted peak.
+   */
+  float frame_peak_db = FLOOR_DB;
   float bass_energy = 0.0f;
 
   for (uint8_t b = 0; b < VIS_BANDS; b++) {
@@ -325,13 +356,16 @@ static void analyse_locked(uint32_t dt_ms) {
       const float m = fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
       if (m > best) best = m;  // peak, not mean: peaks look like music
     }
-    const float db = to_db(sqrtf(best) * bin_scale) + band_tilt[b];
+    const float flat_db = to_db(sqrtf(best) * bin_scale);
+    const float db = flat_db + band_tilt[b];
     raw_db[b] = db;
     if (db > frame_max_db) frame_max_db = db;
+    if (flat_db > frame_peak_db) frame_peak_db = flat_db;
     if (b < 4) bass_energy += sqrtf(best) * bin_scale;
   }
 
-  vis.active = frame_max_db > FLOOR_DB + 8.0f;
+  last_peak_db = frame_peak_db;
+  vis.active = frame_peak_db > FLOOR_DB + ACTIVE_ABOVE_FLOOR_DB;
   if (vis.active) last_active_ms = now;
 
   /*
@@ -502,3 +536,5 @@ void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
 }
 
 uint32_t audio_probe_last_active() { return last_active_ms; }
+
+float audio_probe_peak_db() { return last_peak_db; }

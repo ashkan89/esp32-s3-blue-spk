@@ -19,6 +19,7 @@
 #include <esp_wifi.h>
 
 #include "BluetoothA2DPSink.h"
+#include "audio_probe.h"
 #include "battery.h"
 #include "ble_control.h"
 #include "df_player.h"
@@ -2033,6 +2034,12 @@ void handleSettingsGet() {
   // one being held open, and by what.
   oled["idleSeconds"] = ui_idle_ms() / 1000;
   oled["untouchedSeconds"] = ui_untouched_ms() / 1000;
+  // What the analyser is actually hearing, which is what both timers are
+  // decided from. Silence reads as the floor; anything playing reads well above
+  // it, and a number that will not fall is the answer to "why is it not idle".
+  oled["audioPeakDb"] = serialized(String(audio_probe_peak_db(), 1));
+  oled["audioHeard"] = audio_probe_last_active() != 0;
+  oled["dfBusy"] = df_player_active();
 
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;

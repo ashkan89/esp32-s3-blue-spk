@@ -964,6 +964,19 @@ powered. The probe now watches its own write counter instead: a quarter-second
 with no new samples is a stopped stream, and the window is treated as the silence
 it is. That one costs the writer nothing.
 
+The third was the test itself, and it was the one that mattered. `band_tilt`
+lifts the high bands by up to 11 dB so a spectrum of real music fills the display
+evenly instead of sloping away to the right — a cosmetic, and applied *after*
+`to_db()` has already clamped at `FLOOR_DB`. Digital silence therefore did not
+come out at the floor; it came out at the floor plus the tilt, which at the top
+band is −67 dBFS. Tested against `FLOOR_DB + 8` (−70), that is above the
+threshold, so **silence read as audio** — `active` was true from boot, in every
+mode, with nothing connected and nothing playing. Nothing downstream could have
+been right: the idle timers never counted, and the visualiser screens were always
+eligible. The tilt stays where it is for the bars; the test reads the untilted
+peak, and the threshold has a name (`ACTIVE_ABOVE_FLOOR_DB`) now that it is
+capable of being false.
+
 What is left is honest, because it is looking at the samples, and every source
 that passes through this chip feeds it — A2DP, the network player, the chimes.
 The timers read its last-heard timestamp rather than its instantaneous flag, so a
@@ -972,9 +985,13 @@ fade or the gap between two tracks does not read as *stopped*
 both timers also ask `df_player_active()`; without that the panel would blank
 mid-track in the one mode where it is most obviously playing.
 
-Both countdowns are reported on the card — *nothing has played for 2m 14s;
-nobody has touched it for 6m 52s* — and the ring's on the Lighting page, so a
-panel that will not blank is a thing you can look at rather than guess about.
+Both countdowns are reported on the card, along with the analyser's own reading
+— *nothing has played for 2m 14s; nobody has touched it for 6m 52s. Analyser
+peak −78 dBFS* — and the ring's countdown on the Lighting page. Silence reads
+about −78 and anything playing reads well above it, so a panel that will not
+blank is now a thing you can look at rather than guess about: a peak stuck high
+with nothing playing is the analyser, a peak at the floor with the timer stuck at
+zero is not.
 
 Timeouts run from ten seconds to twelve hours. Both modes are suspended while a
 system overlay is up — an update, a restart, the factory-reset countdown — since
