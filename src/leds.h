@@ -20,8 +20,9 @@
  *
  * Configuration arrives from the web task, which is a different task again, so
  * the live settings live behind a spinlock. Both sides only ever copy the whole
- * struct in or out -- it is twelve bytes and the critical section is a memcpy,
- * which is cheaper than reasoning about which fields may be seen half-updated.
+ * struct in or out -- it is a couple of dozen bytes and the critical section is
+ * a memcpy, which is cheaper than reasoning about which fields may be seen
+ * half-updated.
  *
  * ---------------------------------------------------------------------------
  * How the music sync works
@@ -94,6 +95,22 @@ struct LedConfig {
   uint8_t reactivity;  ///< 0..100, how much the music is allowed to show
   uint32_t color;      ///< primary
   uint32_t color2;     ///< secondary: the other end of the gradients
+
+  /*
+   * Resting. With idleOff set, the ring goes dark once nothing has been heard
+   * and nothing has been changed for idleAfterS seconds, and comes straight
+   * back on the first note or the first touch of the dashboard.
+   *
+   * Deliberately *not* the same thing as `enabled`, which is the owner saying
+   * the ring should be off and survives a reboot as that. This is the ring
+   * resting between uses, and `enabled` stays true throughout -- so the page
+   * still shows the effect and the colours that will come back.
+   *
+   * DFPlayer mode hears nothing (that module's audio never passes through this
+   * chip), so there the timer only ever runs from the last dashboard change.
+   */
+  bool idleOff;
+  uint16_t idleAfterS;
 };
 
 #if LEDS_ENABLED
@@ -128,6 +145,10 @@ const char *leds_effect_hint(uint8_t effect);
 /// "the music mode looks frozen" is otherwise a mystery in DFPlayer mode.
 bool leds_hearing_audio();
 
+/// True while idleOff has the ring resting. Reported for the same reason: a
+/// dark ring that the page says is on and rainbow is otherwise a fault.
+bool leds_resting();
+
 /// Serial console: "leds", "leds on|off", "leds fx <0-14>", "leds color RRGGBB",
 /// "leds color2 RRGGBB", "leds bright <0-255>", "leds speed <0-255>",
 /// "leds react <0-100>". Returns false if the line was not one of those.
@@ -142,5 +163,6 @@ inline void leds_get(LedConfig *out) { *out = LedConfig{}; }
 inline const char *leds_effect_name(uint8_t) { return "?"; }
 inline const char *leds_effect_hint(uint8_t) { return ""; }
 inline bool leds_hearing_audio() { return false; }
+inline bool leds_resting() { return false; }
 inline bool leds_command(const char *) { return false; }
 #endif

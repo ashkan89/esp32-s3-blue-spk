@@ -386,3 +386,12 @@ static const uint32_t LED_DEFAULT_COLOR2 = 0xFF0080u;   // magenta
 /// How long after the last audio the reactive effects fall back to their
 /// non-reactive behaviour, so a paused speaker does not sit frozen mid-flash.
 static const uint16_t LED_AUDIO_IDLE_MS = 2500;
+
+/// Resting the ring when the speaker is not being used. Off by default -- a
+/// ring is often the point of the build and switching it off uninvited would be
+/// a surprise. These are only the starting values; the dashboard's Lighting
+/// page stores the owner's choice in NVS and that wins from then on.
+static const bool LED_IDLE_OFF_DEFAULT = false;
+static const uint16_t LED_IDLE_AFTER_S_DEFAULT = 300;
+static const uint16_t LED_IDLE_AFTER_S_MIN = 10;
+static const uint16_t LED_IDLE_AFTER_S_MAX = 43200;  // 12 hours

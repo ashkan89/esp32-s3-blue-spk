@@ -150,6 +150,27 @@ static portMUX_TYPE system_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
 // ------------------------------------------------------------------ timers ---
 static uint32_t last_frame_ms;
 static uint32_t last_activity_ms;
+
+/*
+ * Two idle clocks, not one.
+ *
+ * last_activity_ms is the old one and audio keeps it warm, which is what the
+ * dim and the screensaver want: a speaker that is playing is not idle. It is
+ * therefore useless for a blanking mode whose whole point is to go dark during
+ * playback, so the moments the *owner* did something get their own timestamp.
+ */
+static uint32_t last_input_ms;
+
+static volatile uint8_t blank_mode = UI_BLANK_MODE_DEFAULT;
+static volatile uint32_t blank_after_ms = UI_BLANK_AFTER_S_DEFAULT * 1000UL;
+static bool panel_off;
+
+/// One touch resets both clocks. Every caller wants both -- the owner pressing
+/// a button is activity by any definition.
+static void note_input(uint32_t now) {
+  last_activity_ms = now;
+  last_input_ms = now;
+}
 static uint32_t frame_counter;
 static float fps_avg = UI_FPS;
 
@@ -606,17 +627,32 @@ static void draw_waterfall(const AudioVis &v) {
   memcpy(fb(), wf_fb, FB_BYTES);
 }
 
+/*
+ * HH:MM in whichever format the owner picked. The 12-hour form drops the
+ * leading zero -- "6:51 PM" -- because these readouts share a 128 px row with
+ * other text and the zero buys nothing.
+ */
+static void format_hhmm(char *out, size_t size, const struct tm &t) {
+  if (soft_clock_use_24h()) {
+    snprintf(out, size, "%02d:%02d", t.tm_hour, t.tm_min);
+    return;
+  }
+  int hour = t.tm_hour % 12;
+  if (hour == 0) hour = 12;
+  snprintf(out, size, "%d:%02d%s", hour, t.tm_min, t.tm_hour < 12 ? "a" : "p");
+}
+
 static void draw_clock_screen(uint32_t now, uint32_t dt) {
   struct tm t;
   soft_clock_now(&t);
 
   int hour = t.tm_hour;
   const char *ampm = nullptr;
-#if !CLOCK_24H
-  ampm = (hour < 12) ? "AM" : "PM";
-  hour = hour % 12;
-  if (hour == 0) hour = 12;
-#endif
+  if (!soft_clock_use_24h()) {
+    ampm = (hour < 12) ? "AM" : "PM";
+    hour = hour % 12;
+    if (hour == 0) hour = 12;
+  }
 
   /*
    * Burn-in wander. These panels do retain a bright static image, and a clock is
@@ -858,9 +894,9 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
 
   struct tm t;
   soft_clock_now(&t);
-  char line[32];
-  snprintf(line, sizeof(line), "%02d:%02d  %d/%d", t.tm_hour, t.tm_min,
-           t.tm_mday, t.tm_mon + 1);
+  char line[32], clock[12];
+  format_hhmm(clock, sizeof(clock), t);
+  snprintf(line, sizeof(line), "%s  %d/%d", clock, t.tm_mday, t.tm_mon + 1);
   u8g2.setFont(FONT_SMALL);
   u8g2.drawUTF8(32, 31, line);
 }
@@ -887,8 +923,8 @@ static void draw_saver(uint32_t now) {
 
   struct tm t;
   soft_clock_now(&t);
-  char line[8];
-  snprintf(line, sizeof(line), "%02d:%02d", t.tm_hour, t.tm_min);
+  char line[12];
+  format_hhmm(line, sizeof(line), t);
 
   u8g2.drawRFrame(sx, sy, BW, BH, 3);
   u8g2.drawXBMP(sx + 4, sy + 4, 8, 8, ICON_CLOCK);
@@ -948,6 +984,18 @@ static void draw_toast(const PlayerInfo &s, uint32_t dt) {
   draw_marquee(MQ_TOAST_A, 18, 12, W - 24, head, dt);
   u8g2.setFont(FONT_TEXT);
   draw_marquee(MQ_TOAST_B, 7, 26, W - 14, detail, dt);
+}
+
+/// Is an overlay on screen right now? A read with no side effects, unlike the
+/// snapshot below, which also retires an expired one.
+static bool system_overlay_visible(uint32_t now) {
+  bool visible;
+  portENTER_CRITICAL(&system_overlay_mux);
+  visible = system_overlay.active &&
+            (system_overlay.until == 0 ||
+             (int32_t)(now - system_overlay.until) < 0);
+  portEXIT_CRITICAL(&system_overlay_mux);
+  return visible;
 }
 
 static bool system_overlay_snapshot(SystemOverlay *out, uint32_t now) {
@@ -1224,7 +1272,7 @@ static void poll_button(uint32_t now) {
     btn_consumed = true;
     bright_level = (uint8_t)((bright_level + 1) % 3);
     bright_override = 0;
-    last_activity_ms = now;
+    note_input(now);
     return;
   }
 
@@ -1240,7 +1288,7 @@ static void poll_button(uint32_t now) {
     ui_show_system_status(UI_STATUS_NETWORK, title, "Let go, then press BOOT",
                           -1, UI_BTN_MODE_CONFIRM_MS);
     status_led_blip(2);
-    last_activity_ms = now;
+    note_input(now);
     return;
   }
 
@@ -1267,14 +1315,21 @@ static void poll_button(uint32_t now) {
                             0);
       status_led_blip(1);
     }
-    last_activity_ms = now;
+    note_input(now);
     return;
   }
 
   if (!down && btn_down) {
     btn_down = false;
     const uint32_t held = now - btn_since;
-    last_activity_ms = now;
+    const bool was_dark = panel_off;
+    note_input(now);
+    // With the panel blanked the first press only brings it back. Anything else
+    // means the screen you asked to see is one you never got to look at.
+    if (was_dark) {
+      btn_reset_shown = 0xFF;
+      return;
+    }
     if (btn_reset_shown != 0xFF && !btn_reset_fired) {
       btn_reset_shown = 0xFF;
       ui_show_system_status(UI_STATUS_SUCCESS, "Factory reset",
@@ -1343,6 +1398,33 @@ static void ui_frame() {
   const uint32_t idle = now - last_activity_ms;
   const bool dim = idle > UI_DIM_AFTER_MS;
   const bool deep_idle = idle > UI_SLEEP_AFTER_MS;
+
+  /*
+   * Blanking, decided before anything is drawn: the I2C frame is by far the
+   * expensive part of this task, and a panel that is off has no use for one.
+   *
+   * The two modes differ only in which clock they read. IDLE reads the one
+   * audio keeps warm, so playback holds the display open; ALWAYS reads the one
+   * only the owner touches, so it does not.
+   */
+  bool blank = false;
+  const uint8_t mode = blank_mode;
+  const uint32_t after = blank_after_ms;
+  if (mode == UI_BLANK_IDLE) blank = idle > after;
+  else if (mode == UI_BLANK_ALWAYS) blank = (now - last_input_ms) > after;
+  // An update, a restart or the reset countdown suspends it: those are exactly
+  // the moments somebody is watching the panel, and going dark through one is
+  // indistinguishable from a crash.
+  if (blank && system_overlay_visible(now)) blank = false;
+
+  if (blank != panel_off) {
+    panel_off = blank;
+    u8g2.setPowerSave(blank ? 1 : 0);
+    // Coming back, the contrast register is re-applied on the next frame
+    // anyway; going away, forget what was applied so it cannot be skipped.
+    if (!blank) bright_applied = 0;
+  }
+  if (panel_off) return;
 
   const UiScreen want = pick_screen(info, now, deep_idle);
   if (want != cur_screen) {
@@ -1483,7 +1565,7 @@ bool ui_begin() {
 
 void ui_start() {
   if (!g_present) return;
-  last_activity_ms = millis();
+  note_input(millis());
   screen_since = millis();
   // Core 0, priority 1: the Bluetooth controller and the audio path both
   // outrank it, so a slow I2C frame can never delay a sample.
@@ -1492,7 +1574,20 @@ void ui_start() {
 
 bool ui_present() { return g_present; }
 
-void ui_wake() { last_activity_ms = millis(); }
+void ui_wake() { note_input(millis()); }
+
+void ui_set_blank(UiBlankMode mode, uint16_t after_seconds) {
+  if (mode > UI_BLANK_ALWAYS) mode = UI_BLANK_NEVER;
+  if (after_seconds < UI_BLANK_AFTER_S_MIN) after_seconds = UI_BLANK_AFTER_S_MIN;
+  if (after_seconds > UI_BLANK_AFTER_S_MAX) after_seconds = UI_BLANK_AFTER_S_MAX;
+  blank_mode = (uint8_t)mode;
+  blank_after_ms = (uint32_t)after_seconds * 1000UL;
+  // Waking is the point: whatever the owner just chose, they should see the
+  // panel come back rather than wonder whether the setting took.
+  ui_wake();
+}
+
+bool ui_blanked() { return panel_off; }
 
 void ui_show_system_status(UiSystemStatus kind, const char *title,
                            const char *detail, int16_t progress,

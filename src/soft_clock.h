@@ -113,10 +113,30 @@ int32_t soft_clock_utc_offset_min();
 /// Accepts -840..840 (UTC-14 to UTC+14); anything else is ignored.
 void soft_clock_set_utc_offset_min(int32_t minutes);
 
+// ------------------------------------------------------------ presentation --
+/*
+ * How the time is written down, rather than what it is. Kept here, next to the
+ * clock itself, because the OLED and the dashboard both draw it and neither is
+ * a sensible owner of the preference. Seeded from CLOCK_24H and then whatever
+ * the dashboard's Clock card last stored.
+ */
+
+/// True for 24-hour time, false for 12-hour with AM/PM.
+bool soft_clock_use_24h();
+void soft_clock_set_use_24h(bool on);
+
 // --------------------------------------------------------- network sync -----
 
+/// Whether SNTP may correct the clock while the speaker is on Wi-Fi. On by
+/// default; turning it off is for an owner who has set the time by hand and
+/// wants it left alone. soft_clock_network_begin() honours this, so the caller
+/// does not have to.
+bool soft_clock_auto_sync();
+void soft_clock_set_auto_sync(bool on);
+
 /// Starts (or restarts) SNTP. Call once the station has an address; it is
-/// cheap and idempotent, so calling it again after a reconnect is fine.
+/// cheap and idempotent, so calling it again after a reconnect is fine. Does
+/// nothing while soft_clock_auto_sync() is false.
 void soft_clock_network_begin();
 
 /// Stops SNTP. Call when the network goes away, so the client is not polling

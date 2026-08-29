@@ -31,6 +31,10 @@
 
 #include <stdint.h>
 
+// For the blanking defaults and bounds below, which are owner-tunable and so
+// live with the rest of the UI's build-time settings.
+#include "ui_config.h"
+
 /// Brings up I2C and the panel. Returns false if nothing answers on the bus, in
 /// which case the whole UI stays switched off and the speaker works as before.
 bool ui_begin();
@@ -41,8 +45,46 @@ void ui_start();
 /// True if a panel was found.
 bool ui_present();
 
-/// Resets the idle timers and undims. Call on anything the user did.
+/// Resets the idle timers, undims, and lights the panel again if blanking had
+/// switched it off. Call on anything the user did.
 void ui_wake();
+
+/*
+ * When the panel switches itself off.
+ *
+ * Distinct from the dim and the screensaver: those keep the display lit and
+ * only move the lit pixels around, which is a burn-in measure. This turns the
+ * display off at the controller, which is the only thing that stops the panel
+ * ageing at all -- and the only one that gets back the ~15 mA it draws, which
+ * on a battery is the reason to want it.
+ *
+ * The two timed modes differ in what counts as a reason to stay on:
+ *
+ *   UI_BLANK_IDLE     runs off the same idle timer the screensaver uses, which
+ *                     audio keeps warm -- so a speaker that is playing keeps
+ *                     its display no matter how long the track is.
+ *   UI_BLANK_ALWAYS   runs off the last thing the *owner* did: a button press,
+ *                     a dashboard action, a serial command. Playback does not
+ *                     hold it open, so the panel goes dark mid-album.
+ *
+ * A system overlay -- an update, a restart, the factory-reset countdown --
+ * suspends both. Those are the moments somebody is watching the panel for a
+ * reason, and blanking through one would look like a crash.
+ */
+enum UiBlankMode : uint8_t {
+  UI_BLANK_NEVER = 0,  ///< the panel stays on
+  UI_BLANK_IDLE,       ///< off once nothing is playing and nobody has touched it
+  UI_BLANK_ALWAYS,     ///< off on a timer, whatever is playing
+};
+
+/// Applies a blanking policy and wakes the panel so the change is visible.
+/// `after_seconds` is clamped to UI_BLANK_AFTER_S_MIN..MAX and ignored for
+/// UI_BLANK_NEVER. Safe from any task.
+void ui_set_blank(UiBlankMode mode, uint16_t after_seconds);
+
+/// True while blanking has the display switched off, so the dashboard can say
+/// so rather than leaving a dark panel looking like a fault.
+bool ui_blanked();
 
 enum UiSystemStatus : uint8_t {
   UI_STATUS_NETWORK = 0,

@@ -92,6 +92,20 @@ static const uint16_t UI_TOAST_MS = 2200;
 static const uint32_t UI_DIM_AFTER_MS = 90000;
 static const uint32_t UI_SLEEP_AFTER_MS = 300000;
 
+/// Blanking, which is a different thing from the two above: they keep the panel
+/// lit and only move the pixels around, this switches the display off at the
+/// controller. It is the only thing that actually stops an OLED ageing, and the
+/// only one that saves the ~15 mA the panel draws.
+///
+/// These are the values a speaker that has never been opened in a browser comes
+/// up with. The dashboard's OLED display card stores the owner's choice in NVS
+/// and that wins from then on. Mode 0 is off, 1 blanks once nothing is playing,
+/// 2 blanks on a timer whatever is playing -- see UiBlankMode in ui.h.
+static const uint8_t UI_BLANK_MODE_DEFAULT = 0;
+static const uint16_t UI_BLANK_AFTER_S_DEFAULT = 300;
+static const uint16_t UI_BLANK_AFTER_S_MIN = 10;
+static const uint16_t UI_BLANK_AFTER_S_MAX = 43200;  // 12 hours
+
 // ----------------------------------------------------------------- button ----
 
 /// GPIO0 is the BOOT button that is already on the dev board -- no wiring, no
@@ -170,7 +184,9 @@ static const float VIS_AGC_RELEASE_S = 3.0f;
 /// Whatever the source, the time is written to NVS every 10 minutes, so a
 /// reboot or a power cut comes back within minutes rather than back to 1970.
 
-/// 24-hour clock (1) or 12-hour with AM/PM (0).
+/// 24-hour clock (1) or 12-hour with AM/PM (0). Only the starting value: the
+/// dashboard's Clock card stores the owner's choice in NVS and that wins from
+/// then on, so this is what a speaker that has never been opened comes up with.
 #ifndef CLOCK_24H
 #define CLOCK_24H 1
 #endif

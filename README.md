@@ -666,12 +666,21 @@ Under **Settings → GitHub Releases**, enter `owner/repository` and an asset
 pattern such as `*.bin` or `speaker-*.bin`. The updater ignores bootloader,
 partition-table, LittleFS and SPIFFS images. Publish the normal PlatformIO
 `firmware.bin` as a release asset, then use **Check GitHub** and **Install
-release**. Public repositories need no token; a fine-grained token can be saved
+update**. Public repositories need no token; a fine-grained token can be saved
 for a private repository. GitHub API and release downloads are verified over TLS
 against the Mozilla root store — see **Trust anchors** below.
 
 Set the version reported by the dashboard in [src/app_config.h](src/app_config.h)
-for each release. A leading `v` in a GitHub tag is ignored during comparison.
+for each release.
+
+**Only a newer release is an update.** The tags are compared as numbers,
+component by component: a leading `v` and any pre-release suffix are ignored, and
+missing components count as zero, so `v2.3` and `2.3.0` are the same release and
+`2.10.0` is newer than `2.9.0`. A latest release that is older than or equal to
+what is running reports *up to date* and offers no button, and the install
+endpoint refuses it too — the dashboard is not the only way in, and the OTA
+writer would flash an older image quite happily. There is no downgrade path
+short of the **Upload firmware** box, which takes whatever `.bin` you hand it.
 
 Restarts — after an update, a settings change, a factory reset or the dashboard
 button — are run from a dedicated high-priority task rather than from a deadline
@@ -739,7 +748,7 @@ time-limited URL on a storage host with a different name and a different
 certificate chain. `HTTPClient` can follow that on its own, but it does it by
 switching hosts underneath a live `NetworkClientSecure` — stop the socket,
 reconnect the same mbedtls context to a different name. **Check GitHub** worked
-and **Install release** then failed with **HTTP -1**: a refused connection, which
+and **Install update** then failed with **HTTP -1**: a refused connection, which
 is what a handshake that never completes looks like from up there.
 
 So the redirect is followed by hand, one hop at a time, each with its own client
@@ -894,6 +903,34 @@ Screen changes are animated by compositing the previous frame with the new one,
 rotating through a horizontal slide, a wipe with a bright leading edge, and a
 dithered dissolve. The frame buffer is four 128-byte pages of eight vertical
 pixels, so the slide and the wipe are `memmove`s and cost nothing measurable.
+
+### Switching the panel off
+
+Dimming and the screensaver both keep the display lit; they only keep the lit
+pixels moving, which is a burn-in measure and nothing more. **Settings → OLED
+display → Switch the panel off** turns the display off at the controller, which
+is the only thing that stops the panel ageing at all, and the only one that gets
+back the ~15 mA it draws — the reason to want it on a battery.
+
+Three choices, one at a time:
+
+| | |
+|---|---|
+| **Always on** | The panel never switches itself off. This is the default. |
+| **Off when idle** | Off once the timeout passes with nothing playing and nobody touching it. Audio holds it open, so a playing speaker keeps its display however long the album is. |
+| **Off on a timer** | Off once the timeout passes since the last thing *you* did — a button press, a dashboard action, a serial command. Playback does not hold it open, so it goes dark mid-track. |
+
+That difference is the whole reason there are two of them, and why the firmware
+keeps two idle clocks rather than one: the first reads the clock audio keeps
+warm, the second reads the one only the owner touches.
+
+Timeouts run from ten seconds to twelve hours. Both modes are suspended while a
+system overlay is up — an update, a restart, the factory-reset countdown — since
+those are the moments somebody is watching the panel, and going dark through one
+is indistinguishable from a crash. Anything wakes it: the BOOT button, a
+dashboard action, the serial console, a Bluetooth connection. With the panel
+dark the first press of BOOT only brings it back and does not also change
+screen, since a screen you never saw is not one you asked for.
 
 ### Controls
 
@@ -1096,6 +1133,23 @@ press.
 The effect list the page draws comes from the firmware, not from the page, so
 adding an effect stays a one-file change in [src/leds.cpp](src/leds.cpp).
 
+**Resting.** The card at the bottom of the page puts the ring out when the
+speaker is not being used: with it on, the ring goes dark once the timeout
+passes with nothing heard and nothing changed, and comes straight back on the
+first note or the first change made on the page. Off — the default — keeps it
+lit for as long as the speaker is powered.
+
+This is deliberately not the same thing as the master switch at the top. That
+one is you saying the ring should be off, and it survives a reboot as exactly
+that. Resting is the ring waiting between uses: the effect and both colours are
+kept, the page goes on showing them, and the master switch stays on throughout.
+
+The timer runs off the same analysis the effects react to, so it hears
+Bluetooth, network audio and the start-up chimes alike. DFPlayer mode is the
+exception it always is — that module decodes its own card and its audio never
+passes through this chip — so a resting ring there is woken by the dashboard and
+not by playback.
+
 ### From the serial console
 
 ```
@@ -1180,7 +1234,16 @@ value is UTC; firmware older than the automatic sync saved local time under a
 different key, so the first boot after upgrading falls back to the build stamp
 until the first sync lands.
 
-`-DCLOCK_24H=0` switches the clock screen to 12-hour with AM/PM.
+**Settings → Clock** owns the rest of it. It shows the speaker's own time next
+to the source it came from, switches between 24-hour and 12-hour with AM/PM —
+which the OLED clock, the pairing screen and the screensaver all follow — and
+carries the switch for network sync. Turning that off stops SNTP: the clock
+then keeps whatever you last set and nothing corrects it, which is what you
+want on a speaker whose time you set by hand and not otherwise — the update
+check validates GitHub's certificate against this clock, and a clock that has
+drifted far enough fails the handshake. All three apply immediately; there is
+nothing to save. `-DCLOCK_24H=0` in [src/ui_config.h](src/ui_config.h) is only
+the starting value, for a speaker that is never opened in a browser.
 
 ## The battery gauge
 
@@ -1485,6 +1548,8 @@ Display knobs live in [src/ui_config.h](src/ui_config.h), all commented in place
   `UI_FLIP_180`
 - `UI_SCREEN_DWELL_MS`, `UI_TRANSITION_MS`, `UI_VOLUME_POPUP_MS`, `UI_TOAST_MS`
 - `UI_BRIGHT_*`, `UI_DIM_AFTER_MS`, `UI_SLEEP_AFTER_MS`
+- `UI_BLANK_MODE_DEFAULT`, `UI_BLANK_AFTER_S_DEFAULT` / `_MIN` / `_MAX` — the
+  panel blanking the dashboard then owns
 - `PIN_UI_BUTTON`, `UI_BTN_LONG_MS`, `UI_BTN_HOLD_MS`
 - `FFT_SIZE`, `VIS_BANDS`, `VIS_RANGE_DB`, `VIS_FALL_PER_S`,
   `VIS_PEAK_FALL_PER_S`, `VIS_PEAK_HANG_MS`, `VIS_AGC_RELEASE_S`
@@ -1532,7 +1597,8 @@ build_flags =
   default 160 about 260 mA
 - `LED_DEFAULT_EFFECT`, `LED_DEFAULT_BRIGHTNESS`, `LED_DEFAULT_SPEED`,
   `LED_DEFAULT_REACTIVITY`, `LED_DEFAULT_COLOR` / `LED_DEFAULT_COLOR2`,
-  `LED_AUDIO_IDLE_MS` — only the factory-fresh values; everything here is stored
+  `LED_AUDIO_IDLE_MS`, `LED_IDLE_OFF_DEFAULT`, `LED_IDLE_AFTER_S_DEFAULT` /
+  `_MIN` / `_MAX` — only the factory-fresh values; everything here is stored
   in NVS and editable from **Lighting**
 
 To make the ESP32 forget the paired phone, call

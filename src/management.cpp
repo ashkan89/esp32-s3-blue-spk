@@ -67,6 +67,11 @@ struct Settings {
   uint8_t batteryLow;
   uint8_t batteryCritical;
 
+  // Panel blanking. A UiBlankMode and how long it waits; see ui.h for what the
+  // two timed modes each count as a reason to stay on.
+  uint8_t oledBlankMode;
+  uint16_t oledBlankAfterS;
+
   LedConfig leds;
 };
 
@@ -254,6 +259,19 @@ void loadSettings(const char *fallbackName) {
   settings.batteryLow = prefs.getUChar("batLow", BATTERY_LOW_PCT_DEFAULT);
   settings.batteryCritical = prefs.getUChar("batCrit", BATTERY_CRITICAL_PCT_DEFAULT);
 
+  settings.oledBlankMode = prefs.getUChar("uiBlank", UI_BLANK_MODE_DEFAULT);
+  settings.oledBlankAfterS = prefs.getUShort("uiBlankS", UI_BLANK_AFTER_S_DEFAULT);
+  if (settings.oledBlankMode > (uint8_t)UI_BLANK_ALWAYS) {
+    settings.oledBlankMode = (uint8_t)UI_BLANK_NEVER;
+  }
+  settings.oledBlankAfterS = (uint16_t)constrain(
+      (int)settings.oledBlankAfterS, (int)UI_BLANK_AFTER_S_MIN,
+      (int)UI_BLANK_AFTER_S_MAX);
+  // The panel may not exist yet -- ui_begin() runs later in some modes -- but
+  // ui_set_blank() only writes two variables the render task reads, so this is
+  // safe here and saves a second place that has to remember to apply it.
+  ui_set_blank((UiBlankMode)settings.oledBlankMode, settings.oledBlankAfterS);
+
   /*
    * The ring. Loaded in every radio mode, not just the ones with a dashboard:
    * a Bluetooth-only speaker still has lights on it, and they should come back
@@ -267,8 +285,13 @@ void loadSettings(const char *fallbackName) {
   settings.leds.reactivity = prefs.getUChar("ledRct", LED_DEFAULT_REACTIVITY);
   settings.leds.color = prefs.getULong("ledCol", LED_DEFAULT_COLOR);
   settings.leds.color2 = prefs.getULong("ledCol2", LED_DEFAULT_COLOR2);
+  settings.leds.idleOff = prefs.getBool("ledIdle", LED_IDLE_OFF_DEFAULT);
+  settings.leds.idleAfterS = prefs.getUShort("ledIdleS", LED_IDLE_AFTER_S_DEFAULT);
   if (settings.leds.effect >= LED_FX_COUNT) settings.leds.effect = LED_DEFAULT_EFFECT;
   if (settings.leds.reactivity > 100) settings.leds.reactivity = 100;
+  settings.leds.idleAfterS = (uint16_t)constrain(
+      (int)settings.leds.idleAfterS, (int)LED_IDLE_AFTER_S_MIN,
+      (int)LED_IDLE_AFTER_S_MAX);
   leds_configure(settings.leds);
 
   stableDeviceName = settings.deviceName;
@@ -311,6 +334,9 @@ void saveSettings() {
   prefs.putUChar("batLow", settings.batteryLow);
   prefs.putUChar("batCrit", settings.batteryCritical);
 
+  prefs.putUChar("uiBlank", settings.oledBlankMode);
+  prefs.putUShort("uiBlankS", settings.oledBlankAfterS);
+
   saveLedSettings();
 }
 
@@ -328,6 +354,8 @@ void saveLedSettings() {
   prefs.putUChar("ledRct", settings.leds.reactivity);
   prefs.putULong("ledCol", settings.leds.color);
   prefs.putULong("ledCol2", settings.leds.color2);
+  prefs.putBool("ledIdle", settings.leds.idleOff);
+  prefs.putUShort("ledIdleS", settings.leds.idleAfterS);
   ledsDirty = false;
 }
 
@@ -563,8 +591,46 @@ bool isFirmwareAsset(const String &name) {
 
 String normalizedVersion(String value) {
   value.trim();
-  if (value.startsWith("v") || value.startsWith("V")) value.remove(0, 1);
+  // Anything ahead of the first digit is decoration -- "v2.3.0", "release-2.3.0"
+  // and "firmware_2.3.0" are all the same release.
+  while (value.length() && !isdigit((unsigned char)value[0])) value.remove(0, 1);
   return value;
+}
+
+/// One dotted component, advancing the cursor past it and its separator. Stops
+/// at anything that is neither a digit nor a dot, so the "-rc1" in 2.3.0-rc1
+/// reads as the end of the number.
+long versionComponent(const char *&p) {
+  if (!isdigit((unsigned char)*p)) return 0;
+  long value = 0;
+  while (isdigit((unsigned char)*p)) value = value * 10 + (*p++ - '0');
+  if (*p == '.') ++p;
+  return value;
+}
+
+/*
+ * -1 if left is older than right, 0 if they are the same release, 1 if newer.
+ *
+ * This is what decides whether a release is an *update*. Comparing the strings
+ * instead, as this used to, makes every release that is merely *different* look
+ * installable -- so a speaker on 2.3.0 offers to "update" to the 2.0.2 that
+ * happens to be latest on GitHub, and installing it is a silent downgrade.
+ *
+ * Missing components count as zero, so 2.3 and 2.3.0 are the same release, and
+ * a pre-release suffix is ignored rather than ordered: 2.3.0-rc1 compares equal
+ * to 2.3.0, which keeps a candidate build from being offered over the final.
+ */
+int compareVersions(const String &left, const String &right) {
+  const String a = normalizedVersion(left);
+  const String b = normalizedVersion(right);
+  const char *pa = a.c_str();
+  const char *pb = b.c_str();
+  for (int i = 0; i < 4; ++i) {
+    const long va = versionComponent(pa);
+    const long vb = versionComponent(pb);
+    if (va != vb) return va < vb ? -1 : 1;
+  }
+  return 0;
 }
 
 struct GithubJob {
@@ -795,16 +861,28 @@ void runGithubJob(const GithubJob &job) {
   strlcpy(updateState.assetName, release.assetName.c_str(), sizeof(updateState.assetName));
   strlcpy(updateState.releaseUrl, release.url.c_str(), sizeof(updateState.releaseUrl));
   updateState.total = release.assetSize;
-  const bool available =
-      normalizedVersion(release.tag) != normalizedVersion(FW_VERSION);
+  // Strictly newer, never merely different: see compareVersions().
+  const bool available = compareVersions(release.tag, FW_VERSION) > 0;
   updateState.available = available;
   portEXIT_CRITICAL(&updateMux);
 
   if (!job.install) {
     updateSet("ready",
-              available ? "A firmware release is available"
+              available ? "A newer firmware release is available"
                         : "Firmware is up to date",
               false);
+    return;
+  }
+
+  // The dashboard disables its own button, but the endpoint is reachable
+  // without it and a downgrade is not a thing this speaker does: the OTA writer
+  // would happily flash an older image, and whatever settings that firmware
+  // does not understand would be the owner's problem afterwards.
+  if (!available) {
+    const String refusal = String("Release ") + release.tag +
+                           " is not newer than " + FW_VERSION +
+                           "; downgrading is not allowed";
+    updateSet("error", refusal.c_str(), false);
     return;
   }
 
@@ -1117,6 +1195,19 @@ void handleStatus() {
   system["uptimeMs"] = millis();
   system["resetReason"] = (int)esp_reset_reason();
 
+  /*
+   * The speaker's own wall clock. Sent as a UTC epoch plus the stored offset
+   * rather than as formatted text: the dashboard polls every two seconds, and a
+   * clock that only moves when a poll lands looks broken. With the epoch and
+   * the moment it arrived, the page can tick the seconds by itself between
+   * polls and still never drift away from the speaker.
+   */
+  system["epoch"] = (uint32_t)time(nullptr);
+  system["tzOffsetMinutes"] = soft_clock_utc_offset_min();
+  system["clockSource"] = soft_clock_source_name();
+  system["clockTrusted"] = soft_clock_trusted();
+  system["clock24h"] = soft_clock_use_24h();
+
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["connected"] = WiFi.status() == WL_CONNECTED;
   wifi["ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "";
@@ -1285,6 +1376,7 @@ void handleStatus() {
   led["effect"] = settings.leds.effect;
   led["effectName"] = leds_effect_name(settings.leds.effect);
   led["hearingAudio"] = leds_hearing_audio();
+  led["resting"] = leds_resting();
 
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
@@ -1787,6 +1879,12 @@ void handleLeds() {
   }
   next.color = parseColor(body["color"], next.color);
   next.color2 = parseColor(body["color2"], next.color2);
+  if (!body["idleOff"].isNull()) next.idleOff = body["idleOff"].as<bool>();
+  if (!body["idleAfterSeconds"].isNull()) {
+    next.idleAfterS = (uint16_t)constrain(body["idleAfterSeconds"].as<int>(),
+                                          (int)LED_IDLE_AFTER_S_MIN,
+                                          (int)LED_IDLE_AFTER_S_MAX);
+  }
 
   settings.leds = next;
   leds_configure(next);
@@ -1798,6 +1896,7 @@ void handleLeds() {
   reply["effectName"] = leds_effect_name(next.effect);
   reply["effectHint"] = leds_effect_hint(next.effect);
   reply["hearingAudio"] = leds_hearing_audio();
+  reply["resting"] = leds_resting();
   sendJson(reply);
 }
 
@@ -1863,6 +1962,16 @@ void handleSettingsGet() {
   doc["clockSource"] = soft_clock_source_name();
   doc["clockOffsetMinutes"] = soft_clock_utc_offset_min();
   doc["clockNetworkSynced"] = soft_clock_network_synced();
+  doc["clock24h"] = soft_clock_use_24h();
+  doc["clockAutoSync"] = soft_clock_auto_sync();
+
+  JsonObject oled = doc["display"].to<JsonObject>();
+  oled["present"] = ui_present();
+  oled["blankMode"] = settings.oledBlankMode;
+  oled["blankAfterSeconds"] = settings.oledBlankAfterS;
+  oled["blankMinSeconds"] = UI_BLANK_AFTER_S_MIN;
+  oled["blankMaxSeconds"] = UI_BLANK_AFTER_S_MAX;
+  oled["blanked"] = ui_blanked();
 
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
@@ -1901,6 +2010,11 @@ void handleSettingsGet() {
   led["color"] = colorText(settings.leds.color);
   led["color2"] = colorText(settings.leds.color2);
   led["hearingAudio"] = leds_hearing_audio();
+  led["idleOff"] = settings.leds.idleOff;
+  led["idleAfterSeconds"] = settings.leds.idleAfterS;
+  led["idleMinSeconds"] = LED_IDLE_AFTER_S_MIN;
+  led["idleMaxSeconds"] = LED_IDLE_AFTER_S_MAX;
+  led["resting"] = leds_resting();
   // Whether there is anything for the reactive effects to react to in this
   // mode at all. DFPlayer audio never passes through this chip, so the music
   // sync has nothing to work with and the page should say so rather than
@@ -1976,6 +2090,24 @@ void handleSettingsSave() {
         (uint8_t)constrain(body["dfLoopFolder"].as<int>(), 1, 99);
   }
   if (!body["dfAutoplay"].isNull()) settings.dfAutoplay = body["dfAutoplay"].as<bool>();
+
+  // Panel blanking, applied immediately rather than at the next boot: the whole
+  // card is about what the panel does while you are looking at it.
+  bool blankChanged = false;
+  if (!body["oledBlankMode"].isNull()) {
+    settings.oledBlankMode = (uint8_t)constrain(body["oledBlankMode"].as<int>(),
+                                                0, (int)UI_BLANK_ALWAYS);
+    blankChanged = true;
+  }
+  if (!body["oledBlankAfterSeconds"].isNull()) {
+    settings.oledBlankAfterS =
+        (uint16_t)constrain(body["oledBlankAfterSeconds"].as<int>(),
+                            (int)UI_BLANK_AFTER_S_MIN, (int)UI_BLANK_AFTER_S_MAX);
+    blankChanged = true;
+  }
+  if (blankChanged) {
+    ui_set_blank((UiBlankMode)settings.oledBlankMode, settings.oledBlankAfterS);
+  }
 
   // The battery pack. Applied immediately rather than at the next boot: these
   // describe the hardware, and a wrong divider showing 8.4 V should be fixable
@@ -2068,12 +2200,38 @@ void handleClock() {
   if (!requireAuth()) return;
   JsonDocument body;
   if (!readBody(body)) return;
+
+  /*
+   * Display format and network sync ride on this endpoint and apply on their
+   * own, without a time in the body -- so the Clock card behaves like the OLED
+   * card next to it: change it, see it, no Save button. A full sync sends them
+   * alongside the time and both paths land here.
+   */
+  if (!body["use24h"].isNull()) soft_clock_set_use_24h(body["use24h"].as<bool>());
+  if (!body["autoSync"].isNull()) {
+    const bool wanted = body["autoSync"].as<bool>();
+    soft_clock_set_auto_sync(wanted);
+    // Switching it back on should not wait for the next reconnect to take
+    // effect. soft_clock_network_begin() is idempotent and now honours the
+    // flag itself, so this is safe either way.
+    if (wanted && WiFi.status() == WL_CONNECTED) soft_clock_network_begin();
+  }
+
   const int year = body["year"] | 0;
   const int month = body["month"] | 0;
   const int day = body["day"] | 0;
   const int hour = body["hour"] | -1;
   const int minute = body["minute"] | -1;
   const int second = body["second"] | -1;
+  // A preferences-only request carries no date at all, and setting the clock is
+  // not what it asked for.
+  if (body["year"].isNull()) {
+    JsonDocument reply;
+    reply["ok"] = true;
+    sendJson(reply);
+    return;
+  }
+
   if (year < 2024 || year > 2099 || month < 1 || month > 12 || day < 1 ||
       day > 31 || hour < 0 || hour > 23 || minute < 0 || minute > 59 ||
       second < 0 || second > 59) {

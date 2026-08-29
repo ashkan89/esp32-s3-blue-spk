@@ -51,6 +51,17 @@ static const uint32_t PERSIST_EVERY_MS = 10UL * 60UL * 1000UL;
  */
 static const char *EPOCH_KEY = "utc";
 static const char *OFFSET_KEY = "tzmin";
+static const char *H24_KEY = "h24";
+static const char *SYNC_KEY = "autosync";
+
+/// Presentation, not time: 24-hour or 12-hour with AM/PM. CLOCK_24H is only the
+/// value a speaker that has never been opened in a browser comes up with.
+static bool g_use_24h = CLOCK_24H != 0;
+
+/// Whether SNTP is allowed to correct the clock. Off is for an owner who set the
+/// time by hand and wants it kept, and it is checked in network_begin() so no
+/// caller has to remember.
+static bool g_auto_sync = true;
 
 // ------------------------------------------------------------ build stamp ----
 /*
@@ -198,6 +209,7 @@ static void ntp_notification(struct timeval *tv) {
 }
 
 void soft_clock_network_begin() {
+  if (!g_auto_sync) return;  // the owner keeps their own time
   // Re-arming a running client is what a reconnect wants: configTzTime() stops
   // it first, so the next poll goes out immediately instead of waiting out the
   // remainder of an hour-long interval that elapsed while the link was down.
@@ -257,6 +269,8 @@ void soft_clock_begin() {
   if (g_prefs_ok) {
     g_offset_min = (int32_t)g_prefs.getLong(OFFSET_KEY, CLOCK_TZ_OFFSET_MIN);
     if (g_offset_min < -840 || g_offset_min > 840) g_offset_min = CLOCK_TZ_OFFSET_MIN;
+    g_use_24h = g_prefs.getBool(H24_KEY, CLOCK_24H != 0);
+    g_auto_sync = g_prefs.getBool(SYNC_KEY, true);
   }
   apply_timezone();
 
@@ -329,6 +343,28 @@ static void persist_now() {
   if (!g_prefs_ok) return;
   g_prefs.putULong(EPOCH_KEY, (uint32_t)time(nullptr));
   g_last_persist_ms = millis();
+}
+
+bool soft_clock_use_24h() { return g_use_24h; }
+
+void soft_clock_set_use_24h(bool on) {
+  if (on == g_use_24h) return;
+  g_use_24h = on;
+  if (g_prefs_ok) g_prefs.putBool(H24_KEY, on);
+  Serial.printf("[clock] %s clock\n", on ? "24-hour" : "12-hour");
+}
+
+bool soft_clock_auto_sync() { return g_auto_sync; }
+
+void soft_clock_set_auto_sync(bool on) {
+  if (on != g_auto_sync) {
+    g_auto_sync = on;
+    if (g_prefs_ok) g_prefs.putBool(SYNC_KEY, on);
+    Serial.printf("[clock] network sync %s\n", on ? "on" : "off");
+  }
+  // Unconditional, so switching it off stops a client that is already polling
+  // rather than waiting for the next disconnect to do it.
+  if (!on) soft_clock_network_end();
 }
 
 int32_t soft_clock_utc_offset_min() { return g_offset_min; }

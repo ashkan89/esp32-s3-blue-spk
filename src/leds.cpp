@@ -238,6 +238,17 @@ static bool hearing(uint32_t now) {
   return a_heard_ms != 0 && (now - a_heard_ms) < LED_AUDIO_IDLE_MS;
 }
 
+/*
+ * The resting timer.
+ *
+ * The last moment the ring had a reason to be lit: audio, or somebody changing
+ * something from the dashboard or the console. Seeded at leds_start() so a
+ * speaker that boots into silence still gets its full idle period before going
+ * dark, rather than resting on the first frame because the timer started at 0.
+ */
+static volatile uint32_t awake_ms;
+static volatile bool resting;
+
 // ----------------------------------------------------------------- effects ---
 /*
  * Phase accumulators rather than a frame counter, so the effects run at the
@@ -575,11 +586,19 @@ static void leds_task(void *) {
     audio_probe_frame(&vis, 1000 / LED_FPS);
     update_audio(vis, dt, now);
 
+    // Resting is decided here rather than inside render() so that every effect
+    // -- including the reactive ones, which draw their own idle animation --
+    // goes dark the same way, and so commit() has nothing left to brighten.
+    if (hearing(now)) awake_ms = now;
+    const bool asleep = live.idleOff && live.idleAfterS &&
+                        (now - awake_ms) > (uint32_t)live.idleAfterS * 1000UL;
+    resting = asleep;
+
     const float r = rate_of(live.speed);
     phase = wrap01(phase + dt * r);
     phase2 = wrap01(phase2 + dt * r * 0.23f);
 
-    if (!live.enabled) {
+    if (!live.enabled || asleep) {
       fill(0);
     } else {
       render(live, vis, dt, now);
@@ -649,6 +668,7 @@ bool leds_begin() {
 
 void leds_start() {
   if (!g_present) return;
+  awake_ms = millis();  // a full idle period before the first rest
   // Core 0, priority 1: the same berth as the display task, and below both the
   // Bluetooth controller and the audio path, so a late frame of light is the
   // only thing a busy moment can cost. The stack carries a whole AudioVis copy
@@ -659,6 +679,10 @@ void leds_start() {
 bool leds_present() { return g_present; }
 
 void leds_configure(const LedConfig &in) {
+  // Any change is a reason to be lit: turning the ring back on from a resting
+  // dashboard and watching nothing happen for five minutes is not a setting,
+  // it is a fault report.
+  awake_ms = millis();
   LedConfig v = in;
   if (v.effect >= LED_FX_COUNT) v.effect = LED_FX_MUSIC;
   if (v.reactivity > 100) v.reactivity = 100;
@@ -707,6 +731,8 @@ const char *leds_effect_hint(uint8_t effect) {
 }
 
 bool leds_hearing_audio() { return hearing(millis()); }
+
+bool leds_resting() { return resting; }
 
 // ----------------------------------------------------------------- console ---
 static void print_leds_status() {
