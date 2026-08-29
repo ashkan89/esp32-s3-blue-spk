@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "audio_probe.h"
+#include "df_player.h"
 
 // ------------------------------------------------------------------ strip ----
 /*
@@ -589,7 +590,10 @@ static void leds_task(void *) {
     // Resting is decided here rather than inside render() so that every effect
     // -- including the reactive ones, which draw their own idle animation --
     // goes dark the same way, and so commit() has nothing left to brighten.
-    if (hearing(now)) awake_ms = now;
+    // df_player_active() for the same reason the display checks it: that module
+    // never feeds the analyser, so hearing() is deaf to the one mode whose whole
+    // job is playing something.
+    if (hearing(now) || df_player_active()) awake_ms = now;
     const bool asleep = live.idleOff && live.idleAfterS &&
                         (now - awake_ms) > (uint32_t)live.idleAfterS * 1000UL;
     resting = asleep;

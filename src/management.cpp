@@ -1638,6 +1638,59 @@ void handleDeviceAction() {
  * rather than being silently clamped -- a track number the card does not have is
  * worth telling somebody about.
  */
+/*
+ * The folder index, as a page of its own.
+ *
+ * Deliberately not part of /api/status: it is up to ninety-nine numbers, it
+ * only changes while a scan is running, and the status poll fires every two
+ * seconds whether or not anybody is looking at the Media page. The browser asks
+ * for this when it opens and again while a scan is in progress.
+ *
+ * Folders with no files are dropped rather than sent as zeroes -- a card with
+ * three folders on it should not cost ninety-six entries of nothing.
+ */
+void handleDfLibrary() {
+  if (!requireAuth()) return;
+  if (!df_player_running()) {
+    sendError(409, "The DFPlayer only runs in DFPlayer mode.");
+    return;
+  }
+  DfStatus d;
+  const bool read = df_player_snapshot(&d);
+
+  uint16_t counts[DF_MAX_FOLDERS];
+  df_player_folder_counts(counts, DF_MAX_FOLDERS);
+
+  uint8_t done = 0, total = 0;
+  const bool scanning = df_player_scanning(&done, &total);
+
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["source"] = df_source_name(d.source);
+  doc["online"] = read && d.online;
+  doc["totalTracks"] = d.totalTracks;
+  doc["reportedFolders"] = d.folders;
+  doc["scanning"] = scanning;
+  doc["scanned"] = df_player_scanned();
+  doc["scanDone"] = done;
+  doc["scanTotal"] = total;
+  doc["track"] = d.track;
+  doc["folder"] = d.folder;
+  doc["busy"] = d.busy;
+
+  uint16_t known = 0;
+  JsonArray folders = doc["folders"].to<JsonArray>();
+  for (uint8_t i = 0; i < DF_MAX_FOLDERS; ++i) {
+    if (!counts[i]) continue;
+    ++known;
+    JsonObject entry = folders.add<JsonObject>();
+    entry["folder"] = i + 1;
+    entry["files"] = counts[i];
+  }
+  doc["knownFolders"] = known;
+  sendJson(doc);
+}
+
 void handleDfPlayer() {
   if (!requireAuth()) return;
   if (!df_player_running()) {
@@ -1737,6 +1790,8 @@ void handleDfPlayer() {
     ok = df_player_standby();
   } else if (action == "wake") {
     ok = df_player_wake();
+  } else if (action == "scan") {
+    ok = df_player_scan();
   } else if (action == "queryFolder") {
     const int folder = body["folder"] | 0;
     bad = folder < 1 || folder > 99;
@@ -2477,6 +2532,7 @@ void configureRoutes() {
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsSave);
   server.on("/api/dfplayer", HTTP_POST, handleDfPlayer);
+  server.on("/api/dfplayer/library", HTTP_GET, handleDfLibrary);
   server.on("/api/battery", HTTP_POST, handleBattery);
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/leds", HTTP_POST, handleLeds);

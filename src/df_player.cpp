@@ -179,6 +179,38 @@ bool push(const Command &cmd, uint32_t wait = 20) {
   return xQueueSend(commands, &cmd, pdMS_TO_TICKS(wait)) == pdTRUE;
 }
 
+/*
+ * The folder index. See the header for why it exists and why it is a scan.
+ *
+ * `scanAt` is the folder the last 0x4E asked about, which is how a reply that
+ * does not name a folder gets attributed to one. It is written only by the
+ * driver task, where the frames are sent, and read only by the reply parser,
+ * which runs on that same task -- so it needs no lock; the counts do, because
+ * the web task reads them.
+ */
+uint16_t folderCounts[DF_MAX_FOLDERS];
+uint8_t scanAt;        ///< folder the last 0x4E query named, 0 for none
+uint8_t scanNext;      ///< next folder to ask about, 0 when no scan is running
+bool scanComplete;     ///< a scan finished and the cache has not been dropped
+uint32_t scanSentAt;   ///< when the last scan query went out
+
+/// The scan's own pacing. Slower than DF_COMMAND_GAP_MS deliberately: the
+/// attribution above assumes the answer to folder N arrives before the question
+/// about N+1 goes out, and 120 ms is comfortably longer than the module takes
+/// to answer a query it can answer instantly.
+constexpr uint16_t SCAN_GAP_MS = 120;
+
+/// Forgets the index. Anything that could have changed what is on the card
+/// calls this -- a source switch, a card event, a reset -- because a stale
+/// count is worse than no count: the browser would offer a track that is not
+/// there and the module would refuse it with no explanation.
+void dropFolderIndex() {
+  memset(folderCounts, 0, sizeof(folderCounts));
+  scanAt = 0;
+  scanNext = 0;
+  scanComplete = false;
+}
+
 bool frame(uint8_t cmd, uint16_t param = 0) {
   return push(Command{OP_FRAME, cmd, param});
 }
@@ -348,6 +380,7 @@ void handleFrame(uint8_t cmd, uint16_t param) {
 
     case EV_INSERTED:
       applyDevices(param, true);
+      dropFolderIndex();
       if (param & DEV_PC) {
         setError("A computer has the card: playback from it stops until the "
                  "USB cable is unplugged");
@@ -358,6 +391,7 @@ void handleFrame(uint8_t cmd, uint16_t param) {
 
     case EV_REMOVED:
       applyDevices(param, false);
+      dropFolderIndex();
       if (param & DEV_PC) setError(nullptr);
       else setError("Storage was removed while the module was using it");
       break;
@@ -466,6 +500,10 @@ void handleFrame(uint8_t cmd, uint16_t param) {
       Locked lock;
       if (!lock.held) break;
       status.folderTracks = param;
+      // The reply does not name a folder, so it belongs to whichever one the
+      // last query named. One task owns the wire and the module answers in
+      // order, so that is the right one.
+      if (scanAt >= 1 && scanAt <= DF_MAX_FOLDERS) folderCounts[scanAt - 1] = param;
       break;
     }
 
@@ -707,6 +745,27 @@ void driverTask(void *) {
           break;
       }
       continue;  // straight back round: there may be more, and reads are cheap
+    }
+
+    /*
+     * The folder scan, one query per pass, ahead of the poller.
+     *
+     * It goes first because a scan the owner asked for and is watching a
+     * progress bar for should not be held up by routine polling, and it only
+     * ever runs when the queue is empty, so it cannot get in the way of a
+     * command either. Ninety-nine folders at SCAN_GAP_MS is about twelve
+     * seconds; the counts appear in the dashboard as they land.
+     */
+    if (!sleeping && scanNext && uxQueueMessagesWaiting(commands) == 0 &&
+        (int32_t)(now - scanSentAt) >= (int32_t)SCAN_GAP_MS) {
+      scanAt = scanNext;
+      scanSentAt = now;
+      frameNow(Q_FOLDER_FILES, scanAt);
+      if (++scanNext > DF_MAX_FOLDERS) {
+        scanNext = 0;
+        scanComplete = true;
+      }
+      continue;
     }
 
     // The status poll, spread over several rounds so no single wake-up puts four
@@ -1074,6 +1133,7 @@ bool df_player_set_source(DfSource source) {
       status.queriedFolder = 0;
     }
   }
+  dropFolderIndex();
   if (!frame(CMD_SOURCE, (uint16_t)source)) return false;
   // The module needs about 200 ms after a source change before it will answer
   // questions about the new one; the queue's own pacing covers that, and the
@@ -1133,6 +1193,7 @@ bool df_player_reset() {
     }
   }
   liveState = DF_STOPPED;
+  dropFolderIndex();
   return push(Command{OP_STARTUP, 0, 0});
 }
 
@@ -1175,7 +1236,7 @@ bool df_player_wake() {
 bool df_player_refresh() { return push(Command{OP_REFRESH, 0, 0}); }
 
 bool df_player_query_folder(uint8_t folder) {
-  if (folder < 1 || folder > 99) return false;
+  if (folder < 1 || folder > DF_MAX_FOLDERS) return false;
   {
     Locked lock;
     if (lock.held) {
@@ -1183,7 +1244,35 @@ bool df_player_query_folder(uint8_t folder) {
       status.folderTracks = 0;
     }
   }
+  // Also the folder the next 0x4E reply belongs to. A one-off query and the
+  // scan use the same field because they use the same command, and the scan
+  // only advances when the queue is empty, so the two cannot interleave.
+  scanAt = folder;
   return frame(Q_FOLDER_FILES, folder);
+}
+
+// ----------------------------------------------------------- folder index ---
+bool df_player_scan() {
+  if (!running) return false;
+  dropFolderIndex();
+  scanNext = 1;
+  scanSentAt = millis() - SCAN_GAP_MS;  // start on the next pass, not in 120 ms
+  return true;
+}
+
+bool df_player_scanning(uint8_t *done, uint8_t *total) {
+  const uint8_t next = scanNext;
+  if (done) *done = next ? (uint8_t)(next - 1) : (scanComplete ? DF_MAX_FOLDERS : 0);
+  if (total) *total = DF_MAX_FOLDERS;
+  return next != 0;
+}
+
+bool df_player_scanned() { return scanComplete; }
+
+void df_player_folder_counts(uint16_t *out, uint8_t count) {
+  if (out == nullptr) return;
+  if (count > DF_MAX_FOLDERS) count = DF_MAX_FOLDERS;
+  memcpy(out, folderCounts, count * sizeof(folderCounts[0]));
 }
 
 // --- pins -------------------------------------------------------------------

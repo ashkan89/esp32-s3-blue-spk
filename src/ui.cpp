@@ -1391,7 +1391,15 @@ static void ui_frame() {
   AudioVis vis;
   audio_probe_frame(&vis, 1000 / UI_FPS);
 
-  if (vis.active || info.streaming) last_activity_ms = now;
+  /*
+   * What counts as the speaker being in use.
+   *
+   * df_player_active() is in here because that module decodes its own card and
+   * its audio never passes through this chip -- so the analyser hears nothing,
+   * and without this the panel would blank in the middle of a track in the one
+   * mode where it is most obviously playing.
+   */
+  if (vis.active || info.streaming || df_player_active()) last_activity_ms = now;
   detect_events(info, now);
   poll_button(now);
 

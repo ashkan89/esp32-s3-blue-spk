@@ -8,6 +8,13 @@
  * this module does is *control*, over a 9600 baud serial link and six GPIOs,
  * and report what it learns so the dashboard and the OLED can show it.
  *
+ * There is no directory listing in the protocol and there never will be: the
+ * YX5200 answers in counts and indices and has no idea what a file is called.
+ * What it will answer is "how many files are in folder N", one folder at a
+ * time -- so the closest thing to a library is assembled here, by df_player_scan()
+ * walking the folders once and caching what comes back. See the folder index
+ * further down; the dashboard draws a browser out of those numbers.
+ *
  * That is also why DFPlayer mode is a Wi-Fi mode rather than a third radio
  * arrangement. Nothing about it needs the antenna, so Wi-Fi gets all of it:
  * station when a network is saved, the setup access point when not, and the
@@ -67,6 +74,10 @@ enum DfLoop : uint8_t {
   DF_LOOP_ALL,     ///< 0x11: repeat the whole card
   DF_LOOP_RANDOM,  ///< 0x18: shuffle everything
 };
+
+/// Folders are /01 to /99 in the protocol -- two zero-padded digits, and no
+/// more of them than that whatever the card holds.
+static const uint8_t DF_MAX_FOLDERS = 99;
 
 /// The pins that are inputs on the module and are driven from here.
 enum DfPin : uint8_t {
@@ -231,6 +242,37 @@ bool df_player_refresh();
 /// its range. The answer lands in folderTracks/queriedFolder.
 bool df_player_query_folder(uint8_t folder);
 
+// ----------------------------------------------------------- folder index ---
+/*
+ * The nearest thing to a library the protocol allows.
+ *
+ * 0x4E answers "how many files in folder N" for one folder per round trip, and
+ * the reply carries the count without saying which folder it was for. So the
+ * scan walks the folders itself and attributes each answer to whichever folder
+ * it last asked about -- safe, because one task owns the wire and the module
+ * answers in order -- and caches the result. Ninety-nine round trips on a 9600
+ * baud link takes several seconds: fine once, intolerable on every page load,
+ * so it is asked for rather than done on its own.
+ *
+ * The cache is dropped whenever the library under it could have changed: a
+ * source switch, a card going in or out, a reset.
+ */
+
+/// Starts a walk of every folder on the current source, or restarts one that is
+/// already running. False if the driver is not up.
+bool df_player_scan();
+
+/// Progress, for the dashboard's bar: `done` and `total` are folder counts.
+/// Returns true while a scan is running.
+bool df_player_scanning(uint8_t *done, uint8_t *total);
+
+/// True once a scan has finished and the cache has not been dropped since.
+bool df_player_scanned();
+
+/// Copies the cache out. `out[i]` is the file count for folder `i + 1`; 0 means
+/// empty, absent, or not asked about yet. `count` is clamped to DF_MAX_FOLDERS.
+void df_player_folder_counts(uint16_t *out, uint8_t count);
+
 /// Presses one of the module's own button inputs by pulling it to ground.
 /// `long_press` picks the module's second meaning for IO1/IO2 (volume down/up
 /// instead of previous/next); it is ignored for the ADKEY pins, which have only
@@ -291,6 +333,10 @@ inline bool df_player_standby() { return false; }
 inline bool df_player_wake() { return false; }
 inline bool df_player_refresh() { return false; }
 inline bool df_player_query_folder(uint8_t) { return false; }
+inline bool df_player_scan() { return false; }
+inline bool df_player_scanning(uint8_t *, uint8_t *) { return false; }
+inline bool df_player_scanned() { return false; }
+inline void df_player_folder_counts(uint16_t *, uint8_t) {}
 inline bool df_player_pulse(DfPin, bool) { return false; }
 inline bool df_player_pin_available(DfPin) { return false; }
 inline void df_player_set_led(DfLedMode) {}

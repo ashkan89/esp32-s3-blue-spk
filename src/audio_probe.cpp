@@ -15,6 +15,29 @@ static const uint16_t RING_MASK = RING_SIZE - 1;
 static int16_t ring[RING_SIZE];
 static volatile uint32_t ring_written;  // monotonic count, never wraps in practice
 
+/*
+ * Whether the feed is still running.
+ *
+ * The ring is not cleared when playback stops -- nothing calls it, and the
+ * writer is a hot path that should not be made to. So the newest FFT_SIZE
+ * samples stay exactly as the last track left them, and analysing them again
+ * reports that same music, at that same level, for as long as the speaker is
+ * powered. `active` therefore never went false once anything had ever played,
+ * which is what kept the panel awake and the ring lit.
+ *
+ * The fix costs nothing on the writer's side: analyse_locked() watches the
+ * write counter itself. A counter that has not moved for PROBE_STALE_MS means
+ * no new audio, and the window is treated as the silence it is.
+ */
+static uint32_t ring_head_seen;
+static uint32_t ring_head_at;
+
+/// A2DP packets land every few milliseconds and the analysis runs at most every
+/// 16, so a quarter of a second of no new samples is a stopped stream and not a
+/// stalled one. Short enough that the display and the ring settle promptly,
+/// long enough to ride out a network stream refilling its buffer.
+static const uint32_t PROBE_STALE_MS = 250;
+
 // Decimation state: the first sample of each pair waits here for its partner.
 static int32_t pair_hold;
 static bool pair_pending;
@@ -259,8 +282,14 @@ static void analyse_locked(uint32_t dt_ms) {
   portEXIT_CRITICAL(&meter_mux);
 
   // --- copy the newest FFT_SIZE samples out of the ring -------------------
+  // Stale samples are silence: see the note on ring_head_seen above.
   const uint32_t head = ring_written;
-  const bool have_samples = head >= FFT_SIZE;
+  if (head != ring_head_seen) {
+    ring_head_seen = head;
+    ring_head_at = now;
+  }
+  const bool fed = ring_head_at != 0 && (now - ring_head_at) < PROBE_STALE_MS;
+  const bool have_samples = fed && head >= FFT_SIZE;
 
   float window_peak = 1.0f;
   if (have_samples) {

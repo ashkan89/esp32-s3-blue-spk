@@ -531,6 +531,27 @@ waits for the card to mount and report a file count before sending anything and
 gives up after fifteen seconds rather than sitting on a command the module would
 refuse.
 
+**Browsing it.** There is no directory listing in the protocol and there cannot
+be: the YX5200 answers in counts and indices and has no idea what a file is
+called. What it *will* answer is "how many files are in folder N", one folder per
+round trip — so **Media → Library → Scan library** asks all ninety-nine, caches
+what comes back, and draws a browser out of the numbers. Click a folder, click a
+track, it plays; transport controls sit under the grid so the page is
+self-contained.
+
+The scan takes about twelve seconds on a 9600 baud link, with the folders
+appearing as their answers land, and only runs when you ask for it. The result is
+kept until the library under it could have changed — a source switch, a card
+going in or out, a reset — at which point it is dropped rather than left to
+describe a card that is no longer there. The reply to 0x4E does not say which
+folder it is for, so each answer is attributed to whichever folder the last query
+named: safe, because one task owns the wire and the module replies in order, and
+the scan paces itself slower than the ordinary command gap to keep it that way.
+
+Folder-and-track is also the *reliable* way to play something here. The flat
+index follows FAT directory order, which changes when you re-copy the card;
+`/01/003.mp3` does not.
+
 **Two honest limits.** The module never reports a filename, a duration or a
 position, so the dashboard works in track numbers and the OLED's progress bar
 stays empty — the same case it already handles for phones that send no AVRCP
@@ -924,6 +945,17 @@ That difference is the whole reason there are two of them, and why the firmware
 keeps two idle clocks rather than one: the first reads the clock audio keeps
 warm, the second reads the one only the owner touches.
 
+**What counts as playing.** The analyser is the source of truth for both timed
+modes, and for the ring's resting timer next to it. Two things had to be true for
+that to work. The probe re-analyses the newest window of its ring buffer, and
+nothing clears that buffer when playback stops — so the last few milliseconds of
+the last track were being re-reported as live audio for as long as the speaker
+stayed powered, and neither timer ever ran down. The probe now watches its own
+write counter: a quarter-second with no new samples is a stopped stream, and the
+window is treated as the silence it is. And DFPlayer audio never passes through
+this chip at all, so both timers also ask `df_player_active()` — without it the
+panel would blank mid-track in the one mode where it is most obviously playing.
+
 Timeouts run from ten seconds to twelve hours. Both modes are suspended while a
 system overlay is up — an update, a restart, the factory-reset countdown — since
 those are the moments somebody is watching the panel, and going dark through one
@@ -1145,10 +1177,10 @@ that. Resting is the ring waiting between uses: the effect and both colours are
 kept, the page goes on showing them, and the master switch stays on throughout.
 
 The timer runs off the same analysis the effects react to, so it hears
-Bluetooth, network audio and the start-up chimes alike. DFPlayer mode is the
-exception it always is — that module decodes its own card and its audio never
-passes through this chip — so a resting ring there is woken by the dashboard and
-not by playback.
+Bluetooth, network audio and the start-up chimes alike, and it also asks the
+DFPlayer directly — that module decodes its own card and its audio never passes
+through this chip, so nothing else here would know it was playing. See *What
+counts as playing* under the display, which covers both timers.
 
 ### From the serial console
 
