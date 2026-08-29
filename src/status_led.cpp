@@ -24,6 +24,7 @@ uint8_t ledPin = 0xFF;
 bool ledActiveHigh = true;
 volatile uint8_t baseState = LED_BOOT;
 volatile uint8_t blipSlots;  // remaining half-cycles of the attention blink
+volatile bool muted;
 
 uint32_t lastSlotAt;
 uint8_t slot;
@@ -62,8 +63,22 @@ void status_led_blip(uint8_t pulses) {
   if (slots > blipSlots) blipSlots = slots;
 }
 
+void status_led_mute(bool on) {
+  if (on == muted) return;
+  muted = on;
+  // Coming back, the next slot redraws from the pattern; going away, the pin is
+  // taken low here rather than waiting up to 125 ms for a slot that says so.
+  if (on && ledPin != 0xFF) drive(false);
+}
+
+bool status_led_muted() { return muted; }
+
 void status_led_tick() {
   if (ledPin == 0xFF) return;
+  if (muted) {
+    drive(false);
+    return;
+  }
 
   const uint32_t now = millis();
 

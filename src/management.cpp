@@ -26,6 +26,7 @@
 #include "leds.h"
 #include "net_audio.h"
 #include "player_state.h"
+#include "power.h"
 #include "soft_clock.h"
 #include "status_led.h"
 #include "ui.h"
@@ -72,6 +73,11 @@ struct Settings {
   // two timed modes each count as a reason to stay on.
   uint8_t oledBlankMode;
   uint16_t oledBlankAfterS;
+
+  // Power saving: a PowerMode, and the battery percentage AUTO engages at or
+  // below. See power.h for what saving actually switches off.
+  uint8_t powerMode;
+  uint8_t powerThreshold;
 
   LedConfig leds;
 };
@@ -273,6 +279,17 @@ void loadSettings(const char *fallbackName) {
   // safe here and saves a second place that has to remember to apply it.
   ui_set_blank((UiBlankMode)settings.oledBlankMode, settings.oledBlankAfterS);
 
+  settings.powerMode = prefs.getUChar("pwrMode", (uint8_t)POWER_MODE_OFF);
+  settings.powerThreshold = prefs.getUChar("pwrPct", 20);
+  if (settings.powerMode > (uint8_t)POWER_MODE_AUTO) {
+    settings.powerMode = (uint8_t)POWER_MODE_OFF;
+  }
+  if (settings.powerThreshold > 100) settings.powerThreshold = 100;
+  // AUTO cannot engage yet -- battery_begin() has not run, so the gauge reads
+  // nothing and decide() reports itself blind. power_tick() from the loop picks
+  // it up as soon as there is a reading, which is the point of the tick.
+  power_configure((PowerMode)settings.powerMode, settings.powerThreshold);
+
   /*
    * The ring. Loaded in every radio mode, not just the ones with a dashboard:
    * a Bluetooth-only speaker still has lights on it, and they should come back
@@ -337,6 +354,9 @@ void saveSettings() {
 
   prefs.putUChar("uiBlank", settings.oledBlankMode);
   prefs.putUShort("uiBlankS", settings.oledBlankAfterS);
+
+  prefs.putUChar("pwrMode", settings.powerMode);
+  prefs.putUChar("pwrPct", settings.powerThreshold);
 
   saveLedSettings();
 }
@@ -1208,6 +1228,7 @@ void handleStatus() {
   system["clockSource"] = soft_clock_source_name();
   system["clockTrusted"] = soft_clock_trusted();
   system["clock24h"] = soft_clock_use_24h();
+  system["powerSaving"] = power_saving();
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["connected"] = WiFi.status() == WL_CONNECTED;
@@ -2041,6 +2062,13 @@ void handleSettingsGet() {
   oled["audioHeard"] = audio_probe_last_active() != 0;
   oled["dfBusy"] = df_player_active();
 
+  JsonObject pwr = doc["power"].to<JsonObject>();
+  pwr["mode"] = settings.powerMode;
+  pwr["threshold"] = settings.powerThreshold;
+  pwr["saving"] = power_saving();
+  pwr["reason"] = power_reason();
+  pwr["blind"] = power_auto_blind();
+
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
   df["volume"] = settings.dfVolume;
@@ -2176,6 +2204,23 @@ void handleSettingsSave() {
   }
   if (blankChanged) {
     ui_set_blank((UiBlankMode)settings.oledBlankMode, settings.oledBlankAfterS);
+  }
+
+  // Power saving, applied at once for the same reason: the card is about what
+  // the speaker is doing while you are looking at it.
+  bool powerChanged = false;
+  if (!body["powerMode"].isNull()) {
+    settings.powerMode =
+        (uint8_t)constrain(body["powerMode"].as<int>(), 0, (int)POWER_MODE_AUTO);
+    powerChanged = true;
+  }
+  if (!body["powerThreshold"].isNull()) {
+    settings.powerThreshold =
+        (uint8_t)constrain(body["powerThreshold"].as<int>(), 0, 100);
+    powerChanged = true;
+  }
+  if (powerChanged) {
+    power_configure((PowerMode)settings.powerMode, settings.powerThreshold);
   }
 
   // The battery pack. Applied immediately rather than at the next boot: these

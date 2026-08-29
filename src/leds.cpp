@@ -250,6 +250,11 @@ static bool hearing(uint32_t now) {
 static volatile uint32_t awake_ms;
 static volatile bool resting;
 
+/// Power saving, which outranks everything: the ring is the largest load on the
+/// board by a wide margin, so it is the first thing to go and the whole reason
+/// the mode is worth having.
+static volatile bool powerSave;
+
 // ----------------------------------------------------------------- effects ---
 /*
  * Phase accumulators rather than a frame counter, so the effects run at the
@@ -602,7 +607,7 @@ static void leds_task(void *) {
     phase = wrap01(phase + dt * r);
     phase2 = wrap01(phase2 + dt * r * 0.23f);
 
-    if (!live.enabled || asleep) {
+    if (!live.enabled || asleep || powerSave) {
       fill(0);
     } else {
       render(live, vis, dt, now);
@@ -739,6 +744,15 @@ bool leds_hearing_audio() { return hearing(millis()); }
 bool leds_resting() { return resting; }
 
 uint32_t leds_idle_ms() { return millis() - awake_ms; }
+
+void leds_set_power_save(bool on) {
+  if (on == powerSave) return;
+  powerSave = on;
+  // Coming back out, the ring has been dark for a while and its idle timer has
+  // been running the whole time -- so without this it would light for one frame
+  // and immediately rest again.
+  if (!on) awake_ms = millis();
+}
 
 // ----------------------------------------------------------------- console ---
 static void print_leds_status() {

@@ -86,6 +86,10 @@ void ui_set_blank(UiBlankMode mode, uint16_t after_seconds);
 /// so rather than leaving a dark panel looking like a fault.
 bool ui_blanked();
 
+/// Holds the panel off for power saving, over the top of whatever blanking mode
+/// is set. Lifted the moment saving ends; it writes no setting. See power.h.
+void ui_set_power_save(bool on);
+
 /// The two countdowns, in milliseconds, for the dashboard to show. `idle` is
 /// what UI_BLANK_IDLE watches -- reset by audio as well as by the owner --
 /// and `untouched` is what UI_BLANK_ALWAYS watches. Reported because "it never

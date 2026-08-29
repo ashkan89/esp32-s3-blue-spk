@@ -161,6 +161,7 @@ static uint32_t last_activity_ms;
  */
 static uint32_t last_input_ms;
 
+static volatile bool power_save;
 static volatile uint8_t blank_mode = UI_BLANK_MODE_DEFAULT;
 static volatile uint32_t blank_after_ms = UI_BLANK_AFTER_S_DEFAULT * 1000UL;
 static bool panel_off;
@@ -1426,11 +1427,11 @@ static void ui_frame() {
    * audio keeps warm, so playback holds the display open; ALWAYS reads the one
    * only the owner touches, so it does not.
    */
-  bool blank = false;
+  bool blank = power_save;  // saving takes the panel outright, with no timeout
   const uint8_t mode = blank_mode;
   const uint32_t after = blank_after_ms;
-  if (mode == UI_BLANK_IDLE) blank = idle > after;
-  else if (mode == UI_BLANK_ALWAYS) blank = (now - last_input_ms) > after;
+  if (mode == UI_BLANK_IDLE) blank = blank || idle > after;
+  else if (mode == UI_BLANK_ALWAYS) blank = blank || (now - last_input_ms) > after;
   // An update, a restart or the reset countdown suspends it: those are exactly
   // the moments somebody is watching the panel, and going dark through one is
   // indistinguishable from a crash.
@@ -1607,6 +1608,14 @@ void ui_set_blank(UiBlankMode mode, uint16_t after_seconds) {
 }
 
 bool ui_blanked() { return panel_off; }
+
+void ui_set_power_save(bool on) {
+  if (on == power_save) return;
+  power_save = on;
+  // Leaving saving is an event worth seeing, and the panel coming back to a
+  // stale screen a timeout away from blanking again is not.
+  if (!on) ui_wake();
+}
 
 uint32_t ui_idle_ms() { return millis() - last_activity_ms; }
 uint32_t ui_untouched_ms() { return millis() - last_input_ms; }

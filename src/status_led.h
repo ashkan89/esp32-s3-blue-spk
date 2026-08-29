@@ -39,6 +39,12 @@ void status_led_begin(uint8_t pin, bool active_high);
 void status_led_state(StatusLedState state);
 StatusLedState status_led_state();
 
+// Holds the indicator dark whatever pattern is set, and lets it resume where it
+// was on release. Power saving uses it; nothing else should, because a status
+// LED that is off is a speaker with no status on it.
+void status_led_mute(bool on);
+bool status_led_muted();
+
 // Plays `pulses` fast blinks over the top of the resting pattern and then
 // returns to it. Use for events worth noticing: a phone connecting, a track
 // change, a setting saved. Safe to call from any task.

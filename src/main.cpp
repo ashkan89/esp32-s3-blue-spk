@@ -75,6 +75,7 @@
 #include "management.h"
 #include "net_audio.h"
 #include "player_state.h"
+#include "power.h"
 #include "soft_clock.h"
 #include "status_led.h"
 #include "ui.h"
@@ -1220,6 +1221,10 @@ void loop() {
   // sample taken after that decision is one frame stale in the one indicator
   // that is meant to be urgent.
   battery_loop();
+  // Straight after the gauge and before the indicator: the policy reads the
+  // sample battery_loop() just took, and muting the LED is one of the things it
+  // may decide to do.
+  power_tick();
   update_status_led();
   log_state_changes();
   soft_clock_tick();

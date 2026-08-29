@@ -1314,6 +1314,62 @@ drifted far enough fails the handshake. All three apply immediately; there is
 nothing to save. `-DCLOCK_24H=0` in [src/ui_config.h](src/ui_config.h) is only
 the starting value, for a speaker that is never opened in a browser.
 
+## Power saving
+
+The parts of this board that draw current and are not the speaker: seven WS2812
+pixels at up to 260 mA, an OLED panel at ~15 mA, an indicator LED, and a Wi-Fi
+radio that by default never sleeps between beacons. Each already has its own
+setting, and setting four of them by hand every time the pack gets low is not a
+feature. **Settings → Power** is the one switch, and it is three modes, one at a
+time:
+
+| | |
+|---|---|
+| **Off** | Nothing is saved. Every setting is the one you chose. The default. |
+| **Always saving** | Saving, on mains as well as on battery. |
+| **Automatic** | Saving while the pack is at or below a level you set *and* nothing is charging it. |
+
+**Charging wins outright.** A pack at 8% with a charger on it is a pack that is
+getting better, and dimming the lights to protect it makes the speaker worse for
+nothing — the mode exists to stretch the time until a charger arrives, and one
+has. So *Automatic* releases the moment either charge pin says so, whatever the
+percentage reads.
+
+**Coming out needs more than going in.** The gauge is a voltage read off a curve,
+and voltage moves when the load does — which is exactly what saving changes. A
+pack sitting on the threshold would switch the ring off, sag less, read a point
+higher, switch it back on, and oscillate. Saving therefore releases five points
+above where it engages, and the card says so while it is in that band rather
+than claiming to be below a threshold it is above.
+
+**Automatic needs a gauge.** With the battery switched off in settings, no sense
+pin compiled in, or no plausible cell voltage on it, there is nothing to read.
+The mode reports itself inactive and says which of the three it is, rather than
+guessing at a percentage that does not exist.
+
+### What saving actually does
+
+- **the ring** — off. By a wide margin the largest load on the board, and the
+  reason the mode is worth having at all.
+- **the panel** — held off, the same ~15 mA the blanking modes get back, taken
+  at once rather than after a timeout.
+- **the indicator LED** — held dark between states.
+- **Wi-Fi** — modem sleep on and transmit power at 11 dBm instead of 19.5, which
+  costs some dashboard latency and nothing else. Skipped entirely when no radio
+  is up, which is every Bluetooth-only boot.
+
+None of it writes a setting. All four come back exactly as you left them the
+moment saving ends, and the sidebar says *Power saving* throughout so a dark ring
+and a dark panel read as the mode doing its job rather than as a fault.
+
+**What it deliberately does not touch is the CPU clock.** Dropping 240 MHz to 160
+is the obvious next saving and it is not here: SBC decode with the Bluetooth
+stack running has little headroom at 240 and none below it, and a power mode
+whose symptom is crackle is not one anybody would leave switched on. This is the
+same reasoning that keeps `CORE_DEBUG_LEVEL` at 1 — see the note in
+[platformio.ini](platformio.ini). Everything the mode touches is peripheral
+current, and none of it can reach a sample.
+
 ## The battery gauge
 
 Reading a battery with an ADC is easy; getting a number worth showing is not, so
@@ -1690,6 +1746,7 @@ To make the ESP32 forget the paired phone, call
 | [src/soft_clock.h](src/soft_clock.h) / [.cpp](src/soft_clock.cpp) | timekeeping: build stamp, serial, DS3231, NTP, NVS |
 | [src/ui.h](src/ui.h) / [.cpp](src/ui.cpp) | the screens, overlays, transitions, marquees, 7-segment |
 | [src/leds.h](src/leds.h) / [.cpp](src/leds.cpp) | the WS2812 ring: fifteen effects, the music sync, the RMT wire protocol |
+| [src/power.h](src/power.h) / [.cpp](src/power.cpp) | power saving: the three modes, the battery policy, and the four things it switches off |
 | [src/ui_assets.h](src/ui_assets.h) | hand-drawn XBM icons |
 
 ## Notes on the toolchain

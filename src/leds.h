@@ -149,6 +149,11 @@ bool leds_hearing_audio();
 /// dark ring that the page says is on and rainbow is otherwise a fault.
 bool leds_resting();
 
+/// Holds the ring dark for power saving, over the top of whatever it is set to.
+/// Distinct from `enabled` and from resting: both of those are the owner's own
+/// choices and survive, and this is lifted the moment saving ends. See power.h.
+void leds_set_power_save(bool on);
+
 /// Milliseconds since the ring last had a reason to be lit -- audio, or a
 /// change made from the dashboard. The countdown behind idleAfterS, shown on
 /// the page so a ring that will not rest can be diagnosed rather than guessed.
@@ -170,5 +175,6 @@ inline const char *leds_effect_hint(uint8_t) { return ""; }
 inline bool leds_hearing_audio() { return false; }
 inline bool leds_resting() { return false; }
 inline uint32_t leds_idle_ms() { return 0; }
+inline void leds_set_power_save(bool) {}
 inline bool leds_command(const char *) { return false; }
 #endif
