@@ -79,6 +79,10 @@ struct Settings {
   uint8_t powerMode;
   uint8_t powerThreshold;
 
+  // Standby: a SleepMode, and how long the speaker has to be doing nothing.
+  uint8_t sleepMode;
+  uint16_t sleepAfterS;
+
   LedConfig leds;
 };
 
@@ -290,6 +294,16 @@ void loadSettings(const char *fallbackName) {
   // it up as soon as there is a reading, which is the point of the tick.
   power_configure((PowerMode)settings.powerMode, settings.powerThreshold);
 
+  settings.sleepMode = prefs.getUChar("slpMode", (uint8_t)SLEEP_MODE_OFF);
+  settings.sleepAfterS = prefs.getUShort("slpS", POWER_SLEEP_AFTER_S_DEFAULT);
+  if (settings.sleepMode > (uint8_t)SLEEP_MODE_SAVING) {
+    settings.sleepMode = (uint8_t)SLEEP_MODE_OFF;
+  }
+  settings.sleepAfterS = (uint16_t)constrain(
+      (int)settings.sleepAfterS, (int)POWER_SLEEP_AFTER_S_MIN,
+      (int)POWER_SLEEP_AFTER_S_MAX);
+  power_configure_sleep((SleepMode)settings.sleepMode, settings.sleepAfterS);
+
   /*
    * The ring. Loaded in every radio mode, not just the ones with a dashboard:
    * a Bluetooth-only speaker still has lights on it, and they should come back
@@ -357,6 +371,8 @@ void saveSettings() {
 
   prefs.putUChar("pwrMode", settings.powerMode);
   prefs.putUChar("pwrPct", settings.powerThreshold);
+  prefs.putUChar("slpMode", settings.sleepMode);
+  prefs.putUShort("slpS", settings.sleepAfterS);
 
   saveLedSettings();
 }
@@ -2068,6 +2084,13 @@ void handleSettingsGet() {
   pwr["saving"] = power_saving();
   pwr["reason"] = power_reason();
   pwr["blind"] = power_auto_blind();
+  pwr["sleepMode"] = settings.sleepMode;
+  pwr["sleepAfterSeconds"] = settings.sleepAfterS;
+  pwr["sleepMinSeconds"] = POWER_SLEEP_AFTER_S_MIN;
+  pwr["sleepMaxSeconds"] = POWER_SLEEP_AFTER_S_MAX;
+  pwr["sleepPossible"] = power_sleep_possible();
+  pwr["idleSeconds"] = power_idle_ms() / 1000;
+  pwr["wokeFromSleep"] = power_woke_from_sleep();
 
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
@@ -2221,6 +2244,22 @@ void handleSettingsSave() {
   }
   if (powerChanged) {
     power_configure((PowerMode)settings.powerMode, settings.powerThreshold);
+  }
+
+  bool sleepChanged = false;
+  if (!body["sleepMode"].isNull()) {
+    settings.sleepMode =
+        (uint8_t)constrain(body["sleepMode"].as<int>(), 0, (int)SLEEP_MODE_SAVING);
+    sleepChanged = true;
+  }
+  if (!body["sleepAfterSeconds"].isNull()) {
+    settings.sleepAfterS = (uint16_t)constrain(
+        body["sleepAfterSeconds"].as<int>(), (int)POWER_SLEEP_AFTER_S_MIN,
+        (int)POWER_SLEEP_AFTER_S_MAX);
+    sleepChanged = true;
+  }
+  if (sleepChanged) {
+    power_configure_sleep((SleepMode)settings.sleepMode, settings.sleepAfterS);
   }
 
   // The battery pack. Applied immediately rather than at the next boot: these
@@ -2540,6 +2579,21 @@ void handleSystem() {
     server.client().flush();
     delay(150);
     management_switch_mode(target);  // does not return
+  } else if (action == "standby") {
+    if (!power_sleep_possible()) {
+      sendError(409, "No wake button is compiled in (PIN_UI_BUTTON is -1), so "
+                     "there would be nothing to bring the speaker back.");
+      return;
+    }
+    JsonDocument reply;
+    reply["ok"] = true;
+    reply["message"] = "Going into standby; press BOOT to wake";
+    sendJson(reply);
+    // After the reply: power_sleep_now() never returns, and a dashboard left
+    // waiting on a socket that never answers reports a failure for something
+    // that worked.
+    power_sleep_now();
+    return;
   } else if (action == "factoryReset") {
     factoryReset();
     JsonDocument reply;

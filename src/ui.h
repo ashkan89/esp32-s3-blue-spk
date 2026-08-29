@@ -90,6 +90,11 @@ bool ui_blanked();
 /// is set. Lifted the moment saving ends; it writes no setting. See power.h.
 void ui_set_power_save(bool on);
 
+/// Powers the panel down and parks the render task. For standby: without it the
+/// task goes on running an FFT thirty times a second to draw nothing. There is
+/// no resume -- standby ends in a restart.
+void ui_suspend();
+
 /// The two countdowns, in milliseconds, for the dashboard to show. `idle` is
 /// what UI_BLANK_IDLE watches -- reset by audio as well as by the owner --
 /// and `untouched` is what UI_BLANK_ALWAYS watches. Reported because "it never

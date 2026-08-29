@@ -1362,7 +1362,44 @@ None of it writes a setting. All four come back exactly as you left them the
 moment saving ends, and the sidebar says *Power saving* throughout so a dark ring
 and a dark panel read as the mode doing its job rather than as a fault.
 
-**What it deliberately does not touch is the CPU clock.** Dropping 240 MHz to 160
+### Standby
+
+Saving leaves a working speaker that costs less to run. **Standby** stops being a
+speaker: the ring is written black, the panel is powered down, the DFPlayer is
+stopped and put in its own standby, the indicator goes dark, Wi-Fi and Bluetooth
+are both torn down, and the core drops to 10 MHz to watch one GPIO. Pressing
+**BOOT** — held briefly, so a speaker in a bag that brushes it stays asleep —
+restarts the board, because bringing the radios, the audio path and the module
+back up from nothing is exactly what `setup()` does.
+
+Three modes, the same shape as the rest: **Never**, **After the timeout**
+(whenever nothing has played and nobody has touched it), and **Only while
+saving** (the same, but gated on power saving actually being on — which is the
+option for a speaker that should put itself away on battery and stay up on
+mains). Timeouts run from one minute to twelve hours, and **Stand by now** does
+it on the spot.
+
+The external parts are the ones that need shutting down by hand, because nothing
+about a quiet ESP32 reaches them. The WS2812s matter most: they *latch*. A ring
+that is merely stopped holds its last colour forever, with no clock and no data,
+drawing its full current on a board that is otherwise asleep — so it has to be
+written black and then have its task parked, in that order.
+
+**This is not `esp_deep_sleep_start()`, and the difference is real.** Deep sleep
+would be tens of microamps against the ~15 mA this manages — five days on a
+2000 mAh pack rather than effectively forever. It was the first thing tried. The
+sleep entry path has to run with the flash cache disabled, so it lives in IRAM,
+and it wants about 1.8 KB of it; this firmware has **821 bytes** of IRAM left.
+The Bluetooth controller blob alone holds 33 KB there, which is the same ceiling
+that makes the WS2812 driver forty lines of RMT rather than a library and that
+switched off the PSRAM cache workaround in [platformio.ini](platformio.ini).
+Linking deep sleep in overflows `iram0_0_seg` by 1012 bytes and the image will
+not build. A build with Bluetooth compiled out has the room for the real thing;
+that is the way in if the microamps matter more than A2DP does.
+
+Against the ~260 mA the ring alone can draw, 15 mA is still worth having.
+
+**What power saving deliberately does not touch is the CPU clock.** Dropping 240 MHz to 160
 is the obvious next saving and it is not here: SBC decode with the Bluetooth
 stack running has little headroom at 240 and none below it, and a power mode
 whose symptom is crackle is not one anybody would leave switched on. This is the

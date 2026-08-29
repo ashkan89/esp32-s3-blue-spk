@@ -14,6 +14,7 @@
 #include "battery.h"
 #include "df_player.h"
 #include "player_state.h"
+#include "power.h"
 #include "soft_clock.h"
 #include "status_led.h"
 #include "ui_assets.h"
@@ -162,6 +163,7 @@ static uint32_t last_activity_ms;
 static uint32_t last_input_ms;
 
 static volatile bool power_save;
+static volatile bool suspended;
 static volatile uint8_t blank_mode = UI_BLANK_MODE_DEFAULT;
 static volatile uint32_t blank_after_ms = UI_BLANK_AFTER_S_DEFAULT * 1000UL;
 static bool panel_off;
@@ -1502,6 +1504,14 @@ static void ui_task(void *) {
   last_frame_ms = millis();
 
   for (;;) {
+    if (suspended) {
+      if (!panel_off) {
+        panel_off = true;
+        u8g2.setPowerSave(1);
+      }
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
     ui_frame();
 
     /*
@@ -1594,7 +1604,12 @@ void ui_start() {
 
 bool ui_present() { return g_present; }
 
-void ui_wake() { note_input(millis()); }
+void ui_wake() {
+  note_input(millis());
+  // Standby counts down from the same events. Hanging it here rather than
+  // duplicating the call sites is what keeps the two from disagreeing.
+  power_note_activity();
+}
 
 void ui_set_blank(UiBlankMode mode, uint16_t after_seconds) {
   if (mode > UI_BLANK_ALWAYS) mode = UI_BLANK_NEVER;
@@ -1608,6 +1623,13 @@ void ui_set_blank(UiBlankMode mode, uint16_t after_seconds) {
 }
 
 bool ui_blanked() { return panel_off; }
+
+void ui_suspend() {
+  if (!g_present) return;
+  // The task does the powering down, on the task that owns the I2C bus. Setting
+  // the flag and waiting is what keeps two writers off one bus.
+  suspended = true;
+}
 
 void ui_set_power_save(bool on) {
   if (on == power_save) return;

@@ -2,11 +2,17 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_wifi.h>
 
+#include "audio_probe.h"
 #include "battery.h"
+#include "df_player.h"
 #include "leds.h"
 #include "status_led.h"
 #include "ui.h"
+#include "ui_config.h"
 
 namespace {
 
@@ -38,6 +44,25 @@ constexpr uint8_t EXIT_MARGIN_PCT = 5;
  */
 constexpr uint32_t EVAL_EVERY_MS = 500;
 uint32_t g_lastEval;
+
+// --- sleep ------------------------------------------------------------------
+SleepMode g_sleepMode = SLEEP_MODE_OFF;
+uint32_t g_sleepAfterMs = (uint32_t)POWER_SLEEP_AFTER_S_DEFAULT * 1000UL;
+uint32_t g_activeAt;
+bool g_sleeping;  // the shutdown is running; do not start it twice
+
+/// The same grace the display's idle blanking uses, and for the same reason: a
+/// fade or the gap between two tracks is not the speaker being finished with.
+constexpr uint32_t SLEEP_AUDIO_GRACE_MS = UI_AUDIO_GRACE_MS;
+
+/// How long the panel says what is about to happen before it happens. Long
+/// enough to read, short enough not to feel like a fault.
+constexpr uint32_t SLEEP_NOTICE_MS = 2500;
+
+/// The wake button has to be let go of first: deep sleep entered with EXT0's
+/// level already asserted wakes again immediately, which reads as a speaker
+/// that refuses to sleep.
+constexpr uint32_t SLEEP_RELEASE_WAIT_MS = 8000;
 
 /// Transmit power while saving. -- 11 dBm rather than the default 19.5 keeps a
 /// dashboard usable across a room and costs roughly a third of the radio's
@@ -149,7 +174,42 @@ void evaluate() {
   apply(want);
 }
 
+/// Is the speaker doing anything? The same three inputs the display's idle
+/// blanking uses, deliberately: two different answers to "is this thing in use"
+/// is one more than a speaker needs.
+bool busy(uint32_t now) {
+  const uint32_t heard = audio_probe_last_active();
+  if (heard != 0 && (now - heard) < SLEEP_AUDIO_GRACE_MS) return true;
+  return df_player_active();
+}
+
+void serviceSleep(uint32_t now) {
+  if (g_sleepMode == SLEEP_MODE_OFF || g_sleeping) return;
+  if (!power_sleep_possible()) return;
+  if (g_sleepMode == SLEEP_MODE_SAVING && !g_active) {
+    // Tied to saving and saving is not on: the countdown has not started, so it
+    // should not be part-way through when it does.
+    g_activeAt = now;
+    return;
+  }
+  if (busy(now)) {
+    g_activeAt = now;
+    return;
+  }
+  if (now - g_activeAt < g_sleepAfterMs) return;
+  power_sleep_now();
+}
+
 }  // namespace
+
+/*
+ * Survives the restart that ends standby. RTC slow memory is not touched by a
+ * software reset and NOINIT keeps the startup code from zeroing it, so this is
+ * the one thing that can tell "woke from standby" from "somebody rebooted it":
+ * both are ESP_RST_SW as far as the reset reason is concerned.
+ */
+RTC_NOINIT_ATTR uint32_t g_wokeMagic;
+constexpr uint32_t WOKE_MAGIC = 0x5A11EEB1;
 
 void power_configure(PowerMode mode, uint8_t threshold) {
   g_mode = mode > POWER_MODE_AUTO ? POWER_MODE_OFF : mode;
@@ -163,6 +223,7 @@ void power_tick() {
   if (now - g_lastEval < EVAL_EVERY_MS) return;
   g_lastEval = now;
   evaluate();
+  serviceSleep(now);
 }
 
 bool power_saving() { return g_active; }
@@ -170,3 +231,131 @@ bool power_saving() { return g_active; }
 const char *power_reason() { return g_reason; }
 
 bool power_auto_blind() { return g_blind; }
+
+// ------------------------------------------------------------------ sleep ---
+void power_configure_sleep(SleepMode mode, uint16_t after_seconds) {
+  g_sleepMode = mode > SLEEP_MODE_SAVING ? SLEEP_MODE_OFF : mode;
+  if (after_seconds < POWER_SLEEP_AFTER_S_MIN) after_seconds = POWER_SLEEP_AFTER_S_MIN;
+  if (after_seconds > POWER_SLEEP_AFTER_S_MAX) after_seconds = POWER_SLEEP_AFTER_S_MAX;
+  g_sleepAfterMs = (uint32_t)after_seconds * 1000UL;
+  // A policy that has just been chosen starts its countdown now rather than
+  // part-way through, which for a long-running speaker would otherwise mean
+  // "sleep immediately".
+  g_activeAt = millis();
+}
+
+void power_note_activity() { g_activeAt = millis(); }
+
+uint32_t power_idle_ms() { return millis() - g_activeAt; }
+
+bool power_sleep_possible() { return PIN_UI_BUTTON >= 0; }
+
+bool power_woke_from_sleep() {
+  static bool checked, woke;
+  if (!checked) {
+    checked = true;
+    woke = esp_reset_reason() == ESP_RST_SW && g_wokeMagic == WOKE_MAGIC;
+    g_wokeMagic = 0;  // read once: the next boot is not this one
+  }
+  return woke;
+}
+
+bool power_sleep_now() {
+  if (!power_sleep_possible()) {
+    Serial.println("[power] no wake button compiled in; refusing to stand by");
+    return false;
+  }
+  if (g_sleeping) return true;
+  g_sleeping = true;
+
+  Serial.printf("[power] standby; wake on GPIO%d\n", (int)PIN_UI_BUTTON);
+
+  /*
+   * Say so first, and on the panel rather than only on a serial port nobody is
+   * watching. A speaker that goes dark and silent with no warning is
+   * indistinguishable from one that has crashed.
+   */
+  ui_show_system_status(UI_STATUS_RESTART, "Standby",
+                        "Press BOOT to wake", -1, 0);
+  delay(SLEEP_NOTICE_MS);
+
+  /*
+   * The DFPlayer first: it is the one that is audible, and its command has
+   * furthest to travel -- two frames at the driver's own pacing on a 9600 baud
+   * link. Stop before standby, because a sleeping module ignores everything
+   * including stop, so the order is not interchangeable.
+   */
+  df_player_stop();
+  df_player_standby();
+  delay(300);
+
+  // Each on the task that owns the hardware. Two writers on one I2C bus or one
+  // RMT channel is how a shutdown becomes a crash.
+  leds_suspend();
+  ui_suspend();
+  status_led_mute(true);
+  delay(250);
+
+  /*
+   * The radios, which on this chip are most of the current. Both are guarded on
+   * their own status rather than on which mode we think we are in: Bluetooth is
+   * never started in Wi-Fi only mode, and tearing down a controller that was
+   * never brought up is a panic, not a no-op.
+   */
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  esp_wifi_stop();
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED) {
+    esp_bluedroid_disable();
+  }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_INITIALIZED) {
+    esp_bluedroid_deinit();
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+    esp_bt_controller_disable();
+  }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED) {
+    esp_bt_controller_deinit();
+  }
+
+  /*
+   * And the core itself. Ten megahertz is the lowest the PLL-free path will do
+   * and is legal only because both radios are down -- the Wi-Fi and Bluetooth
+   * MACs need 80 MHz to keep time with the air. Nothing is left that needs to
+   * be fast: one GPIO read every fifty milliseconds.
+   */
+  setCpuFrequencyMhz(10);
+
+  Serial.flush();
+
+  /*
+   * The wait. Deliberately a restart rather than a resume: coming back means
+   * the radios, the audio path and the DFPlayer all have to be brought up from
+   * nothing, and that is precisely what setup() does. Waking into a half-torn-
+   * down speaker to save four seconds is not a trade worth making.
+   *
+   * The press has to be a deliberate one. A speaker in a bag that brushes the
+   * button should stay asleep, so the button is required to be down for
+   * WAKE_HOLD_MS rather than merely observed low once.
+   */
+  pinMode(PIN_UI_BUTTON, INPUT_PULLUP);
+  constexpr uint32_t WAKE_HOLD_MS = 400;
+  uint32_t downSince = 0;
+  for (;;) {
+    if (digitalRead(PIN_UI_BUTTON) == LOW) {
+      if (downSince == 0) downSince = millis();
+      if (millis() - downSince >= WAKE_HOLD_MS) break;
+    } else {
+      downSince = 0;
+    }
+    delay(50);
+  }
+
+  setCpuFrequencyMhz(240);  // so the restart runs at the speed it expects
+  g_wokeMagic = WOKE_MAGIC;
+  Serial.println("[power] waking");
+  Serial.flush();
+  delay(50);
+  ESP.restart();
+  return true;  // unreachable; keeps the signature honest
+}

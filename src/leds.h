@@ -154,6 +154,11 @@ bool leds_resting();
 /// choices and survive, and this is lifted the moment saving ends. See power.h.
 void leds_set_power_save(bool on);
 
+/// Writes the ring black and parks its task. For standby: WS2812s latch, so a
+/// ring that is merely stopped stays lit at whatever it was showing, drawing
+/// its full current. There is no resume -- standby ends in a restart.
+void leds_suspend();
+
 /// Milliseconds since the ring last had a reason to be lit -- audio, or a
 /// change made from the dashboard. The countdown behind idleAfterS, shown on
 /// the page so a ring that will not rest can be diagnosed rather than guessed.
@@ -176,5 +181,6 @@ inline bool leds_hearing_audio() { return false; }
 inline bool leds_resting() { return false; }
 inline uint32_t leds_idle_ms() { return 0; }
 inline void leds_set_power_save(bool) {}
+inline void leds_suspend() {}
 inline bool leds_command(const char *) { return false; }
 #endif

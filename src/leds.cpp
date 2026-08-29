@@ -255,6 +255,10 @@ static volatile bool resting;
 /// the mode is worth having.
 static volatile bool powerSave;
 
+/// Standby. One black frame goes out, and then the task stops touching the RMT
+/// channel at all rather than clocking sixty frames a second of nothing.
+static volatile bool suspended;
+
 // ----------------------------------------------------------------- effects ---
 /*
  * Phase accumulators rather than a frame counter, so the effects run at the
@@ -577,6 +581,10 @@ static void leds_task(void *) {
   uint32_t last_ms = millis();
 
   for (;;) {
+    if (suspended) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
     const uint32_t now = millis();
     float dt = (now - last_ms) * 0.001f;
     last_ms = now;
@@ -744,6 +752,16 @@ bool leds_hearing_audio() { return hearing(millis()); }
 bool leds_resting() { return resting; }
 
 uint32_t leds_idle_ms() { return millis() - awake_ms; }
+
+void leds_suspend() {
+  if (!g_present || suspended) return;
+  // Black first, then park: the order is the whole point, because the pixels
+  // keep showing the last thing they were sent once the task stops sending.
+  fill(0);
+  LedConfig off{};
+  commit(off, millis());
+  suspended = true;
+}
 
 void leds_set_power_save(bool on) {
   if (on == powerSave) return;

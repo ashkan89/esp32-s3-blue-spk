@@ -66,6 +66,99 @@ const char *power_reason();
 /// a percentage that does not exist.
 bool power_auto_blind();
 
+// ------------------------------------------------------------------ sleep ---
+/*
+ * Standby, which is a different thing from saving.
+ *
+ * Saving leaves a working speaker that costs less to run. Standby stops being a
+ * speaker: everything external goes dark, both radios come down, the core drops
+ * to 10 MHz, and the board sits there watching one GPIO until somebody presses
+ * BOOT -- at which point it restarts, because coming back means bringing the
+ * radios, the audio path and the DFPlayer up from nothing, and setup() is what
+ * does that.
+ *
+ * ---------------------------------------------------------------------------
+ * Why this is not esp_deep_sleep_start()
+ * ---------------------------------------------------------------------------
+ * Because it does not fit. Deep sleep would be ~10 uA against the ~15 mA this
+ * manages, and it was the first thing tried -- but esp_sleep's entry path has
+ * to run with the flash cache off, so it lives in IRAM, and it wants about
+ * 1.8 KB of it. This firmware has 821 bytes of IRAM left: the Bluetooth
+ * controller blob alone holds 33 KB there, and the same ceiling is why the
+ * WS2812 driver is forty lines of RMT rather than a library and why the PSRAM
+ * cache workaround is switched off in platformio.ini. Linking deep sleep in
+ * overflows iram0_0_seg by 1012 bytes and the image will not build.
+ *
+ * So this is what fits, and the difference is real: standby is roughly 15 mA
+ * where deep sleep would be effectively nothing, which on a 2000 mAh pack is
+ * about five days rather than about forever. Against the ~260 mA the ring alone
+ * can draw it is still worth having. A build with Bluetooth compiled out has
+ * the IRAM for the real thing; that is the way in if the microamps matter more
+ * than A2DP does.
+ *
+ * ---------------------------------------------------------------------------
+ * What has to be shut down by hand
+ * ---------------------------------------------------------------------------
+ * The external parts, because nothing about a quiet ESP32 reaches them:
+ *
+ *   the ring     WS2812s latch: they hold the last colour they were sent
+ *                forever, with no clock and no data. A ring left mid-rainbow
+ *                would stay mid-rainbow, lit, drawing its full current, on a
+ *                board that is otherwise asleep.
+ *   the panel    the SSD1306 keeps displaying whatever is in its buffer, and
+ *                has to be told to power down.
+ *   the DFPlayer decodes its own card and does not care what the ESP32 is
+ *                doing. Left alone it would go on playing to an empty room.
+ *
+ * The DAC needs nothing: with the I2S clocks stopped the PCM5102A idles.
+ *
+ * Waking is the BOOT button, which is already on the board and already the
+ * speaker's only control. It has to be held for a moment rather than merely
+ * seen low, so a speaker in a bag that brushes it stays asleep. Because standby
+ * ends in a software restart rather than a chip reset, GPIO0 being the
+ * download-mode strap does not matter here: the strapping pins are latched at
+ * power-on and the button is long released by the time the restart runs.
+ */
+
+enum SleepMode : uint8_t {
+  SLEEP_MODE_OFF = 0,    ///< never sleep on its own
+  SLEEP_MODE_IDLE,       ///< sleep after the timeout, whatever the power mode
+  SLEEP_MODE_SAVING,     ///< sleep after the timeout, but only while saving
+};
+
+/// Applies the sleep policy. `after_seconds` is the idle time before the
+/// speaker puts itself away, clamped to POWER_SLEEP_AFTER_S_MIN..MAX.
+void power_configure_sleep(SleepMode mode, uint16_t after_seconds);
+
+/// Defers sleep. Called from ui_wake(), so everything already treated as the
+/// owner doing something -- the button, the dashboard, the serial console, an
+/// update writing progress -- pushes the timer out without a second list of
+/// call sites to keep in step.
+void power_note_activity();
+
+/// Milliseconds since the speaker last did anything, by the same definition the
+/// display's idle blanking uses: audio through the analyser, the DFPlayer
+/// playing, or the owner. For the dashboard's countdown.
+uint32_t power_idle_ms();
+
+/// Shuts everything down in order and waits for the button. Does not return:
+/// it ends in a restart. Refuses, and says so, when no wake button is compiled
+/// in -- a speaker that cannot be woken is not one to put to sleep.
+bool power_sleep_now();
+
+/// False when PIN_UI_BUTTON is -1, in which case there is nothing that could
+/// wake the board and the card says so rather than offering a switch that would
+/// strand it.
+bool power_sleep_possible();
+
+/// True if this boot is a wake from standby rather than a power-on or an
+/// ordinary reboot. Read once; the answer is consumed.
+bool power_woke_from_sleep();
+
+static const uint16_t POWER_SLEEP_AFTER_S_MIN = 60;
+static const uint16_t POWER_SLEEP_AFTER_S_MAX = 43200;  // 12 hours
+static const uint16_t POWER_SLEEP_AFTER_S_DEFAULT = 1800;
+
 /*
  * What saving does, so the dashboard can list it without repeating itself and
  * the two owners below can be found from here:
