@@ -86,6 +86,13 @@ void ui_set_blank(UiBlankMode mode, uint16_t after_seconds);
 /// so rather than leaving a dark panel looking like a fault.
 bool ui_blanked();
 
+/// The two countdowns, in milliseconds, for the dashboard to show. `idle` is
+/// what UI_BLANK_IDLE watches -- reset by audio as well as by the owner --
+/// and `untouched` is what UI_BLANK_ALWAYS watches. Reported because "it never
+/// blanks" is otherwise a guess about which of them is being held open.
+uint32_t ui_idle_ms();
+uint32_t ui_untouched_ms();
+
 enum UiSystemStatus : uint8_t {
   UI_STATUS_NETWORK = 0,
   UI_STATUS_UPDATE,

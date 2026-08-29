@@ -1394,12 +1394,23 @@ static void ui_frame() {
   /*
    * What counts as the speaker being in use.
    *
-   * df_player_active() is in here because that module decodes its own card and
-   * its audio never passes through this chip -- so the analyser hears nothing,
-   * and without this the panel would blank in the middle of a track in the one
-   * mode where it is most obviously playing.
+   * Not info.streaming, which is the transport's *declared* state and is wrong
+   * about the one case this has to get right. Pausing on a phone normally
+   * leaves the AVDTP stream in STARTED and simply sends silence -- no state
+   * change is signalled, often none ever is -- so `streaming` stayed true from
+   * the first track until the phone disconnected, and the panel never blanked
+   * however short the timeout was set.
+   *
+   * The analyser is the honest answer because it is looking at the samples, and
+   * every source that passes through this chip feeds it: A2DP, the network
+   * player and the chimes alike. Its last-heard timestamp rather than the
+   * instantaneous flag, so a fade or the gap between two tracks does not read
+   * as "stopped" -- and df_player_active() alongside it, because that module
+   * decodes its own card and the analyser never hears it at all.
    */
-  if (vis.active || info.streaming || df_player_active()) last_activity_ms = now;
+  const uint32_t heard = audio_probe_last_active();
+  const bool audible = heard != 0 && (now - heard) < UI_AUDIO_GRACE_MS;
+  if (audible || df_player_active()) last_activity_ms = now;
   detect_events(info, now);
   poll_button(now);
 
@@ -1596,6 +1607,9 @@ void ui_set_blank(UiBlankMode mode, uint16_t after_seconds) {
 }
 
 bool ui_blanked() { return panel_off; }
+
+uint32_t ui_idle_ms() { return millis() - last_activity_ms; }
+uint32_t ui_untouched_ms() { return millis() - last_input_ms; }
 
 void ui_show_system_status(UiSystemStatus kind, const char *title,
                            const char *detail, int16_t progress,

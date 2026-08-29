@@ -738,6 +738,8 @@ bool leds_hearing_audio() { return hearing(millis()); }
 
 bool leds_resting() { return resting; }
 
+uint32_t leds_idle_ms() { return millis() - awake_ms; }
+
 // ----------------------------------------------------------------- console ---
 static void print_leds_status() {
   LedConfig c;

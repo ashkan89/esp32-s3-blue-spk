@@ -1377,6 +1377,7 @@ void handleStatus() {
   led["effectName"] = leds_effect_name(settings.leds.effect);
   led["hearingAudio"] = leds_hearing_audio();
   led["resting"] = leds_resting();
+  led["idleSeconds"] = leds_idle_ms() / 1000;
 
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
@@ -2027,6 +2028,11 @@ void handleSettingsGet() {
   oled["blankMinSeconds"] = UI_BLANK_AFTER_S_MIN;
   oled["blankMaxSeconds"] = UI_BLANK_AFTER_S_MAX;
   oled["blanked"] = ui_blanked();
+  // The live countdowns, so a panel that will not blank can be diagnosed from
+  // the page rather than guessed at: whichever number is not climbing is the
+  // one being held open, and by what.
+  oled["idleSeconds"] = ui_idle_ms() / 1000;
+  oled["untouchedSeconds"] = ui_untouched_ms() / 1000;
 
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
@@ -2070,6 +2076,7 @@ void handleSettingsGet() {
   led["idleMinSeconds"] = LED_IDLE_AFTER_S_MIN;
   led["idleMaxSeconds"] = LED_IDLE_AFTER_S_MAX;
   led["resting"] = leds_resting();
+  led["idleSeconds"] = leds_idle_ms() / 1000;
   // Whether there is anything for the reactive effects to react to in this
   // mode at all. DFPlayer audio never passes through this chip, so the music
   // sync has nothing to work with and the page should say so rather than

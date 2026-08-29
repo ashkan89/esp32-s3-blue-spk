@@ -149,6 +149,11 @@ bool leds_hearing_audio();
 /// dark ring that the page says is on and rainbow is otherwise a fault.
 bool leds_resting();
 
+/// Milliseconds since the ring last had a reason to be lit -- audio, or a
+/// change made from the dashboard. The countdown behind idleAfterS, shown on
+/// the page so a ring that will not rest can be diagnosed rather than guessed.
+uint32_t leds_idle_ms();
+
 /// Serial console: "leds", "leds on|off", "leds fx <0-14>", "leds color RRGGBB",
 /// "leds color2 RRGGBB", "leds bright <0-255>", "leds speed <0-255>",
 /// "leds react <0-100>". Returns false if the line was not one of those.
@@ -164,5 +169,6 @@ inline const char *leds_effect_name(uint8_t) { return "?"; }
 inline const char *leds_effect_hint(uint8_t) { return ""; }
 inline bool leds_hearing_audio() { return false; }
 inline bool leds_resting() { return false; }
+inline uint32_t leds_idle_ms() { return 0; }
 inline bool leds_command(const char *) { return false; }
 #endif

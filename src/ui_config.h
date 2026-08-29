@@ -101,6 +101,11 @@ static const uint32_t UI_SLEEP_AFTER_MS = 300000;
 /// up with. The dashboard's OLED display card stores the owner's choice in NVS
 /// and that wins from then on. Mode 0 is off, 1 blanks once nothing is playing,
 /// 2 blanks on a timer whatever is playing -- see UiBlankMode in ui.h.
+/// How long after the last sound the speaker still counts as playing. A fade,
+/// the gap between two tracks and a quiet passage all drop below the analyser's
+/// floor for a moment, and none of them is a reason to blank the panel.
+static const uint32_t UI_AUDIO_GRACE_MS = 4000;
+
 static const uint8_t UI_BLANK_MODE_DEFAULT = 0;
 static const uint16_t UI_BLANK_AFTER_S_DEFAULT = 300;
 static const uint16_t UI_BLANK_AFTER_S_MIN = 10;

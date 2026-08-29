@@ -945,16 +945,36 @@ That difference is the whole reason there are two of them, and why the firmware
 keeps two idle clocks rather than one: the first reads the clock audio keeps
 warm, the second reads the one only the owner touches.
 
-**What counts as playing.** The analyser is the source of truth for both timed
-modes, and for the ring's resting timer next to it. Two things had to be true for
-that to work. The probe re-analyses the newest window of its ring buffer, and
-nothing clears that buffer when playback stops — so the last few milliseconds of
-the last track were being re-reported as live audio for as long as the speaker
-stayed powered, and neither timer ever ran down. The probe now watches its own
-write counter: a quarter-second with no new samples is a stopped stream, and the
-window is treated as the silence it is. And DFPlayer audio never passes through
-this chip at all, so both timers also ask `df_player_active()` — without it the
-panel would blank mid-track in the one mode where it is most obviously playing.
+**What counts as playing.** The analyser, and only the analyser, plus the
+DFPlayer asked directly. That is the whole rule, and getting to it took removing
+two things that looked like better answers and were not.
+
+The first was the A2DP transport state. `streaming` means the AVDTP stream is in
+STARTED, which is not the same as audio existing: pausing on a phone normally
+leaves the stream started and simply sends silence, and plenty of phones never
+signal a state change at all. So a paused speaker reported itself as playing from
+the first track until the phone disconnected, and the panel never blanked however
+short the timeout was set.
+
+The second was inside the probe. It re-analyses the newest window of its ring
+buffer, and nothing clears that buffer when playback stops — the writer is a hot
+path with no "stopped" hook to hang it on. So the last few milliseconds of the
+last track were re-reported as live audio for as long as the speaker stayed
+powered. The probe now watches its own write counter instead: a quarter-second
+with no new samples is a stopped stream, and the window is treated as the silence
+it is. That one costs the writer nothing.
+
+What is left is honest, because it is looking at the samples, and every source
+that passes through this chip feeds it — A2DP, the network player, the chimes.
+The timers read its last-heard timestamp rather than its instantaneous flag, so a
+fade or the gap between two tracks does not read as *stopped*
+(`UI_AUDIO_GRACE_MS`, four seconds). DFPlayer audio never reaches it at all, so
+both timers also ask `df_player_active()`; without that the panel would blank
+mid-track in the one mode where it is most obviously playing.
+
+Both countdowns are reported on the card — *nothing has played for 2m 14s;
+nobody has touched it for 6m 52s* — and the ring's on the Lighting page, so a
+panel that will not blank is a thing you can look at rather than guess about.
 
 Timeouts run from ten seconds to twelve hours. Both modes are suspended while a
 system overlay is up — an update, a restart, the factory-reset countdown — since
