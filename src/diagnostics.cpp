@@ -16,12 +16,10 @@
 #include "app_config.h"
 #include "audio_probe.h"
 #include "battery.h"
-#include "ble_control.h"
 #include "df_player.h"
 #include "hw_config.h"
 #include "leds.h"
 #include "management.h"
-#include "net_audio.h"
 // For PIN_MAP_I2S_*: pin_check.h is where the whole pin map is visible at once,
 // which is exactly what a report of the pin map wants.
 #include "pin_check.h"
@@ -197,8 +195,6 @@ void print_report() {
   print_stack("ui");
   print_stack("leds");
   print_stack("dfplayer");
-  print_stack("net_audio");
-  print_stack("dlna");
   Serial.printf("  tasks       %u running\n",
                 (unsigned)uxTaskGetNumberOfTasks());
 
@@ -271,14 +267,9 @@ void print_report() {
     Serial.printf("\n  setup ap    %s\n",
                   management_ap_running() ? "up" : "down");
   }
-  if (radio_mode_has_ble(mode)) {
-    Serial.printf("  ble         %s, %u client(s)\n",
-                  ble_control_running() ? "advertising" : "off",
-                  (unsigned)ble_control_clients());
-    Serial.printf("  net player  %s\n", net_audio_running() ? "running" : "off");
-  }
 
   PlayerInfo info;
+
   ps_snapshot(&info);
   Serial.printf("  connected   %s%s%s\n", yes_no(info.connected),
                 info.peer[0] ? " -- " : "", info.peer);

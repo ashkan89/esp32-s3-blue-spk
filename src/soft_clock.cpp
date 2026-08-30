@@ -500,8 +500,6 @@ void soft_clock_now(struct tm *out) {
 
 bool soft_clock_trusted() { return g_source != CLOCK_SRC_BUILD; }
 
-ClockSource soft_clock_source() { return g_source; }
-
 const char *soft_clock_source_name() {
   switch (g_source) {
     case CLOCK_SRC_NVS: return "nvs";

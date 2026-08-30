@@ -950,13 +950,13 @@ void df_player_loop() {
   /*
    * Every write here is behind a change test, and that is not an optimisation.
    *
-   * ps_set_net_connection() restamps connected_at and, when disconnecting,
+   * ps_set_source_connection() restamps connected_at and, when disconnecting,
    * clears the track text; ps_set_track_text() bumps track_seq whenever the
    * title differs from what is stored. Calling the pair unconditionally four
    * times a second would therefore restart the connection timer continuously
    * and -- while the module is offline, where the clear and the set disagree --
    * fire a track-change event on every pass, which the OLED shows as a toast
-   * and main.cpp writes to the serial log. Same shape as net_audio_loop().
+   * and main.cpp writes to the serial log.
    */
   static bool last_online;
   static bool last_primed;
@@ -1005,7 +1005,8 @@ void df_player_loop() {
     // the strings below have to be re-sent afterwards rather than suppressed by
     // a cache that still holds what was just thrown away.
     last_title[0] = last_detail[0] = 0;
-    ps_set_net_connection(s.online, df_source_name(s.source));
+    ps_set_source_connection(s.online, df_source_name(s.source));
+
   }
   if (strcmp(title, last_title) != 0 || strcmp(detail, last_detail) != 0) {
     strlcpy(last_title, title, sizeof(last_title));

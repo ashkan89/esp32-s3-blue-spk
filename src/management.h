@@ -9,28 +9,15 @@ class BluetoothA2DPSink;
 /*
  * Radio mode.
  *
- * This chip has one 2.4 GHz front end shared by Wi-Fi and Bluetooth Classic.
- * What Espressif's coexistence scheduler supports is Wi-Fi *station* alongside
- * Bluetooth. A SoftAP alongside an A2DP sink is not a supported combination,
- * and in practice neither side works properly -- the access point cannot be
- * joined, and the sink is not reliably discoverable. That is the line these
- * three modes are drawn along: the setup access point is exclusive, a station
- * is not.
+ * This chip has one 2.4 GHz front end shared by Wi-Fi and Bluetooth Classic,
+ * and each mode gives it to exactly one job. Whichever half of the Bluetooth
+ * controller a mode does not use is handed back at boot, and that is where the
+ * heap the dashboard and the OTA download need comes from.
  *
  *   MANAGEMENT  Wi-Fi is up -- station if a network is configured, the setup
  *               access point if not -- and the dashboard is reachable.
  *               Bluetooth is not started at all, and its RAM is handed back.
  *   BLUETOOTH   the A2DP sink owns the antenna. Wi-Fi is never initialised.
- *   COMBO       station plus A2DP sink, sharing the radio under coexistence.
- *               The dashboard stays reachable while music plays, which is what
- *               makes its media controls worth having. No setup access point
- *               ever comes up here, so the mode needs a network already saved:
- *               management_begin() demotes it to MANAGEMENT when there is none.
- *   NET         station plus BLE. Audio arrives over Wi-Fi instead of
- *               Bluetooth -- a DLNA/UPnP renderer anything can cast to, or a
- *               URL -- and BLE carries status, transport control and Wi-Fi
- *               provisioning. Bluetooth Classic is never started, so the setup
- *               access point is allowed here exactly as in MANAGEMENT.
  *   DFPLAYER    Wi-Fi exactly as in MANAGEMENT -- station if a network is
  *               saved, the setup access point if not, dashboard either way --
  *               and the audio comes from a DFPlayer Mini instead of the radio.
@@ -42,20 +29,19 @@ class BluetoothA2DPSink;
  * Switching is a deliberate act (hold BOOT, or the dashboard) and takes effect
  * through a restart, so every mode begins from a clean radio.
  *
- * On BLE and audio: this is a classic ESP32, Bluetooth 4.2. LE Audio -- the
- * profile that carries music over Bluetooth Low Energy -- needs 5.2 silicon and
- * does not exist on this chip, and BLE 4.2 here sustains a small fraction of
- * what stereo music costs. So BLE is never an audio path in any mode: audio is
- * either A2DP (BR/EDR) or Wi-Fi. Each mode hands back the half of the
- * controller it does not use, which is where the heap for the updater's TLS
- * handshake comes from.
+ * On BLE, and why there is none.
+ *
+ * This is a classic ESP32, Bluetooth 4.2. LE Audio -- the profile that carries
+ * music over Bluetooth Low Energy -- needs 5.2 silicon and does not exist here,
+ * and BLE 4.2 sustains a small fraction of what stereo music costs. So BLE
+ * could only ever have been a control channel, and the dashboard and the setup
+ * access point already are one. Audio is A2DP (BR/EDR) or the DFPlayer, and
+ * provisioning is the setup access point's job in both modes that raise one.
  */
 enum RadioMode : uint8_t {
   RADIO_MODE_MANAGEMENT = 0,
   RADIO_MODE_BLUETOOTH = 1,
-  RADIO_MODE_COMBO = 2,
-  RADIO_MODE_NET = 3,
-  RADIO_MODE_DFPLAYER = 4,
+  RADIO_MODE_DFPLAYER = 2,
   RADIO_MODE_COUNT
 };
 
@@ -64,15 +50,10 @@ inline bool radio_mode_has_wifi(RadioMode mode) {
   return mode != RADIO_MODE_BLUETOOTH;
 }
 
-/// Whether a mode starts Bluetooth Classic and the A2DP sink. Deliberately not
-/// "has Bluetooth": NET has Bluetooth too, just not the half that carries audio.
+/// Whether a mode starts Bluetooth Classic and the A2DP sink. This is also the
+/// only mode that starts Bluetooth at all.
 inline bool radio_mode_has_a2dp(RadioMode mode) {
-  return mode == RADIO_MODE_BLUETOOTH || mode == RADIO_MODE_COMBO;
-}
-
-/// Whether a mode starts the BLE control service and the network audio player.
-inline bool radio_mode_has_ble(RadioMode mode) {
-  return mode == RADIO_MODE_NET;
+  return mode == RADIO_MODE_BLUETOOTH;
 }
 
 /// Whether a mode drives the DFPlayer Mini. Nothing else in the firmware talks
@@ -91,7 +72,7 @@ const char *management_device_name(const char *fallback);
 RadioMode management_radio_mode();
 
 /// The next one in the cycle, for the BOOT button and the console:
-/// Wi-Fi -> Bluetooth -> Wi-Fi + BT -> Wi-Fi + BLE -> DFPlayer -> Wi-Fi.
+/// Wi-Fi -> Bluetooth -> DFPlayer -> Wi-Fi.
 RadioMode management_next_mode();
 
 /// Human-readable, for the console and the display.
@@ -100,9 +81,10 @@ const char *management_mode_name(RadioMode mode);
 /// Persists the mode and restarts into it. Does not return.
 void management_switch_mode(RadioMode mode);
 
-// Starts whatever this mode needs. In MANAGEMENT that is Wi-Fi provisioning,
-// the HTTP dashboard and the OTA services; in BLUETOOTH it reads the stored
-// settings and otherwise leaves the radio alone.
+// Starts whatever this mode needs. In MANAGEMENT and DFPLAYER that is Wi-Fi
+// provisioning, the HTTP dashboard and the OTA services; in BLUETOOTH it reads
+// the stored settings and otherwise leaves the radio alone.
+
 void management_begin(BluetoothA2DPSink &sink);
 
 // Services HTTP requests and deferred operations. Must be called from loop().
@@ -134,11 +116,6 @@ void management_set_bt_active(bool active);
 void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
                            uint8_t *loop, uint8_t *loopFolder, bool *autoplay);
 
-// Saves a network and restarts into it. Used by the BLE provisioning
-// characteristic, which is the way back in when the dashboard is unreachable
-// because the saved credentials are wrong. Does not return.
-void management_provision_wifi(const char *ssid, const char *password);
-
 /*
  * Writes the live WS2812 configuration to NVS.
  *
@@ -165,7 +142,6 @@ inline void management_factory_reset() {}
 inline void management_set_bt_active(bool) {}
 inline void management_df_defaults(uint8_t *, uint8_t *, uint8_t *, uint8_t *,
                                    uint8_t *, bool *) {}
-inline void management_provision_wifi(const char *, const char *) {}
 inline void management_store_leds() {}
 inline bool management_led_state(StatusLedState *) { return false; }
 #endif

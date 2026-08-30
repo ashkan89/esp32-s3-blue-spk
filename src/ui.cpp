@@ -774,10 +774,7 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
       const String ssid = WiFi.SSID();
       snprintf(network_line, sizeof(network_line),
                "%s%s  %u.%u.%u.%u  %ddBm",
-               mode == RADIO_MODE_COMBO      ? "wifi+bt "
-               : mode == RADIO_MODE_NET      ? "wifi+ble "
-               : mode == RADIO_MODE_DFPLAYER ? "sd+wifi "
-                                             : "wifi ",
+               mode == RADIO_MODE_DFPLAYER ? "sd+wifi " : "wifi ",
                ssid.c_str(), ip[0], ip[1], ip[2], ip[3], WiFi.RSSI());
     } else if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
       const IPAddress ip = WiFi.softAPIP();
@@ -850,9 +847,9 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
 
   // "Waiting for something to play" is the same screen whichever mode we are
   // in; only the words change. The beacon animates whenever a source is
-  // actually listening -- an advertising A2DP sink, or a DLNA renderer.
-  const bool listening = s.bt_active || s.source == PS_SRC_NETWORK ||
-                         (s.source == PS_SRC_DFPLAYER && s.connected);
+  // actually listening -- an advertising A2DP sink, or a mounted card.
+  const bool listening =
+      s.bt_active || (s.source == PS_SRC_DFPLAYER && s.connected);
 
   const int cx = 12, cy = 16;
   u8g2.drawXBMP(cx - 8, cy - 8, 16, 16, ICON_BT_BIG);
@@ -875,14 +872,13 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
 
   u8g2.setFont(FONT_TITLE);
   // This screen is the first place anyone looks, so it never claims a capability
-  // the running mode does not have: no "ready to pair" without an A2DP sink, and
-  // no "cast to me" without a network renderer.
-  const char *headline = s.bt_active                     ? "Ready to pair"
-                         : s.source == PS_SRC_NETWORK   ? "Ready to cast"
-                         : s.source == PS_SRC_DFPLAYER  ? (s.connected
+  // the running mode does not have: no "ready to pair" without an A2DP sink,
+  // and no "card ready" without a module answering.
+  const char *headline = s.bt_active                    ? "Ready to pair"
+                         : s.source == PS_SRC_DFPLAYER ? (s.connected
                                                               ? "Card ready"
                                                               : "No module")
-                                                        : "Wi-Fi mode";
+                                                       : "Wi-Fi mode";
   u8g2.drawUTF8(32, 11, headline);
 
   u8g2.setFont(FONT_TEXT);
@@ -892,8 +888,9 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
     // name -- nothing is going to connect to it in this mode.
     draw_marquee(MQ_NAME, 32, 21, W - 32,
                  s.title[0] ? s.title : "Waiting for the module", dt);
-  } else if (s.bt_active || s.source == PS_SRC_NETWORK) {
+  } else if (s.bt_active) {
     draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
+
   } else {
     draw_marquee(MQ_NAME, 32, 21, W - 32,
                  "Bluetooth off - hold BOOT to switch", dt);
@@ -1733,12 +1730,6 @@ void ui_show_system_status(UiSystemStatus kind, const char *title,
   system_overlay.active = true;
   portEXIT_CRITICAL(&system_overlay_mux);
   ui_wake();
-}
-
-void ui_clear_system_status() {
-  portENTER_CRITICAL(&system_overlay_mux);
-  system_overlay.active = false;
-  portEXIT_CRITICAL(&system_overlay_mux);
 }
 
 bool ui_take_mode_switch_request() {

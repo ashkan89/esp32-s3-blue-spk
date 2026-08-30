@@ -110,8 +110,6 @@ void soft_clock_now(struct tm *out);
 /// True once the time came from something better than the build timestamp.
 bool soft_clock_trusted();
 
-ClockSource soft_clock_source();
-
 /// One-line label for the source, for the info screen.
 const char *soft_clock_source_name();
 

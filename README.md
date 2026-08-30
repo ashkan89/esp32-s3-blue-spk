@@ -90,8 +90,8 @@ programming port) and GPIO6–11 are the module's own SPI flash.
   selects the flash regulator voltage, and holding it high can stop a 3.3 V
   module booting at all.
 - **The battery gauge must be on ADC1 (GPIO32–39).** ADC2 shares hardware with
-  the Wi-Fi radio and stops answering whenever the driver is up — which is four
-  of the five radio modes. The Arduino wrapper does not report the failure, it
+  the Wi-Fi radio and stops answering whenever the driver is up — which is two
+  of the three radio modes. The Arduino wrapper does not report the failure, it
   returns 0, so the symptom is a gauge that reads a flat pack whenever Wi-Fi is
   on and a correct one whenever it is not.
 
@@ -184,8 +184,8 @@ and grounds joined. The series resistors make it a passive summing node; the
 would otherwise be pushed into whatever is downstream.
 
 This is safe precisely **because the radio modes are mutually exclusive**.
-DFPlayer mode never starts the A2DP sink or the network player, and no other
-mode starts the DFPlayer, so only one of the two sources is ever producing
+DFPlayer mode never starts the A2DP sink, and no other mode starts the
+DFPlayer, so only one of the two sources is ever producing
 anything — the other contributes its output impedance and nothing else. The
 ~6 dB the resistors cost is recovered on the DFPlayer's own 31-step volume and
 on the ESP32's soft-clipped gain path.
@@ -549,23 +549,17 @@ mode say so and explain how to get to one where they do, rather than showing
 dead controls — the Devices page in a mode with no A2DP sink, the Media page in a
 mode with no DFPlayer.
 
-### Five radio modes
+### Three radio modes
 
-This chip has a single 2.4 GHz front end shared by Wi-Fi and Bluetooth. What
-Espressif's coexistence scheduler supports is Wi-Fi *station* alongside
-Bluetooth. A SoftAP beside an A2DP sink is **not** a supported combination, and
-in practice neither side works — the access point cannot be joined, and the sink
-is not reliably discoverable. Earlier versions tried to referee that contest
-with coexistence preferences, beacon tuning and a "quiet window", and gave up.
-That line — *a station is fine, a hotspot next to Bluetooth Classic is not* — is
-what the modes are drawn along:
+This chip has a single 2.4 GHz front end shared by Wi-Fi and Bluetooth, and each
+mode gives it to exactly one job. Whichever half of the Bluetooth controller a
+mode does not use is handed back at boot, which is where the heap the dashboard
+and the OTA download need comes from:
 
 | Mode | Wi-Fi | Bluetooth | Audio arrives over |
 |------|-------|-----------|--------------------|
 | **Wi-Fi only** | station, or setup hotspot if no network is saved | not started at all; its DRAM goes back to the heap | nothing |
 | **Bluetooth only** | never initialised | A2DP sink owns the antenna | A2DP |
-| **Wi-Fi + Bluetooth** | station only; never raises the setup hotspot | A2DP sink, sharing the radio under coexistence | A2DP |
-| **Wi-Fi + BLE** | station, or setup hotspot; both are fine here | BLE only — Classic is never started | **Wi-Fi** (DLNA or a URL) |
 | **DFPlayer + Wi-Fi** | station, or setup hotspot; identical to Wi-Fi only mode | neither half is started; the *whole* controller goes back to the heap | **a microSD card or USB drive**, over serial |
 
 The mode is remembered across restarts, so a power cut brings the speaker back
@@ -577,75 +571,6 @@ the dashboard is reachable and the mode can be changed again. That sentinel live
 in NVS, so it survives the reboot loop it exists to break; DFPlayer mode is
 covered by it like every other non-default mode.
 
-#### Wi-Fi + Bluetooth
-
-The mode that makes the dashboard's media controls worth having: play, pause,
-skip, seek and volume act on the phone that is streaming right now, because the
-Bluetooth stack and the web server are both up at the same time. Three things
-make it work rather than merely start:
-
-- **Station only.** `startAccessPoint()` refuses to run in this mode, at the
-  call sites and inside the function itself. A speaker with no saved network is
-  demoted to Wi-Fi only at boot, and the demotion is persisted, because
-  otherwise it would have no dashboard and no way to be given one.
-- **Bluetooth keeps its RAM.** The `esp_bt_mem_release(ESP_BT_MODE_BTDM)` that
-  Wi-Fi only mode performs is skipped. ESP32-A2DP starts the controller in
-  `ESP_BT_MODE_CLASSIC_BT` and releases the BLE half itself (~30 KB).
-- **The scheduler is told who matters.** `esp_coex_preference_set(ESP_COEX_PREFER_BT)`
-  before either stack starts, and Wi-Fi modem sleep left on so there are windows
-  to hand over.
-
-The trade is heap: both stacks resident at once leaves noticeably less free than
-either alone, and the updater's TLS handshake is the deepest allocation this
-firmware makes. If an update fails for memory here, do it from Wi-Fi only mode
-and switch back.
-
-#### Wi-Fi + BLE
-
-The other way to answer "both radios at once", and the only one where the audio
-does **not** come over Bluetooth.
-
-**Why not BLE audio.** This is a classic ESP32: Bluetooth 4.2, no BLE 5 features
-and no isochronous channels. LE Audio — the profile that carries music over
-Bluetooth Low Energy — requires Bluetooth 5.2 silicon, and this build's
-`sdkconfig` ships no LE Audio profile for the target at all (`CONFIG_BT_A2DP_ENABLE`
-is the only audio profile present). The bandwidth says the same thing
-independently: BLE 4.2 here sustains roughly 100–300 kbps in practice, against
-about 1,411 kbps for CD-quality stereo. And no phone will stream media to a
-generic BLE peripheral — iOS and Android only offer A2DP for that. So BLE is not
-an audio path on this hardware, on any firmware.
-
-What it is good at is control. So in this mode the audio comes over Wi-Fi and
-BLE does the rest:
-
-- **DLNA / UPnP MediaRenderer.** The speaker advertises itself by SSDP and
-  anything that can cast to a network speaker finds it — BubbleUPnP, VLC, Hi-Fi
-  Cast, foobar2000, Windows' own *Cast to Device*. No app to write and nothing
-  to pair. The renderer serves its description and SOAP endpoints on port 9000;
-  the dashboard stays on 80.
-- **A stream URL.** Paste one into the Overview page, send it over BLE, or type
-  `play <url>` on the console. Internet radio, or any HTTP audio on the network.
-- **BLE control service.** Three characteristics on one custom service: `status`
-  (read + notify, compact JSON), `command` (write: `play`, `pause`, `stop`,
-  `vol N`, `url U`) and `wifi` (write: `<ssid>\n<password>`).
-
-That last one is the reason BLE earns its place. Wi-Fi + Bluetooth mode never
-raises the setup hotspot, so a speaker whose router password changed is
-unreachable until somebody walks over and holds BOOT. Here there are two ways
-back in: the setup hotspot — allowed in this mode, because the combination this
-chip cannot do is a hotspot beside *Classic*, and BLE is not that — and BLE
-provisioning, which works from across the room with any GATT app.
-
-Decoding is MP3, AAC and WAV, via the fixed-point Helix decoders. FLAC and Opus
-decoders exist in AudioTools but do not fit the heap budget next to Wi-Fi, BLE
-and the web server. The Classic half of the controller is released before BLE
-starts, which is the mirror image of what the A2DP sink does in the Bluetooth
-modes.
-
-Two honest limits. There is no skip or seek: a stream URL is not a playlist, and
-the dashboard disables those buttons rather than pretending. And a DLNA control
-point that sends a format outside those three gets an error rather than silence.
-
 #### DFPlayer + Wi-Fi
 
 The only mode where nothing arrives over the air. A DFPlayer Mini holds the card,
@@ -653,7 +578,8 @@ decodes the file and produces its own analog output; the ESP32 does not touch th
 audio at all. What it does is *control* — a 9600 baud serial link and six GPIOs —
 and report what it learns.
 
-That is also why this is a Wi-Fi mode rather than a third radio arrangement.
+That is also why this is a Wi-Fi mode rather than a radio arrangement of its
+own.
 Nothing about it wants the antenna, so Wi-Fi gets all of it: station when a
 network is saved, the setup hotspot when not, and the dashboard either way,
 behaving exactly as it does in Wi-Fi only mode. Both halves of the Bluetooth
@@ -751,24 +677,21 @@ dead module.
 #### Switching
 
 **From the speaker:** hold BOOT for three seconds. The panel offers the next
-mode in the cycle — Wi-Fi → Bluetooth → Wi-Fi + BT → Wi-Fi + BLE → DFPlayer →
-Wi-Fi — so
-let go and press BOOT once within eight seconds to confirm. Ignore it and it
+mode in the cycle — Wi-Fi → Bluetooth → DFPlayer → Wi-Fi — so let go and press
+BOOT once within eight seconds to confirm. Ignore it and it
 goes away; keep holding and you are into the factory-reset countdown instead. On
 a board with no display, a three-second hold released before six seconds
 switches immediately.
 
-**From the dashboard:** **Overview → Radio mode**, which lists all five and
+**From the dashboard:** **Overview → Radio mode**, which lists all three and
 marks the current one. Switching to *Bluetooth only* takes Wi-Fi and the page
-with it, so it asks first; the others come back in a few seconds. *Wi-Fi +
-Bluetooth* stays greyed out until a network has been saved, and *DFPlayer +
+with it, so it asks first; the others come back in a few seconds. *DFPlayer +
 Wi-Fi* is greyed out only in a build compiled with `-DDFPLAYER_ENABLED=0`.
 
-**From the console:** `mode` steps to the next one; `wifi`, `bt`, `both`, `net`
-and `sd` go somewhere specific; `radio` prints where you are and what each half
-is doing.
+**From the console:** `mode` steps to the next one; `wifi`, `bt` and `sd` go
+somewhere specific; `radio` prints where you are and what each half is doing.
 
-Every switch goes through a restart. Both stacks own controller state, DMA
+Every switch goes through a restart. Each stack owns controller state, DMA
 channels and tasks, and ESP32-A2DP's `end()` also forgets the last paired
 device — a reboot costs about a second and guarantees each mode starts from a
 clean radio.
@@ -989,19 +912,18 @@ before and after, which is the number to trust:
 The memory does not come back until a reset, which costs nothing here: switching
 modes already persists the choice and reboots.
 
-None of this happens in **Wi-Fi + Bluetooth** mode, where both stacks have to be
-resident: the release is skipped and only the BLE half goes back, freed by
-ESP32-A2DP's own `start()`. That mode therefore runs with materially less heap
-than Wi-Fi only, and this handshake is the first thing to feel it. If a GitHub
-check or install fails there, do it from Wi-Fi only mode and switch back.
+A classic ESP32 is Bluetooth 4.2: no BLE 5, no isochronous channels, and LE
+Audio needs 5.2 silicon. BLE could therefore only ever have been a control
+channel here, and the dashboard and the setup hotspot already are one — so the
+controller is released outright in every mode that does not run the A2DP sink,
+and the ~55 KB it was sitting on goes to Wi-Fi, the web server and the updater
+instead.
 
-**Wi-Fi + BLE** splits the difference: it releases the Classic half only (in
-`ble_control_begin()`, before the controller initialises) and keeps BLE, then
-spends part of what it saved on the decoders and the DLNA renderer. The boot log
-prints the heap either side of both the BLE start and the network player start,
-which between them are the numbers to watch in that mode. The updater also refuses in words
-now, rather than as `-1`, when the heap or the largest free block is too small
-before it starts.
+Two smaller things fell out of the same heap accounting. I2S is opened before the radio
+starts, because its DMA descriptors have to come from internal DMA-capable RAM
+and that is the one pool nothing else can be traded for. And the updater refuses
+in words now, rather than as `-1`, when the heap or the largest free block is
+too small before it starts.
 
 The updater task's stack is 16 KB, not 20: a task stack comes out of the same
 heap the handshake then has to allocate from, so the margin is not free.
@@ -1150,7 +1072,7 @@ peak, and the threshold has a name (`ACTIVE_ABOVE_FLOOR_DB`) now that it is
 capable of being false.
 
 What is left is honest, because it is looking at the samples, and every source
-that passes through this chip feeds it — A2DP, the network player, the chimes.
+that passes through this chip feeds it — A2DP and the chimes.
 The timers read its last-heard timestamp rather than its instantaneous flag, so a
 fade or the gap between two tracks does not read as *stopped*
 (`UI_AUDIO_GRACE_MS`, four seconds). DFPlayer audio never reaches it at all, so
@@ -1212,12 +1134,8 @@ radio                  current mode and radio state
 mode                   next radio mode, reboots
 bt                     switch to Bluetooth only mode, reboots
 wifi                   switch to Wi-Fi only mode, reboots
-both                   switch to Wi-Fi + Bluetooth mode, reboots
-net                    switch to Wi-Fi + BLE mode, reboots
 sd                     switch to DFPlayer mode, reboots
 pair                   force Bluetooth discoverable again
-play <url>             play a network stream (Wi-Fi + BLE mode)
-stop                   stop network playback
 df                     DFPlayer status in one line
 df play [n]            resume, or play track n
 df pause | stop | next | prev
@@ -1419,8 +1337,8 @@ nothing to configure and no build flag involved.
 
 Bluetooth only mode has no Wi-Fi at all, so the clock there runs on what the
 last sync left behind in NVS and the RTC, and it is right again the next time
-you switch back. Both Wi-Fi + Bluetooth and Wi-Fi + BLE keep SNTP running like
-Wi-Fi only mode does, so a speaker left in either never drifts.
+you switch back. DFPlayer mode keeps SNTP running exactly as Wi-Fi only mode
+does, so a speaker left in it never drifts.
 
 ### Time zone
 
@@ -2147,7 +2065,7 @@ group — most of the pass criteria below are one line of that report.
 - [ ] Pair a phone, play. Connect chime, then music.
 - [ ] **Rapid start/stop**: play, pause, skip, seek, ten times quickly. No
       crackle, no dropout, no reset.
-- [ ] **Rapid mode switching**: hold BOOT → confirm → repeat through all five
+- [ ] **Rapid mode switching**: hold BOOT → confirm → repeat through all three
       modes. Each comes up clean; `diag` → heap min not falling boot on boot.
 - [ ] **Long playback**: at least two hours continuous. Then `diag` → heap free
       and largest block should be within a few hundred bytes of where they were
@@ -2224,10 +2142,8 @@ group — most of the pass criteria below are one line of that report.
 
 ### 8. Radios
 
-- [ ] Wi-Fi + Bluetooth mode with both active: audio while the dashboard is
-      open. This is the mode most likely to brown out a marginal supply.
-- [ ] Wi-Fi + BLE: cast over DLNA, and provision Wi-Fi over the BLE
-      characteristic.
+- [ ] Bluetooth only mode: pair and play with Wi-Fi never initialised.
+- [ ] DFPlayer + Wi-Fi: audio from the card while the dashboard is open.
 - [ ] Setup access point: wrong credentials saved → AP appears after the grace
       period → new credentials fix it.
 
@@ -2262,8 +2178,8 @@ group — most of the pass criteria below are one line of that report.
   v1.2.5 via `I2SStream` — the output path the library documents. AudioTools is
   a hard dependency of current ESP32-A2DP, not an optional extra.
 - The display uses [U8g2](https://github.com/olikraus/u8g2) in full-buffer mode
-  (512 bytes for 128×32). It is the only one of the three libraries that comes
-  from the PlatformIO registry; the other two point at tagged GitHub commits.
+  (512 bytes for 128×32). It is the one library here that comes from the
+  PlatformIO registry; the pschatzmann ones point at tagged GitHub commits.
 - The platform is the [pioarduino](https://github.com/pioarduino/platform-espressif32)
   build of Arduino core 3.3.11 / IDF 5.5.5. The official `platformio/espressif32`
   platform never shipped a core 3.x release, and ESP32-A2DP ≥ 1.8.10 uses IDF 5

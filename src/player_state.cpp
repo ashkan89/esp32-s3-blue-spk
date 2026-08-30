@@ -184,10 +184,11 @@ void ps_set_bt_active(bool active) {
   end_write();
 }
 
-// The network twin of ps_set_connection(). Same clearing rules on the way down:
-// everything on the screen came from whoever just went away, and leaving a dead
-// track title up is worse than showing nothing.
-void ps_set_net_connection(bool connected, const char *who) {
+// The local-source twin of ps_set_connection(). Same clearing rules on the way
+// down: everything on the screen came from whoever just went away, and leaving
+// a dead track title up is worse than showing nothing.
+void ps_set_source_connection(bool connected, const char *who) {
+
   begin_write();
   g_info.connected = connected;
   if (connected) {

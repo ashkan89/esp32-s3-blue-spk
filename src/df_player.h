@@ -18,18 +18,17 @@
  * That is also why DFPlayer mode is a Wi-Fi mode rather than a third radio
  * arrangement. Nothing about it needs the antenna, so Wi-Fi gets all of it:
  * station when a network is saved, the setup access point when not, and the
- * dashboard either way. Bluetooth Classic and BLE are both left uninitialised
- * and their RAM is handed back, exactly as in Wi-Fi only mode.
+ * dashboard either way. Bluetooth is left uninitialised and the whole
+ * controller's RAM is handed back, exactly as in Wi-Fi only mode.
  *
  * Threading. The YX5200 is a request/response device on a slow link with a
- * minimum gap between frames, and commands arrive from three tasks (web server,
- * Arduino loop, and the DLNA/BLE paths do not exist in this mode but the console
- * does). Nothing touches the UART directly: every command goes through a queue
- * and one task owns the port, which is also where the reply parser and the
- * status poller live. Status travels back under a mutex, and df_player_loop() --
- * on the Arduino loop task -- is the single writer that publishes it into
- * player_state.h, keeping that seqlock's one-writer rule intact. This is the
- * same shape net_audio.h uses, for the same reasons.
+ * minimum gap between frames, and commands arrive from two places: the web
+ * server and the Arduino loop, the latter carrying the serial console. Nothing
+ * touches the UART directly -- every command goes through a queue and one task
+ * owns the port, which is also where the reply parser and the status poller
+ * live. Status travels back under a mutex, and df_player_loop() -- on the
+ * Arduino loop task -- is the single writer that publishes it into
+ * player_state.h, keeping that seqlock's one-writer rule intact.
  *
  * What "full control" means here, concretely. Everything the module's serial
  * protocol exposes (transport, track and folder selection, volume, EQ, the four

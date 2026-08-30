@@ -134,7 +134,6 @@ enum UiSystemStatus : uint8_t {
 void ui_show_system_status(UiSystemStatus kind, const char *title,
                            const char *detail, int16_t progress,
                            uint32_t duration_ms = 0);
-void ui_clear_system_status();
 
 /// Serial console: "next", "screen <n>", "auto", "bright <0-255>", "ui".
 /// Returns false if the line was not one of those.

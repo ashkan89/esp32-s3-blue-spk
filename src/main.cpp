@@ -46,9 +46,9 @@
  * else behaves as it did before.
  *
  * Two blocks of optional hardware live in hw_config.h rather than here, because
- * they are pure wiring and the list is long: a DFPlayer Mini (a fifth radio
- * mode, in which the audio comes off a microSD card or a USB stick instead of
- * over the air) and a battery gauge. Both are absent-tolerant in the same way
+ * they are pure wiring and the list is long: a DFPlayer Mini (a radio mode of
+ * its own, in which the audio comes off a microSD card or a USB stick instead
+ * of over the air) and a battery gauge. Both are absent-tolerant in the same way
  * the display is -- no module on the UART reports itself offline, no divider on
  * the ADC reports no battery, and nothing else changes.
  *
@@ -68,13 +68,11 @@
 #include "app_config.h"
 #include "audio_probe.h"
 #include "battery.h"
-#include "ble_control.h"
 #include "df_player.h"
 #include "diagnostics.h"
 #include "hw_config.h"
 #include "leds.h"
 #include "management.h"
-#include "net_audio.h"
 #include "player_state.h"
 #include "power.h"
 #include "soft_clock.h"
@@ -113,10 +111,6 @@ static const uint8_t BT_COD_MINOR_LOUDSPEAKER = 0x05;
 
 static const int SAMPLE_RATE = 44100;  // A2DP/SBC is 44.1 kHz in practice
 
-// Where the DLNA renderer serves its description and SOAP endpoints in Wi-Fi +
-// BLE mode. Deliberately not 80: the dashboard is already there, and control
-// points are perfectly happy with any port as long as SSDP advertises it.
-static const uint16_t NET_AUDIO_HTTP_PORT = 9000;
 
 // Starting point for the software volume, 0..127. The phone overrides it over
 // AVRCP as soon as it connects. Kept at maximum: with the linear curve below,
@@ -202,12 +196,8 @@ static void print_help() {
       "  mode                      next radio mode, reboots\n"
       "  bt                        switch to Bluetooth only mode, reboots\n"
       "  wifi                      switch to Wi-Fi only mode, reboots\n"
-      "  both                      switch to Wi-Fi + Bluetooth mode, reboots\n"
-      "  net                       switch to Wi-Fi + BLE mode, reboots\n"
       "  sd                        switch to DFPlayer mode, reboots\n"
       "  pair                      force Bluetooth discoverable again\n"
-      "  play <url>                play a network stream (Wi-Fi + BLE)\n"
-      "  stop                      stop network playback\n"
       "  df                        DFPlayer status ('df' alone lists its\n"
       "                            own commands: play, folder, source, eq,\n"
       "                            loop, io1, key1, led, reset, ...)\n"
@@ -394,10 +384,6 @@ static bool bt_started;
 static uint32_t bt_started_at;
 static bool bt_identity_applied;
 
-// The Wi-Fi + BLE equivalents: see service_network_audio(). BLE comes up as soon
-// as the mode is known, the network player only once there is an IP address.
-static bool net_started;
-static bool ble_started;
 
 // DFPlayer mode: see service_dfplayer(). One attempt, at the first loop, so the
 // serial console is up to log into and the network bring-up is not held behind
@@ -597,17 +583,6 @@ static void update_status_led() {
       else if (d.source == DF_SRC_USB && !d.usbPresent) state = LED_NO_MEDIA;
       else if (d.state == DF_PAUSED) state = LED_BT_CONNECTED;
       else state = LED_IDLE;
-    } else if (radio_mode_has_ble(management_radio_mode())) {
-      // Network audio reuses the Bluetooth patterns rather than inventing two
-      // more: "solid" still means audio is flowing and a lone flash still means
-      // up and waiting. What is on the other end of the link is not something
-      // one LED can usefully distinguish.
-      const NetAudioState net = net_audio_state();
-      if (!net_started) state = LED_BOOT;
-      else if (net_audio_active()) state = LED_BT_STREAMING;
-      else if (net == NET_AUDIO_ERROR) state = LED_FAULT;
-      else if (net != NET_AUDIO_IDLE) state = LED_BT_CONNECTED;
-      else state = LED_IDLE;
     } else if (!bt_started) {
       state = LED_BOOT;
     } else if (a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) {
@@ -624,7 +599,6 @@ static void update_status_led() {
 
 static bool dac_busy() {
   if (a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) return true;
-  if (net_audio_active()) return true;
   /*
    * The DFPlayer does not share the I2S channel -- its audio is analog and joins
    * further downstream -- so a melody here cannot interleave samples with it the
@@ -650,10 +624,7 @@ static bool radio_command(const char *line) {
         Serial.printf(" %s rssi %d", WiFi.localIP().toString().c_str(),
                       (int)WiFi.RSSI());
       }
-      // Combo mode never raises the setup AP, so reporting it there is noise.
-      if (mode != RADIO_MODE_COMBO) {
-        Serial.printf(" | ap %s", management_ap_running() ? "up" : "down");
-      }
+      Serial.printf(" | ap %s", management_ap_running() ? "up" : "down");
       if (management_ap_running()) {
         Serial.printf(" %s ch %d clients %u", WiFi.softAPIP().toString().c_str(),
                       WiFi.channel(), WiFi.softAPgetStationNum());
@@ -664,24 +635,6 @@ static bool radio_command(const char *line) {
                                 : a2dp_sink.is_connected() ? "connected"
                                 : bt_identity_applied      ? "discoverable"
                                                            : "starting");
-    }
-    if (radio_mode_has_ble(mode)) {
-      Serial.printf(" | ble %s", !ble_control_running() ? "off" : "advertising");
-      if (ble_control_clients()) {
-        Serial.printf(" %u client%s", ble_control_clients(),
-                      ble_control_clients() == 1 ? "" : "s");
-      }
-      NetAudioStatus n;
-      net_audio_snapshot(&n);
-      Serial.printf(" | dlna %s", n.renderer_up ? "up" : "down");
-      Serial.printf(" | audio %s",
-                    !net_started                  ? "waiting for wifi"
-                    : n.state == NET_AUDIO_ERROR  ? n.error
-                    : net_audio_active()          ? "playing"
-                    : n.state == NET_AUDIO_PAUSED ? "paused"
-                    : n.url[0]                    ? "buffering"
-                                                  : "idle");
-      if (n.url[0]) Serial.printf(" | url %s", n.url);
     }
     if (radio_mode_has_dfplayer(mode)) {
       DfStatus d;
@@ -724,50 +677,17 @@ static bool radio_command(const char *line) {
     management_switch_mode(RADIO_MODE_MANAGEMENT);  // does not return
     return true;
   }
-  if (strcmp(line, "both") == 0 || strcmp(line, "combo") == 0) {
-    management_switch_mode(RADIO_MODE_COMBO);  // does not return
-    return true;
-  }
-  if (strcmp(line, "net") == 0 || strcmp(line, "ble") == 0) {
-    management_switch_mode(RADIO_MODE_NET);  // does not return
-    return true;
-  }
   if (strcmp(line, "sd") == 0 || strcmp(line, "dfplayer") == 0) {
     management_switch_mode(RADIO_MODE_DFPLAYER);  // does not return
     return true;
   }
-  if (strncmp(line, "play ", 5) == 0) {
-    if (!radio_mode_has_ble(management_radio_mode())) {
-      Serial.println("[net] not in Wi-Fi + BLE mode; type 'net' to switch");
-    } else if (!net_audio_running()) {
-      Serial.println("[net] the player is still waiting for a Wi-Fi address");
-    } else if (!net_audio_play_url(line + 5, "console")) {
-      Serial.println("[net] that URL is empty or too long");
-    } else {
-      Serial.printf("[net] playing %s\n", line + 5);
-    }
-    return true;
-  }
-  if (strcmp(line, "stop") == 0) {
-    if (!net_audio_running()) {
-      Serial.println("[net] the network player is not running in this mode");
-    } else {
-      net_audio_stop();
-      Serial.println("[net] stopped");
-    }
-    return true;
-  }
   if (strcmp(line, "pair") == 0) {
-    if (radio_mode_has_ble(management_radio_mode())) {
-      Serial.println("[bt] Wi-Fi + BLE mode has no A2DP sink to pair with. "
-                     "Cast to it over DLNA, or type 'bt' / 'both' for a "
-                     "Bluetooth mode.");
-    } else if (radio_mode_has_dfplayer(management_radio_mode())) {
+    if (radio_mode_has_dfplayer(management_radio_mode())) {
       Serial.println("[bt] DFPlayer mode has no Bluetooth at all -- the whole "
-                     "controller is released at boot. Type 'bt' or 'both' for a "
-                     "Bluetooth mode.");
+                     "controller is released at boot. Type 'bt' for Bluetooth "
+                     "mode.");
     } else if (!radio_mode_has_a2dp(management_radio_mode())) {
-      Serial.println("[bt] Wi-Fi mode; type 'bt' or 'both' to start Bluetooth");
+      Serial.println("[bt] Wi-Fi mode; type 'bt' to start Bluetooth");
     } else if (!bt_started) {
       Serial.println("[bt] still starting");
     } else if (a2dp_sink.is_connected()) {
@@ -827,12 +747,12 @@ static void log_state_changes() {
 
   if (s.track_seq != seen_track_seq) {
     seen_track_seq = s.track_seq;
-    // The tag says where the metadata came from: AVRCP off a phone, or ICY /
-    // DIDL off the network. Worth the two characters when the question being
-    // asked of the log is usually "is the source sending me anything at all".
-    const char *tag = s.source == PS_SRC_NETWORK    ? "net"
-                      : s.source == PS_SRC_DFPLAYER ? "df"
-                                                    : "avrc";
+    // The tag says where the metadata came from: AVRCP off a phone, or the
+    // module's own folder listing. Worth the two characters when the question
+    // being asked of the log is usually "is the source sending me anything at
+    // all".
+    const char *tag = s.source == PS_SRC_DFPLAYER ? "df" : "avrc";
+
     if (s.title[0]) {
       if (s.artist[0]) {
         Serial.printf("[%s] %s - %s\n", tag, s.artist, s.title);
@@ -944,14 +864,11 @@ static void service_bluetooth_identity() {
   }
 }
 
-/// Brings the A2DP sink up, in the two modes that have Bluetooth in them.
+/// Brings the A2DP sink up, in the one mode that has Bluetooth in it.
 ///
-/// In Wi-Fi mode the sink is never started at all -- not started and quiet, but
-/// never initialised, so the antenna and the controller's heap stay entirely
-/// with Wi-Fi. In Bluetooth mode it is the other way round. In Wi-Fi + BT both
-/// run and the coexistence scheduler shares the radio between them; nothing
-/// here changes for that, because start() is the same call either way.
-/// See the note in management.h.
+/// In every other mode the sink is never started at all -- not started and
+/// quiet, but never initialised, so the antenna and the controller's heap stay
+/// entirely with Wi-Fi. See the note in management.h.
 static void service_bluetooth_start() {
   if (bt_started) return;
   if (!radio_mode_has_a2dp(management_radio_mode())) return;
@@ -963,53 +880,14 @@ static void service_bluetooth_start() {
   bt_started_at = millis();
   management_set_bt_active(true);
   ps_set_bt_active(true);
-  // The heap either side of the bring-up, because in Wi-Fi + BT mode both
-  // stacks are resident and this is the number that decides whether the OTA
-  // TLS handshake later has room. Cheap to print once, tedious to guess at.
+  // The heap either side of the bring-up, because this is the number that
+  // decides whether the OTA TLS handshake later has room. Cheap to print once,
+  // tedious to guess at.
   Serial.printf("Discoverable as \"%s\" - pair from your phone. (heap %u -> %u)\n",
                 DEVICE_NAME, (unsigned)heap_before,
                 (unsigned)ESP.getFreeHeap());
   // Chime once the radio is up: the speaker is ready to be paired.
   pending_melody = MELODY_ID_NOTIFY;
-}
-
-/*
- * Brings up Wi-Fi + BLE mode, in two steps because they are ready at different
- * times.
- *
- * BLE is normally already up by the time this runs: management_begin() starts
- * it before Wi-Fi, because the dual-mode Bluedroid host needs more contiguous
- * heap than is left once Wi-Fi and the dashboard have taken theirs (see the
- * note there). The call below is the idempotent second chance -- it returns
- * immediately when the service is already advertising, and covers the mode
- * being entered by a path that did not go through management_begin().
- *
- * Starting it early is the point either way: if the saved network is wrong, BLE
- * provisioning is the way back in, and it has to be there before anyone gives
- * up waiting for the dashboard.
- *
- * The network player needs an IP address. The DLNA renderer bakes the local
- * address into the description document it advertises, so starting it before
- * DHCP has answered would publish a URL pointing at 0.0.0.0 and no control
- * point would ever reach us.
- */
-static void service_network_audio() {
-  if (!radio_mode_has_ble(management_radio_mode())) return;
-
-  if (!ble_started) {
-    ble_started = true;  // set first: one attempt, success or not
-    ble_control_begin(DEVICE_NAME);
-  }
-
-  if (!net_started && WiFi.status() == WL_CONNECTED) {
-    net_started = true;
-    if (net_audio_begin(DEVICE_NAME, NET_AUDIO_HTTP_PORT)) {
-      ps_set_net_connection(false, nullptr);
-      // Same chime the Bluetooth modes play when the radio is up: the speaker
-      // is ready to be sent something.
-      pending_melody = MELODY_ID_NOTIFY;
-    }
-  }
 }
 
 /*
@@ -1098,6 +976,19 @@ static void service_mode_switch() {
  * Bluetooth together roughly doubles the peak current, and a thin USB cable or
  * a marginal supply that carried one radio will not carry two.
  */
+/*
+ * One line of heap accounting per bring-up stage.
+ *
+ * Every stage spends from the same pot, and when something later does not fit
+ * the question is always "spent on what" -- which a single figure at the end
+ * cannot answer. Both numbers matter: a heap that is 40 KB free in 4 KB pieces
+ * will refuse an 8 KB allocation while looking perfectly healthy.
+ */
+static void heap_mark(const char *stage) {
+  Serial.printf("[heap] %-18s %6u free, %6u largest\n", stage,
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
+}
+
 static const char *reset_reason_text(esp_reset_reason_t reason) {
   switch (reason) {
     case ESP_RST_POWERON: return "power on";
@@ -1135,6 +1026,7 @@ void setup() {
   // on whatever the pixels powered up holding for the two seconds the radio
   // takes. Its task starts later, once the stored settings have been applied.
   const bool have_leds = leds_begin();
+  heap_mark("leds");
 
   // Display first: it brings up I2C, which the DS3231 path in soft_clock also
   // uses, and it puts a splash on the panel during the seconds the radio takes.
@@ -1142,26 +1034,45 @@ void setup() {
   // ui_begin() only claims the button when it found a panel; without one the
   // headless reset poll still needs the pull-up.
   if (!have_display && PIN_UI_BUTTON >= 0) pinMode(PIN_UI_BUTTON, INPUT_PULLUP);
+  heap_mark("display");
 
   // Before a2dp_sink.start(), because the optional NTP sync needs the radio to
   // itself -- Wi-Fi and Bluetooth Classic share one antenna, and overlapping
   // them is how you get dropouts.
   soft_clock_begin();
+  heap_mark("clock");
+
+  /*
+   * I2S before either radio, and this ordering is load-bearing.
+   *
+   * The DMA descriptors and their buffers have to come out of internal
+   * DMA-capable RAM, which is the one pool here that nothing can be traded for.
+   * Started after the radio there can be eleven kilobytes left and a largest
+   * block of ten, and i2s_alloc_dma_desc() simply fails -- silently as far as
+   * the speaker is concerned, because every write after that goes to a channel
+   * that never opened. Started here it is asking for three kilobytes out of a
+   * hundred and forty, which cannot fail. The radio then fits around it rather
+   * than the other way about.
+   *
+   * Nothing between here and management_begin() touched I2S, so this is a move,
+   * not a duplication.
+   */
+  auto cfg = make_i2s_config();
+  if (!i2s.begin(cfg)) {
+    Serial.println("[i2s] the output channel would not open; there will be no "
+                   "sound. This is almost always a DMA allocation that failed.");
+  }
+  heap_mark("i2s");
 
   // Wi-Fi is brought up before Bluetooth starts so the shared radio is never
   // reconfigured in the middle of an A2DP stream. Connection is asynchronous;
   // an unreachable network falls back to the setup AP after 15 seconds.
   management_begin(a2dp_sink);
   // The number that decides whether the rest of this boot can succeed: what is
-  // left once Wi-Fi has taken its share, and the budget the audio stack is
-  // about to be asked to fit into. In the Bluetooth modes the sink has not
-  // taken its share yet; in Wi-Fi + BLE the Bluedroid host already has, because
-  // it cannot wait until after Wi-Fi -- see the note in management_begin().
+  // left once Wi-Fi has taken its share. In Bluetooth mode the sink has not
+  // taken its share yet.
   Serial.printf("[boot] after network start: heap %u free, %u largest block\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
-
-  auto cfg = make_i2s_config();
-  i2s.begin(cfg);
 
   // Must be installed before set_volume() below, which is what first enables it.
   a2dp_sink.set_volume_control(&volume_control);
@@ -1208,12 +1119,9 @@ void setup() {
   // that receives over the network. Fixed here and never changed again;
   // switching modes reboots.
   ps_set_source(radio_mode_has_a2dp(management_radio_mode())     ? PS_SRC_BLUETOOTH
-                : radio_mode_has_ble(management_radio_mode())      ? PS_SRC_NETWORK
                 : radio_mode_has_dfplayer(management_radio_mode()) ? PS_SRC_DFPLAYER
                                                                   : PS_SRC_NONE);
-  // BLE can come up now; the network player waits for an address (see there).
-  service_network_audio();
-  // The DFPlayer needs nothing from the network, so it starts here too.
+  // The DFPlayer needs nothing from the network, so it starts here.
   service_dfplayer();
 
   /*
@@ -1269,7 +1177,6 @@ void loop() {
   service_mode_switch();
   service_bluetooth_start();
   service_bluetooth_identity();
-  service_network_audio();
   service_dfplayer();
   service_melody();
   // Before update_status_led(): the LED asks whether the cell is critical, and a
@@ -1284,9 +1191,8 @@ void loop() {
   log_state_changes();
   soft_clock_tick();
   management_loop();
-  net_audio_loop();
-  ble_control_loop();
   df_player_loop();
+
   poll_console();
   delay(10);
 }

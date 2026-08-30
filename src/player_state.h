@@ -17,10 +17,7 @@
  * task only. Which task that is depends on the radio mode, and the modes are
  * mutually exclusive so the two never overlap:
  *
- *   Bluetooth / Wi-Fi + BT   the Bluetooth task, in line with the audio path.
- *   Wi-Fi + BLE              the Arduino loop task, via net_audio_loop(). The
- *                            decoder and DLNA tasks only set plain flags in
- *                            net_audio.cpp; loop() is what publishes them here.
+ *   Bluetooth                the Bluetooth task, in line with the audio path.
  *   DFPlayer                 the Arduino loop task, via df_player_loop(). The
  *                            driver task owns the serial link and keeps its own
  *                            status behind a mutex; loop() copies it in here.
@@ -37,12 +34,11 @@ static const size_t PS_TEXT_MAX = 40;
 static const size_t PS_NAME_MAX = 32;
 
 /// Where the audio being played is arriving from. The screens word themselves
-/// differently for each: there is no "pair your phone" in a network mode, and
-/// no "open the dashboard" in a Bluetooth one.
+/// differently for each: there is no "pair your phone" in DFPlayer mode, and no
+/// "insert a card" in a Bluetooth one.
 enum PsSource : uint8_t {
   PS_SRC_NONE = 0,   ///< no audio path is running at all (Wi-Fi only mode)
   PS_SRC_BLUETOOTH,  ///< A2DP sink
-  PS_SRC_NETWORK,    ///< DLNA renderer or a URL the dashboard handed us
   PS_SRC_DFPLAYER,   ///< a DFPlayer Mini playing its own card or USB stick
 };
 
@@ -123,14 +119,16 @@ void ps_set_connection(bool connected, const esp_bd_addr_t addr);
 /// Whether the Bluetooth stack is up at all. Written from setup()/loop().
 void ps_set_bt_active(bool active);
 
-/// The network equivalent of ps_set_connection(): something is sending us audio
-/// and here is what to call it. `who` may be nullptr to leave the name alone.
-/// There is no address to record, which is the only reason this is separate.
-void ps_set_net_connection(bool connected, const char *who);
+/// The local-source equivalent of ps_set_connection(): a source is feeding us
+/// audio and here is what to call it. `who` may be nullptr to leave the name
+/// alone. There is no address to record, which is the only reason this is
+/// separate.
+void ps_set_source_connection(bool connected, const char *who);
 
 /// Sets the track text directly, for sources that hand over plain strings
-/// rather than AVRCP attribute ids (ICY stream titles, DLNA DIDL metadata).
-/// Any argument may be nullptr to leave that field untouched.
+/// rather than AVRCP attribute ids. Any argument may be nullptr to leave that
+/// field untouched.
+
 void ps_set_track_text(const char *title, const char *artist, const char *album);
 void ps_set_peer_name(const char *name);
 void ps_set_avrc(bool up);

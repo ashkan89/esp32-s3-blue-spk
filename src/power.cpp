@@ -59,11 +59,6 @@ constexpr uint32_t SLEEP_AUDIO_GRACE_MS = UI_AUDIO_GRACE_MS;
 /// enough to read, short enough not to feel like a fault.
 constexpr uint32_t SLEEP_NOTICE_MS = 2500;
 
-/// The wake button has to be let go of first: deep sleep entered with EXT0's
-/// level already asserted wakes again immediately, which reads as a speaker
-/// that refuses to sleep.
-constexpr uint32_t SLEEP_RELEASE_WAIT_MS = 8000;
-
 /// Transmit power while saving. -- 11 dBm rather than the default 19.5 keeps a
 /// dashboard usable across a room and costs roughly a third of the radio's
 /// transmit current. Anything lower starts dropping the far end of a house.
