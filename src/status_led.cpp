@@ -23,8 +23,25 @@ constexpr uint32_t BLIP_MS = 55;
 uint8_t ledPin = 0xFF;
 bool ledActiveHigh = true;
 volatile uint8_t baseState = LED_BOOT;
-volatile uint8_t blipSlots;  // remaining half-cycles of the attention blink
 volatile bool muted;
+
+/*
+ * The blip counter, and the one thing here that needs a lock.
+ *
+ * Everything else in this file is a single-byte store from one side and a load
+ * from the other, which on this chip is atomic in the only sense that matters:
+ * a reader sees the old value or the new one. `blipSlots` is different because
+ * both sides read-modify-write it -- status_led_blip() raises it from the
+ * Bluetooth and Wi-Fi callback tasks, status_led_tick() decrements it from the
+ * Arduino loop -- and a decrement that lands between the other side's load and
+ * store is simply lost. The visible cost is small (a blip one flash short, or
+ * one that never ends because the decrement to zero was the one dropped) but
+ * the second of those leaves the indicator stuck, and the fix is four
+ * instructions inside a spinlock rather than an argument about how unlikely it
+ * is.
+ */
+portMUX_TYPE blip_mux = portMUX_INITIALIZER_UNLOCKED;
+uint8_t blipSlots;  // remaining half-cycles of the attention blink
 
 uint32_t lastSlotAt;
 uint8_t slot;
@@ -60,7 +77,9 @@ void status_led_blip(uint8_t pulses) {
   if (pulses > 6) pulses = 6;
   // Two half-cycles per pulse: on, off.
   const uint8_t slots = (uint8_t)(pulses * 2);
+  portENTER_CRITICAL(&blip_mux);
   if (slots > blipSlots) blipSlots = slots;
+  portEXIT_CRITICAL(&blip_mux);
 }
 
 void status_led_mute(bool on) {
@@ -82,11 +101,18 @@ void status_led_tick() {
 
   const uint32_t now = millis();
 
-  if (blipSlots) {
-    if (now - lastSlotAt < BLIP_MS) return;
+  // Read and decrement in one critical section, so a blip raised from a radio
+  // callback between the two cannot be overwritten by the store.
+  portENTER_CRITICAL(&blip_mux);
+  const uint8_t pending = blipSlots;
+  const bool due = pending != 0 && (now - lastSlotAt) >= BLIP_MS;
+  if (due) blipSlots = (uint8_t)(pending - 1);
+  portEXIT_CRITICAL(&blip_mux);
+
+  if (pending) {
+    if (!due) return;
     lastSlotAt = now;
-    const uint8_t left = (uint8_t)(blipSlots - 1);
-    blipSlots = left;
+    const uint8_t left = (uint8_t)(pending - 1);
     // An odd count left means "on", so a blip always ends dark and the resting
     // pattern picks up from a known state.
     drive((left & 1) != 0);

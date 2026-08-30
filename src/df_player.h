@@ -144,6 +144,24 @@ struct DfStatus {
 
   DfLedMode ledMode;
   bool ledOn;
+
+  /*
+   * Link health, for the `diag` console command and the dashboard.
+   *
+   * Four counters, all free: they are increments inside code paths that were
+   * already running. They exist because "the DFPlayer is being unreliable" is
+   * otherwise an unfalsifiable complaint -- these separate the three things it
+   * can mean. A clone that answers everything with 0x40/0x01 shows up in
+   * `errors`; a swapped or noisy TX/RX pair shows up as `framesBad` climbing
+   * with `framesGood` flat; a module that has genuinely gone away shows up in
+   * `offlineEvents`. A healthy link at the default poll rate adds about one to
+   * `framesGood` per second and nothing at all to the other three.
+   */
+  uint32_t framesSent;     ///< protocol frames written to the module
+  uint32_t framesGood;     ///< well-formed frames received from it
+  uint32_t framesBad;      ///< ten-byte windows rejected by frameValid()
+  uint32_t errors;         ///< 0x40 error notifications it sent us
+  uint16_t offlineEvents;  ///< times the online timeout expired this boot
 };
 
 #if DFPLAYER_ENABLED

@@ -60,7 +60,19 @@ static void copy_sanitised(char *dst, size_t cap, const char *src) {
                (p[2] & 0xC0) == 0x80) {
       cp = 0xFFFD;  // three-byte: always beyond Latin-1
       p += 3;
-    } else if ((c & 0xF8) == 0xF0) {
+    } else if ((c & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
+               (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+      /*
+       * All three continuation bytes are checked, and that is not pedantry.
+       * The lead byte alone used to be enough to advance by four, so a string
+       * ending in a truncated sequence -- "\xF0" then the terminator, which is
+       * exactly what a title cut to a fixed field length produces -- stepped
+       * the cursor past the NUL and the loop went on reading whatever followed
+       * the buffer until it happened to find a zero. The write side was always
+       * bounded, so nothing overflowed; the read side was not. A NUL fails the
+       * 0xC0 test, so the checks terminate the sequence safely and the byte is
+       * handled by the Latin-1 fallback below.
+       */
       cp = 0xFFFD;
       p += 4;
     } else {

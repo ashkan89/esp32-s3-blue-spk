@@ -506,11 +506,15 @@ static AudioVis published;
 static volatile uint32_t publish_seq;
 
 static void publish() {
-  publish_seq++;                  // odd: a write is in progress
+  // Read-modify-write spelled out rather than ++: the increment's ordering is
+  // the whole mechanism here, and ++ on a volatile leaves that unspecified (and
+  // is deprecated in C++20 for exactly that reason). player_state.cpp writes
+  // its seqlock the same way.
+  publish_seq = publish_seq + 1;  // odd: a write is in progress
   __sync_synchronize();
   memcpy(&published, &vis, sizeof(published));
   __sync_synchronize();
-  publish_seq++;                  // even: settled
+  publish_seq = publish_seq + 1;  // even: settled
 }
 
 void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
@@ -525,7 +529,16 @@ void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
     xSemaphoreGive(analyse_gate);
   }
 
-  for (;;) {
+  /*
+   * Bounded, like ps_snapshot(). The window a writer holds the sequence open
+   * for is one memcpy of an AudioVis, so a reader that has lost eight times
+   * running is not racing a publisher any more -- it is spinning against
+   * something that stopped mid-write, and at that point spinning forever on a
+   * render task pinned to core 0 would starve the idle task and trip the task
+   * watchdog. A frame with a seam in it is invisible at 30 fps; a watchdog
+   * reset is not.
+   */
+  for (int attempt = 0; attempt < 8; attempt++) {
     const uint32_t before = publish_seq;
     if (before & 1u) continue;    // a write is in flight; look again
     __sync_synchronize();
@@ -533,6 +546,7 @@ void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
     __sync_synchronize();
     if (publish_seq == before) return;
   }
+  memcpy(out, &published, sizeof(*out));
 }
 
 uint32_t audio_probe_last_active() { return last_active_ms; }

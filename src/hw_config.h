@@ -255,8 +255,8 @@ static const float BATTERY_CALIBRATION_DEFAULT = 1.0f;
 
 /// The cell's own limits, used for the percentage curve. Defaults are a single
 /// Li-ion/LiPo cell; a 2S pack is two of everything and a divider of 4.
-static const float BATTERY_FULL_V_DEFAULT = 4.20f;
-static const float BATTERY_EMPTY_V_DEFAULT = 3.30f;
+static constexpr float BATTERY_FULL_V_DEFAULT = 4.20f;
+static constexpr float BATTERY_EMPTY_V_DEFAULT = 3.30f;
 
 /// Percentages at which the speaker starts saying something about it: a warning
 /// on the display and the dashboard at `low`, an urgent LED pattern at
@@ -281,8 +281,8 @@ static const float BATTERY_SMOOTHING = 0.12f;
 /// ceiling is not a cell either. Both bounds matter: a sense pin with nothing on
 /// it is a floating high-impedance input, and the numbers it invents are as
 /// likely to land above a charged pack as below an empty one.
-static const float BATTERY_MIN_PLAUSIBLE_V = 2.20f;
-static const float BATTERY_MAX_PLAUSIBLE_V = 4.45f;
+static constexpr float BATTERY_MIN_PLAUSIBLE_V = 2.20f;
+static constexpr float BATTERY_MAX_PLAUSIBLE_V = 4.45f;
 
 // ============================================================ WS2812 ring ====
 /*

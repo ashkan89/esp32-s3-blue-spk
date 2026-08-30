@@ -114,10 +114,16 @@ bool power_auto_blind();
  *
  * Waking is the BOOT button, which is already on the board and already the
  * speaker's only control. It has to be held for a moment rather than merely
- * seen low, so a speaker in a bag that brushes it stays asleep. Because standby
- * ends in a software restart rather than a chip reset, GPIO0 being the
- * download-mode strap does not matter here: the strapping pins are latched at
- * power-on and the button is long released by the time the restart runs.
+ * seen low, so a speaker in a bag that brushes it stays asleep.
+ *
+ * And then the release has to be waited for before the restart. The ESP32
+ * re-samples its strapping pins on a *system* reset, which is what esp_restart()
+ * performs -- it is not only power-on that latches them. GPIO0 is the
+ * download-mode strap, so restarting while the wake button is still down puts
+ * the chip in the ROM serial bootloader instead of running the firmware, and
+ * from the outside that is indistinguishable from a speaker that died in
+ * standby. The wake sequence is therefore "held long enough, then let go", the
+ * same rule the factory-reset hold in main.cpp follows for the same reason.
  */
 
 enum SleepMode : uint8_t {

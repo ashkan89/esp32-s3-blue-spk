@@ -97,6 +97,29 @@ uint8_t percentFor(float cellVolts) {
 /// faster than anything cleverer and needs no allocation.
 uint16_t readMillivolts() {
 #if PIN_BATTERY_SENSE >= 0
+  /*
+   * One throw-away conversion first, and it is not superstition.
+   *
+   * The divider is 100k over 100k, so the ADC looks into a 50 kOhm Thevenin
+   * source. The ESP32's SAR front end is a switched sample-and-hold: it
+   * connects a small capacitor to the pin for a fixed acquisition window, and
+   * the charge that capacitor needs has to come through those 50 kOhm. Espressif
+   * specify the recommended source impedance as an order of magnitude lower
+   * than that, and the symptom of exceeding it is precisely this -- the first
+   * conversion after the input multiplexer has been elsewhere reads low,
+   * because the cap started at whatever the previously selected channel left on
+   * it and did not finish charging. Back-to-back conversions on the same
+   * channel are fine, because the cap is already close.
+   *
+   * So the first one is discarded and the median is taken over the rest, which
+   * costs about 30 microseconds twice a second and removes a systematic
+   * negative offset that no amount of calibration trim can distinguish from a
+   * genuinely lower cell voltage. The hardware answer -- a 100 nF from the pin
+   * to ground, which turns the 50 kOhm into a reservoir the S/H can draw from
+   * instantly -- is documented in the README and is still worth fitting.
+   */
+  (void)analogReadMilliVolts(PIN_BATTERY_SENSE);
+
   uint16_t samples[BATTERY_OVERSAMPLE];
   for (uint8_t i = 0; i < BATTERY_OVERSAMPLE; i++) {
     // analogReadMilliVolts applies the chip's factory ADC calibration, which is
@@ -408,7 +431,13 @@ const char *battery_state_name(BatteryState state) {
 }
 
 bool battery_command(const char *line) {
+  // The keyword has to end the word, not merely start it. A plain prefix test
+  // claimed every line beginning with those letters -- "battery" was handled
+  // here as "bat" with the argument "tery", printed an unknown-argument
+  // complaint, and returned true, so no later handler ever saw it. Requiring a
+  // space or the end of the line keeps each console verb to itself.
   if (strncmp(line, "bat", 3) != 0) return false;
+  if (line[3] != 0 && line[3] != ' ') return false;
   const char *arg = line + 3;
   while (*arg == ' ') arg++;
 

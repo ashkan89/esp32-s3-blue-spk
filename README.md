@@ -41,6 +41,60 @@ what the folder is named.
 
 ## Wiring
 
+### Every pin at a glance
+
+The full map, in one table. Each entry is overridable from `build_flags`, and
+[src/pin_check.h](src/pin_check.h) asserts the whole set at compile time — a
+clash or an impossible pin is a build error, not a silent misbehaviour.
+
+| GPIO | Used for | Override | Notes |
+|------|----------|----------|-------|
+| 0  | BOOT button: screens, brightness, mode, factory reset, standby wake | `PIN_UI_BUTTON` | **Strapping pin.** Held low at any reset → ROM download mode. The firmware waits for release before every restart it controls |
+| 2  | Status LED (on-board) | `PIN_STATUS_LED`, `STATUS_LED_ACTIVE_HIGH` | **Strapping pin.** Must be low or floating at reset; an LED to ground is |
+| 4  | DFPlayer activity LED | `PIN_DF_LED` (`-1` = none) | ordinary output |
+| 14 | DFPlayer ADKEY1 | `PIN_DF_ADKEY1` | driven open-drain; JTAG MTMS otherwise |
+| 16 | DFPlayer TX → ESP32 RX (UART2) | `PIN_DF_RX` | |
+| 17 | ESP32 TX → DFPlayer RX (UART2), **1 k series** | `PIN_DF_TX` | the resistor is not optional in practice |
+| 18 | WS2812 ring DIN, **330 R series** | `PIN_LEDS` (`-1` = none) | RMT, not bit-banged |
+| 21 | I2C SDA — OLED (0x3C) and DS3231 (0x68) | `PIN_OLED_SDA` | one bus, two devices |
+| 22 | I2C SCL — same two devices | `PIN_OLED_SCL` | |
+| 23 | I2S DIN → PCM5102A | `PIN_MAP_I2S_DOUT` | **not** GPIO22: I2C owns that |
+| 25 | I2S LCK → PCM5102A | `PIN_MAP_I2S_LRCK` | also DAC1/ADC2 — unused as either |
+| 26 | I2S BCK → PCM5102A | `PIN_MAP_I2S_BCLK` | also DAC2/ADC2 — unused as either |
+| 27 | DFPlayer ADKEY2 | `PIN_DF_ADKEY2` | driven open-drain |
+| 32 | DFPlayer IO1 ("previous") | `PIN_DF_IO1` | driven open-drain |
+| 33 | DFPlayer IO2 ("next") | `PIN_DF_IO2` | driven open-drain |
+| 34 | Battery divider tap | `PIN_BATTERY_SENSE` (`-1` = none) | **Input only, ADC1.** No internal pull-up |
+| 35 | DFPlayer BUSY | `PIN_DF_BUSY` (`-1` = none) | **Input only.** The module drives it |
+| 36 | TP4056 CHRG, if wired | `PIN_BATTERY_CHARGING` (default `-1`) | **Input only** — needs its own 10 k to 3V3 |
+| 39 | TP4056 STDBY, if wired | `PIN_BATTERY_FULL` (default `-1`) | **Input only** — needs its own 10 k to 3V3 |
+
+Free on this build: 5, 12, 13, 15, 19. GPIO1/3 are UART0 (the console and the
+programming port) and GPIO6–11 are the module's own SPI flash.
+
+#### The three rules a rewire has to respect
+
+- **GPIO 6–11 are the flash.** Driving one stops the chip executing, because
+  that is where the code is being fetched from. There is no configuration that
+  makes them usable. `pin_check.h` refuses the build.
+- **GPIO 34–39 are input only.** No output driver and no internal pull-up or
+  pull-down at all — `pinMode(OUTPUT)` is accepted and does nothing, so a signal
+  moved here simply never appears on the wire. They are the right place for the
+  battery divider and for BUSY; they cannot carry I2C, I2S, the ring, or the
+  DFPlayer's open-drain button lines. `pin_check.h` refuses those too.
+- **The strapping pins are sampled on every reset, not only at power-on.**
+  `esp_restart()` re-latches them. GPIO0 low at that moment puts the chip in the
+  ROM serial bootloader, where it looks dead until it is power-cycled — which is
+  why the factory-reset hold and the standby wake both wait for the button to be
+  released before restarting. GPIO12 (MTDI) is the one to avoid entirely: it
+  selects the flash regulator voltage, and holding it high can stop a 3.3 V
+  module booting at all.
+- **The battery gauge must be on ADC1 (GPIO32–39).** ADC2 shares hardware with
+  the Wi-Fi radio and stops answering whenever the driver is up — which is four
+  of the five radio modes. The Arduino wrapper does not report the failure, it
+  returns 0, so the symptom is a gauge that reads a flat pack whenever Wi-Fi is
+  on and a correct one whenever it is not.
+
 ### PCM5102A → ESP32
 
 | PCM5102A | ESP32       | Notes                                            |
@@ -344,9 +398,127 @@ unpacks several GB** and takes roughly 25 minutes; later builds are ~20 seconds.
 pio run                        # compile
 pio run -e esp32dev -t upload  # flash the speaker firmware
 pio device monitor             # serial log at 115200
+
+pio run -t clean               # throw the build away and start again
+pio check -e esp32dev --skip-packages   # cppcheck over src/ only
+python scripts/test_pin_check.py        # the pin map, checked on the host
 ```
 
+There is one environment, `esp32dev`, so `pio run` and `pio run -e esp32dev` are
+the same thing.
+
 Then on your phone: Bluetooth settings → pair with **"esp32-blue-spk"** → play.
+
+### What a clean build should say
+
+```
+RAM:   [===       ]  28.3% (used 92884 bytes from 327680 bytes)
+Flash: [====      ]  39.2% (used 2571268 bytes from 6553600 bytes)
+```
+
+The flash denominator is the 6.25 MB `app0` slot of the 16 MB partition table,
+not the chip — see [16 MB flash layout](#16-mb-flash-layout). The RAM figure is
+what the linker places statically; the heap is what is left of the 320 KB after
+that, and the radios take most of it at run time. `diag` reports the live
+numbers.
+
+A clean build produces **no compiler warnings**. If one appears, it is new.
+
+### Checking the pin map
+
+Every GPIO is asserted at compile time by
+[src/pin_check.h](src/pin_check.h): flash pins (6–11), input-only pins (34–39)
+asked to drive, pins that do not exist on a WROOM, ADC2 used for the battery
+gauge, and every pair that could collide. A violation is a build error that
+names both ends, for example:
+
+```
+error: static assertion failed: GPIO conflict: I2S DOUT and I2C SCL are the same pin
+```
+
+`scripts/test_pin_check.py` compiles that header 21 times with different `-D`
+overrides and checks that each one is accepted or rejected as intended, so the
+assertions cannot quietly stop asserting. It needs no board and takes about a
+second:
+
+```
+$ python scripts/test_pin_check.py
+ok    stock pin map
+ok    I2S data on a flash pin
+...
+all 21 pin-map cases behaved as specified
+```
+
+## 16 MB flash layout
+
+Three separate settings have to agree before a board actually gets its 16 MB,
+and only one of them is the obvious one. All three are in
+[platformio.ini](platformio.ini):
+
+```ini
+board_upload.flash_size = 16MB          ; the bootloader image header
+board_build.partitions  = default_16MB.csv  ; the table itself
+board                   = esp32dev      ; whose own JSON still says 4 MB
+```
+
+`board_upload.flash_size` is what writes the size nibble into the image header,
+so it is what the bootloader believes; `board_build.partitions` is what decides
+where anything actually lives. Setting only the second gives a partition table
+that runs off the end of what the bootloader thinks the chip is. Setting only
+the first gives 16 MB of flash with a 4 MB table on it — a board that boots, runs
+and silently wastes three quarters of its storage.
+
+`esp32dev`'s board definition still declares 4 MB, and that is fine: the two
+overrides above take precedence, and PlatformIO recomputes the "maximum program
+size" from the partition CSV, which is why a build reports **6553600 bytes** and
+not 4194304.
+
+The table is the Arduino core's stock `default_16MB.csv`:
+
+| Name | Type | Offset | Size | What it is |
+|------|------|--------|------|------------|
+| `nvs` | data | `0x009000` | 20 KB | settings, Wi-Fi credentials, Bluetooth bonds, the saved clock |
+| `otadata` | data | `0x00E000` | 8 KB | which application slot is current |
+| `app0` | app, ota_0 | `0x010000` | 6.25 MB | slot A — where the firmware runs from |
+| `app1` | app, ota_1 | `0x650000` | 6.25 MB | slot B — where an OTA writes |
+| `spiffs` | data | `0xC90000` | 3.375 MB | reserved; this firmware does not mount it |
+| `coredump` | data | `0xFF0000` | 64 KB | a panic dump, for `esp-coredump` |
+
+`0xFF0000 + 0x10000 = 0x1000000` exactly — the table fills the chip with nothing
+overlapping and nothing past the end. The application is currently about
+2.6 MB, so slot A is ~39 % used and there is room for the OTA to write a much
+larger image into slot B.
+
+**OTA is real here, not nominal.** Two same-sized app slots, an `otadata`
+partition to arbitrate them, and a firmware that writes with `Update.begin()`
+and only restarts once `Update.end()` has validated the whole image. `diag`
+prints the live table and marks the slot that is running.
+
+### Verifying it on a real board
+
+```sh
+pio run -e esp32dev -t upload
+pio device monitor
+# then type:  diag
+```
+
+The report's `flash` line reads the configured size out of the image header and
+the real size out of the chip's JEDEC id, and says so when they disagree:
+
+```
+flash         16 MB configured, 16 MB on the chip @ 40 MHz
+```
+
+A `<-- MISMATCH` there means `board_upload.flash_size` does not match the part
+that is fitted.
+
+> **Flash frequency.** This build clocks flash at 40 MHz, which is the
+> `esp32dev` default. A WROOM-32D's flash is rated for 80 MHz, and
+> `board_build.f_flash = 80000000L` roughly halves instruction-cache miss
+> latency, which is free performance for code that runs from flash. It is left
+> at 40 MHz here because it is a hardware-behaviour change that cannot be
+> verified without the board in hand; try it, and if the board becomes unstable
+> or fails to boot, put it back.
 
 ## Web dashboard and OTA updates
 
@@ -1293,9 +1465,43 @@ probe at boot is otherwise harmless, and a board without the module simply logs
 `no ds3231 on the bus` and carries on.
 
 It is read at boot and written whenever you set the time by hand — and after
-every network sync — so it only needs setting once ever. A chip that has lost its
-cell (which reads back as 2000-01-01) is detected and seeded rather than
-believed.
+every network sync — so it only needs setting once ever.
+
+#### When the RTC is not to be believed
+
+Three different things can be wrong with a DS3231, and only one of them looks
+wrong:
+
+- **Never set.** The registers read back as 2000-01-01. Obvious, and the
+  firmware seeds the chip from whatever better time it has instead.
+- **Registers garbled.** A long lead, a weak pull-up, or a collision with the
+  OLED's own 400 kHz traffic can return a month of 14 or a second of 92. BCD
+  decoding does not complain about either, and `mktime()` would normalise the
+  result into a date years away — which would then be adopted as trusted,
+  written back into the chip, and saved to NVS. Every field is range-checked
+  before any of it is believed.
+- **The oscillator stopped.** This is the one that bites. A DS3231 whose backup
+  cell has gone flat — or that had its cell removed and refitted — does *not*
+  come back blank. It comes back with a perfectly plausible date that is simply
+  wrong by however long it was stopped, and `CLOCK_SRC_RTC` outranks both NVS
+  and the build stamp, so that wrong time wins.
+
+  The chip says so itself, in the oscillator-stop flag (OSF) of register `0x0F`,
+  and the firmware now reads it. A chip reporting OSF is ignored rather than
+  adopted; NVS or the network provides the time instead, and the RTC is trusted
+  again from the first real time set — which clears the flag on its way past.
+
+`diag` reports which of these applies:
+
+```
+DS3231 RTC  oscillator stopped (check the coin cell)
+```
+
+> **The coin cell.** The common ZS-042 board wires a charging circuit meant for
+> a rechargeable LIR2032. Most of them ship with a **non-rechargeable CR2032**
+> in that socket, which the circuit then trickle-charges. Either fit a LIR2032
+> or lift the charge resistor. A cell mistreated this way is the usual reason
+> OSF turns up months later.
 
 Whichever it is, the current time is written to NVS every ten minutes, so a power
 cut comes back within ten minutes rather than back to the build stamp. The saved
@@ -1412,13 +1618,47 @@ current, and none of it can reach a sample.
 Reading a battery with an ADC is easy; getting a number worth showing is not, so
 it is worth being clear about which of the two this is.
 
-**What it does well: resting voltage.** The divider is read nine times, the
-*median* is taken — the ESP32's SAR ADC produces the occasional wild sample and a
-mean carries it through — and the result is smoothed with a slow EMA.
-`analogReadMilliVolts()` applies the chip's factory ADC calibration, worth about
-40 mV over converting the raw count by hand. That gives a voltage good to a few
-tens of millivolts once the trim is set, which is the accuracy limit of the
-resistors rather than of the converter.
+**What it does well: resting voltage.** One conversion is thrown away, the
+divider is then read nine times, the *median* is taken — the ESP32's SAR ADC
+produces the occasional wild sample and a mean carries it through — and the
+result is smoothed with a slow EMA. `analogReadMilliVolts()` applies the chip's
+factory ADC calibration, worth about 40 mV over converting the raw count by
+hand. That gives a voltage good to a few tens of millivolts once the trim is
+set, which is the accuracy limit of the resistors rather than of the converter.
+
+**Why the first conversion is discarded, and the one capacitor worth fitting.**
+100 k over 100 k puts the ADC behind a **50 kΩ** Thevenin source, and Espressif
+recommend an order of magnitude less than that. The ESP32's front end is a
+switched sample-and-hold: it connects a small capacitor to the pin for a fixed
+acquisition window, and that charge has to arrive through the 50 kΩ. The first
+conversion after the input multiplexer has been elsewhere therefore reads *low*
+— the cap started at whatever the previous channel left on it and did not finish
+charging. Back-to-back conversions on the same channel are fine, because the cap
+is already close. Discarding the first one costs about 30 µs twice a second and
+removes a systematic negative offset that no calibration trim can distinguish
+from a genuinely lower cell.
+
+The hardware fix is better and costs one part: **a 100 nF ceramic from GPIO34 to
+GND, at the pin**. It turns the 50 kΩ into a local reservoir the sample-and-hold
+can draw from instantly, and it also filters the switching noise the ring and
+the DFPlayer put on the rail. Fit it if you can; the firmware is correct without
+it.
+
+```
+BAT+ ---[100k]---+---[100k]--- GND
+                 |
+                 +--- GPIO34 (ADC1_CH6)
+                 |
+               [100nF]
+                 |
+                GND
+```
+
+Sizing check: 4.2 V through 2:1 is **2.10 V** at the pin, inside the ~2.45 V the
+11 dB attenuator can read, with headroom. A 3S pack would put 12.6 V into a 2:1
+divider and destroy the input — raise the divider ratio *and* the resistor values
+together for anything above 1S, and confirm with a meter before connecting the
+ESP32.
 
 **What no voltage gauge does well: percentage under load.** A Li-ion cell's
 terminal voltage sags with current, so a speaker that starts playing looks like
@@ -1449,6 +1689,50 @@ reports pack volts and the cell count converts between them.
 voltage alone, so without the TP4056's CHRG and STDBY pins the state is reported
 as *unknown* and the dashboard says why. Guessing would mean the indicator lies
 at the one moment anybody is watching it.
+
+### What a TP4056 is not
+
+A plain TP4056 board — the red one with the micro-USB socket, and the blue
+DW01+FS8205 one with protection — is a **linear charger only**. It is not a
+power-path controller and it does not do load sharing, whatever the listing
+says. That has four consequences no firmware can fix, and they belong in the
+wiring rather than in the code:
+
+- **The load hangs off the cell, not off a switched output.** With USB plugged
+  in, the charger, the cell and the speaker are all on the same node. The
+  charger's constant-current loop cannot tell the difference between current
+  going into the cell and current going out to the ESP32, so the cell never gets
+  a clean charge profile while the speaker is running.
+- **Termination is unreliable under load.** The TP4056 ends a charge when the
+  current falls to about a tenth of the programmed rate. A speaker drawing more
+  than that means the threshold is never reached, so it either never terminates
+  or terminates on the wrong thing. STDBY going low while the speaker is playing
+  should not be read as "the pack is full", and the firmware only reports `full`
+  when STDBY *and* a percentage of 95 or more agree.
+- **The percentage is wrong while charging, and knows it.** The gauge is reading
+  a cell that is simultaneously being charged and discharged. The firmware
+  handles this by not pretending: charging outranks everything in the power
+  policy, so saving switches off and the percentage is shown for information.
+- **A B+/B− board is not a protection circuit for the ESP32.** The DW01 on the
+  protected boards protects the *cell* (over-discharge, over-current, short). It
+  does nothing about the 3.3 V regulator's input, and a 1S cell at 4.2 V into a
+  devkit's 5 V pin does not reach the regulator's dropout at all — you need a
+  boost converter or a regulator that works from 3.0 V up, not a straight wire.
+
+If you want proper behaviour on USB, that is an **IP5306**, a **TP4056 plus an
+ideal-diode power path** (an LM66200 or equivalent), or one of the combined
+charger/boost modules. This firmware works correctly with a plain TP4056; it
+simply cannot make one into something it is not, and it reports *unknown* rather
+than inventing a charge state it has no way to know.
+
+> **Brownouts.** Bringing up Wi-Fi and Bluetooth together roughly doubles peak
+> current, and the ring can add 260 mA more. On a marginal supply or a thin USB
+> cable that is a brownout reset — which `diag` names explicitly, because a
+> brownout, a panic and a watchdog all look identical from outside. Brownout
+> detection is deliberately left on: it is protecting the flash from a write at
+> an unsafe voltage, and switching it off converts a clean reset into a corrupt
+> partition. The fixes are a thicker cable, a bulk capacitor at the board, and
+> `LED_BRIGHTNESS_MAX` lower.
 
 **It starts switched off.** A sense pin with no divider on it floats, a floating
 input invents readings, and one that happened to settle inside a cell's voltage
@@ -1546,6 +1830,49 @@ Note that the analyser taps the stream *after* all of this, so the meters and th
 spectrum show what actually leaves the DAC. It has its own auto-gain on top, so
 turning the phone down does not flatten the bars — otherwise, at a comfortable
 listening level 20 dB below full scale, every band would be a two-pixel stub.
+
+## Diagnostics: the `diag` command
+
+The dashboard reports most of the speaker's state in more detail and more
+legibly. It also needs a network the speaker may be failing to join, and it does
+not exist at all in Bluetooth mode — which is exactly when something is worth
+diagnosing. The serial port is there in every mode, from the first line of
+`setup()`, whatever the radios are doing.
+
+```sh
+pio device monitor
+# type:  diag
+```
+
+It costs nothing until it is typed: every number is either already being kept
+for another reason or is one call into the IDF, so there is no background
+collection to switch off in a release build. It prints about forty lines once
+and stops.
+
+| Section | What it answers |
+|---------|-----------------|
+| firmware, chip, flash, mac | which build is running, and whether the flash is configured to match the part fitted |
+| reset reason | whether the last restart was a crash, a watchdog, a brownout, a deliberate reboot or a standby wake — all of which look identical from outside |
+| uptime, clock | how long since that, and where the time came from |
+| heap free / min / largest block | the three numbers that fail differently. The third one decides whether a TLS handshake or a Bluedroid bring-up can be allocated at all: a heap with 60 KB free in 2 KB pieces will refuse both while looking healthy |
+| DMA-capable free | where the I2S descriptors live |
+| task stacks | the smallest each task's free stack has ever been. Under ~400 bytes is worth raising; an overflow is a panic with a backtrace pointing at whatever function was unlucky |
+| peripherals detected | OLED, DS3231 (with its oscillator state), ring, DFPlayer, battery — every one of which is optional and fails by being *quietly* absent |
+| DFPlayer counters | frames sent/good/bad, module errors, offline events. These separate "noisy or swapped wiring" from "a clone that refuses commands" from "the module has gone away" |
+| I2C errors | DS3231 transactions that did not complete. Should be 0 forever; a number that climbs means the shared bus is marginal, and the OLED is suffering equally and silently |
+| audio peak dBFS | what the analyser is actually hearing. Silence sits at the −78 floor; anything anybody is listening to reads well above −70. This is the input every idle timer keys off, so it settles "why will the panel not blank" |
+| power | whether saving is on and *why*, in a sentence |
+| partitions | the live table, with the running slot marked, and how full it is |
+
+A one-line version of the same thing is printed at every boot:
+
+```
+[boot] self-test: oled yes | rtc present, running | ring yes | dfplayer n/a in this mode | battery no cell / gauge off
+```
+
+That line exists because absent-tolerance has a cost: a peripheral that is
+fitted but *not working* is otherwise indistinguishable from one that was never
+fitted at all.
 
 ## Troubleshooting noise ("heavy rain", crackle, static)
 
@@ -1766,6 +2093,144 @@ build_flags =
 To make the ESP32 forget the paired phone, call
 `a2dp_sink.clean_last_connection()` once in `setup()`, flash, then remove it again.
 
+## Manual hardware test checklist
+
+Everything in this firmware that can be checked without a board already is: it
+compiles with no warnings, `pio check` reports no high-severity findings in
+`src/`, and `scripts/test_pin_check.py` proves the pin assertions still assert.
+None of that says anything about how the speaker *behaves*, and the list below
+is what does. Work down it; the order is roughly worst-consequence-first.
+
+Have `pio device monitor` open throughout and type `diag` at the end of each
+group — most of the pass criteria below are one line of that report.
+
+### 1. Boot and recovery (do these first)
+
+- [ ] **Cold boot from USB.** `[boot] reset reason: power on`, then the
+      `[boot] self-test:` line. The splash appears on the OLED within a second.
+- [ ] **Ten reboots in a row** (`pio run -t upload`, or the dashboard's
+      restart). No panic, no boot loop. `diag` → heap free within a few hundred
+      bytes of the same number every time.
+- [ ] **Every optional peripheral unplugged** — no OLED, no RTC, no ring, no
+      DFPlayer, no battery. The speaker still pairs and plays. Self-test line
+      says `no` / `not fitted` for each, and nothing else complains.
+- [ ] **OLED only** (no RTC on the bus). Panel works; clock falls back to
+      NVS/network and the info screen says so.
+- [ ] **RTC only** (no OLED). No panel, no UI task, clock still comes from the
+      DS3231. The BOOT button still does the headless factory reset.
+- [ ] **OLED and RTC together.** Both on 0x3C and 0x68, no interference; `diag`
+      → `I2C errors 0` after ten minutes.
+- [ ] **Factory reset**: hold BOOT through the countdown, release. Settings,
+      Wi-Fi and Bluetooth bonds are gone; the board **runs the firmware**, not
+      the ROM bootloader. *(This is the strapping-pin case — if it ever comes
+      back silent and unresponsive to the monitor, that is the failure.)*
+- [ ] **Deliberate brownout**: run from a thin cable with the ring at full
+      white. If it resets, `diag` should name it `BROWNOUT`, not a panic.
+
+### 2. Standby and wake — the highest-risk path
+
+- [ ] From the dashboard or the idle timer, enter standby. The **Goodbye**
+      screen animates (moon rises, stars appear), then the panel goes dark.
+- [ ] **The ring is genuinely dark**, not frozen mid-effect. WS2812s latch: a
+      ring still showing colour here means the blanking frame did not go out.
+- [ ] The DFPlayer stops before standby, not after.
+- [ ] **Wake with a long BOOT press and keep holding it.** The speaker must come
+      back and run — the serial log shows `[power] waking`, then the normal boot
+      banner. *A board that comes back silent with no banner is in the ROM
+      download mode, which is the bug this path exists to avoid.*
+- [ ] Wake with a brief brush of the button: it must **stay** asleep.
+- [ ] After waking, `diag` → `reset reason ... (woke from standby)` and the
+      OLED shows **Good morning** briefly.
+
+### 3. Audio
+
+- [ ] Pair a phone, play. Connect chime, then music.
+- [ ] **Rapid start/stop**: play, pause, skip, seek, ten times quickly. No
+      crackle, no dropout, no reset.
+- [ ] **Rapid mode switching**: hold BOOT → confirm → repeat through all five
+      modes. Each comes up clean; `diag` → heap min not falling boot on boot.
+- [ ] **Long playback**: at least two hours continuous. Then `diag` → heap free
+      and largest block should be within a few hundred bytes of where they were
+      at the start. A slow fall is a leak.
+- [ ] **Maximum volume** on loud material. The soft knee should limit, not
+      square off — distortion that appears only on peaks means lowering
+      `OUTPUT_GAIN` from 1.5.
+- [ ] **Underrun check**: while playing, open the dashboard, load the Lighting
+      page, run a Wi-Fi scan. Audio must not stutter. (There is no hardware
+      underrun counter on this path; the ear is the instrument.)
+- [ ] **LED animation during audio**: set the ring to Music sync and confirm it
+      tracks the beat without affecting the sound.
+
+### 4. DFPlayer
+
+- [ ] **Absent**: DFPlayer mode with nothing on the UART. `diag` →
+      `OFFLINE (check TX/RX)` and `framesGood 0`; the dashboard stays usable.
+- [ ] **Present, genuine YX5200** and, if you have one, an **AA104/GD3200B
+      clone**. `diag` → `framesGood` climbing, `framesBad 0`, `errors 0`.
+- [ ] **TX and RX swapped deliberately** — confirm it reports offline rather
+      than hanging.
+- [ ] **SD card missing**: `media` shows no `sd`; the status LED shows the
+      no-media pattern.
+- [ ] **SD card empty**, **corrupt (non-FAT32)**, and **populated**. Only the
+      last should play; the other two must not wedge the driver.
+- [ ] **Card pulled while playing.** Recovers, reports it, does not reboot.
+- [ ] **A computer plugged into the module's USB-B.** The dashboard says the
+      card is mounted elsewhere; playback stops and resumes on unplug.
+- [ ] **Folder and track limits**: a folder with ~3000 files, and track numbers
+      near the top of the range. Numbering is 1-based and folders are 1–99.
+- [ ] **Volume bounds**: 0 and 30 on the module scale, from both the dashboard
+      and the console.
+
+### 5. Battery and power
+
+- [ ] **Meter against the gauge.** Measure the pack with a multimeter, compare
+      to `bat` on the console. Then `bat calib <the meter reading>` and confirm
+      the trim lands within a few tens of millivolts.
+- [ ] Repeat at three states of charge (full, mid, low) — a trim that is right
+      at one voltage and wrong at another means the divider ratio is wrong, not
+      the trim.
+- [ ] **With and without the 100 nF at GPIO34.** Note the difference; the
+      firmware's discarded first conversion should make it small.
+- [ ] **USB power vs battery power**, and the transition between them.
+- [ ] **Low-battery threshold and hysteresis**: run the pack down past the
+      threshold and confirm saving engages, then charge past the exit point and
+      confirm it disengages *once*, not repeatedly.
+- [ ] **Critical**: the status LED heartbeat pattern appears, and stops the
+      moment a charger is connected.
+- [ ] **No pack fitted, gauge enabled**: must report *not present*, not a
+      critically flat cell.
+
+### 6. Clock
+
+- [ ] **RTC power loss**: pull the DS3231's coin cell, power-cycle, refit it.
+      Boot should log `oscillator stopped` and *not* adopt the stale time.
+- [ ] Set the time from the console or the dashboard; confirm `diag` →
+      `present, running` and that the time survives a full power cut.
+- [ ] **millis() wraparound.** Everything time-related here uses wrap-safe
+      arithmetic, but 49.7 days is the only real proof. If you cannot run that
+      long, the review-level confidence is: every comparison in the changed code
+      is `(int32_t)(now - deadline) >= 0` or `now - then >= interval`, never
+      `now > deadline`.
+
+### 7. Persistence
+
+- [ ] Change several settings, power-cycle, confirm they survive.
+- [ ] **Power cycle during a settings write** — pull power repeatedly while
+      saving from the dashboard. NVS should either keep the old value or take
+      the new one; it must never fail to mount on the next boot.
+- [ ] **OTA**: upload `firmware.bin` from the dashboard, confirm it writes to
+      the *other* slot (`diag` → partitions, the `<-- running` marker moves).
+- [ ] Power-cycle mid-OTA. The old slot must still boot.
+
+### 8. Radios
+
+- [ ] Wi-Fi + Bluetooth mode with both active: audio while the dashboard is
+      open. This is the mode most likely to brown out a marginal supply.
+- [ ] Wi-Fi + BLE: cast over DLNA, and provision Wi-Fi over the BLE
+      characteristic.
+- [ ] Setup access point: wrong credentials saved → AP appears after the grace
+      period → new credentials fix it.
+
 ## Source layout
 
 | File | What is in it |
@@ -1785,6 +2250,9 @@ To make the ESP32 forget the paired phone, call
 | [src/leds.h](src/leds.h) / [.cpp](src/leds.cpp) | the WS2812 ring: fifteen effects, the music sync, the RMT wire protocol |
 | [src/power.h](src/power.h) / [.cpp](src/power.cpp) | power saving: the three modes, the battery policy, and the four things it switches off |
 | [src/ui_assets.h](src/ui_assets.h) | hand-drawn XBM icons |
+| [src/pin_check.h](src/pin_check.h) | the whole pin map in one place, asserted at compile time — no code, no flash |
+| [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |
+| [scripts/test_pin_check.py](scripts/test_pin_check.py) | host-side test that the pin assertions actually assert — 21 cases, no board needed |
 
 ## Notes on the toolchain
 

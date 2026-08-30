@@ -142,6 +142,10 @@ struct SystemOverlay {
   char detail[80];
   int16_t progress;
   uint32_t until;
+  /// millis() when this overlay was raised. The animated farewell and greeting
+  /// run from it, so they play once from the beginning rather than being tied
+  /// to whatever the wall clock happened to be at.
+  uint32_t shown_at;
   bool active;
 };
 
@@ -1014,7 +1018,81 @@ static bool system_overlay_snapshot(SystemOverlay *out, uint32_t now) {
   return visible;
 }
 
-static void draw_system_overlay(const SystemOverlay &status, uint32_t dt) {
+/*
+ * The farewell and the greeting.
+ *
+ * Full width, no border, and animated -- deliberately unlike every other
+ * overlay, which is how the eye tells "the speaker is putting itself away" from
+ * "the speaker is busy". See the note on UI_STATUS_GOODBYE in ui.h.
+ *
+ * `phase` runs 0..1 over about two seconds and drives both directions of the
+ * same animation: the moon rises and the stars come out on the way to standby,
+ * and the whole thing plays in reverse on the way back. Everything is drawn
+ * from arithmetic rather than from bitmaps, so the pair costs one 16x8 icon and
+ * no frame buffers.
+ */
+static void draw_farewell(const SystemOverlay &status, bool leaving,
+                          uint32_t now) {
+  // Full-screen erase rather than draw_panel()'s bordered box. The overlays are
+  // composed on top of whatever screen was drawn first, so something has to
+  // clear it -- and a border here would put this back in the "busy, please
+  // wait" visual family that the whole point is to escape.
+  u8g2.setDrawColor(0);
+  u8g2.drawBox(0, 0, W, H);
+  u8g2.setDrawColor(1);
+
+  const uint32_t age = now - status.shown_at;
+  float phase = age / 2000.0f;
+  if (phase > 1.0f) phase = 1.0f;
+  // Ease out, so the movement settles rather than stopping dead.
+  const float eased = 1.0f - (1.0f - phase) * (1.0f - phase);
+  const float travel = leaving ? eased : 1.0f - eased;
+
+  // The moon climbs the left third on the way out and sets on the way back.
+  const int moon_y = 20 - (int)(travel * 12.0f);
+  u8g2.drawXBMP(6, moon_y, 16, 8, ICON_MOON);
+
+  /*
+   * Stars, on a fixed pseudo-random scatter rather than random() -- they have
+   * to be in the same places every frame or they smear instead of twinkling.
+   * Each appears once the animation has travelled past its own threshold, so
+   * they come out one by one rather than all at once.
+   */
+  static const uint8_t STARS[][3] = {
+      {30, 6, 20}, {44, 14, 45}, {38, 25, 62}, {52, 4, 78}, {26, 18, 90},
+  };
+  for (const auto &star : STARS) {
+    if (travel * 100.0f < star[2]) continue;
+    // A slow shimmer: on for most of a cycle, off for a moment, each star out
+    // of step with the next.
+    if (((now / 300 + star[0]) % 7) == 0) continue;
+    u8g2.drawPixel(star[0], star[1]);
+    u8g2.drawPixel(star[0] - 1, star[1] + 1);
+    u8g2.drawPixel(star[0] + 1, star[1] + 1);
+    u8g2.drawPixel(star[0], star[1] + 2);
+  }
+
+  u8g2.setFont(FONT_TITLE);
+  u8g2.drawUTF8(62, 14, status.title);
+  u8g2.setFont(FONT_SMALL);
+  u8g2.drawUTF8(62, 25, status.detail);
+
+  /*
+   * A rule that draws itself in as the animation runs, so there is a visible
+   * sense of a countdown finishing rather than a static screen that then goes
+   * black without warning. On the way back it retracts.
+   */
+  const int rule = (int)(travel * (W - 66));
+  if (rule > 0) u8g2.drawHLine(62, 29, rule);
+}
+
+static void draw_system_overlay(const SystemOverlay &status, uint32_t dt,
+                                uint32_t now) {
+  if (status.kind == UI_STATUS_GOODBYE || status.kind == UI_STATUS_WELCOME) {
+    draw_farewell(status, status.kind == UI_STATUS_GOODBYE, now);
+    return;
+  }
+
   draw_panel(0, 0, W, H);
 
   const uint8_t *icon = ICON_UPDATE;
@@ -1484,7 +1562,7 @@ static void ui_frame() {
   // still wins over Bluetooth/track toasts.
   SystemOverlay status;
   if (system_overlay_snapshot(&status, now)) {
-    draw_system_overlay(status, dt);
+    draw_system_overlay(status, dt, now);
   } else if ((int32_t)(popup_until - now) > 0) {
     draw_volume_popup(info);
   } else if ((int32_t)(toast_until - now) > 0 && toast_kind != TOAST_NONE) {
@@ -1650,7 +1728,8 @@ void ui_show_system_status(UiSystemStatus kind, const char *title,
   strlcpy(system_overlay.title, title ? title : "", sizeof(system_overlay.title));
   strlcpy(system_overlay.detail, detail ? detail : "", sizeof(system_overlay.detail));
   system_overlay.progress = progress < 0 ? -1 : (progress > 100 ? 100 : progress);
-  system_overlay.until = duration_ms ? millis() + duration_ms : 0;
+  system_overlay.shown_at = millis();
+  system_overlay.until = duration_ms ? system_overlay.shown_at + duration_ms : 0;
   system_overlay.active = true;
   portEXIT_CRITICAL(&system_overlay_mux);
   ui_wake();

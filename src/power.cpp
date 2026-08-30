@@ -275,7 +275,7 @@ bool power_sleep_now() {
    * watching. A speaker that goes dark and silent with no warning is
    * indistinguishable from one that has crashed.
    */
-  ui_show_system_status(UI_STATUS_RESTART, "Standby",
+  ui_show_system_status(UI_STATUS_GOODBYE, "Goodbye",
                         "Press BOOT to wake", -1, 0);
   delay(SLEEP_NOTICE_MS);
 
@@ -289,12 +289,31 @@ bool power_sleep_now() {
   df_player_standby();
   delay(300);
 
-  // Each on the task that owns the hardware. Two writers on one I2C bus or one
-  // RMT channel is how a shutdown becomes a crash.
+  /*
+   * Each on the task that owns the hardware. Two writers on one I2C bus or one
+   * RMT channel is how a shutdown becomes a crash -- so both of these only ask,
+   * and the owning task acts.
+   *
+   * The ring is then waited for rather than guessed at. WS2812s latch: if the
+   * radios come down and the core drops to 10 MHz before the dark frame has
+   * actually been clocked out, the pixels stay lit at whatever the last effect
+   * left them, drawing their full current, on a board that is supposed to be
+   * asleep. leds_suspended() says when that frame has gone; the bound is there
+   * so a wedged render task cannot stop the speaker going to standby at all.
+   */
   leds_suspend();
   ui_suspend();
   status_led_mute(true);
-  delay(250);
+  constexpr uint32_t BLANK_WAIT_MS = 400;
+  const uint32_t blankDeadline = millis() + BLANK_WAIT_MS;
+  while (!leds_suspended() && (int32_t)(millis() - blankDeadline) < 0) {
+    delay(10);
+  }
+  if (!leds_suspended()) {
+    Serial.println("[power] the ring did not confirm its dark frame; going to "
+                   "standby anyway");
+  }
+  delay(150);  // the panel's own power-down, on the UI task
 
   /*
    * The radios, which on this chip are most of the current. Both are guarded on
@@ -354,8 +373,35 @@ bool power_sleep_now() {
   setCpuFrequencyMhz(240);  // so the restart runs at the speed it expects
   g_wokeMagic = WOKE_MAGIC;
   Serial.println("[power] waking");
+
+  /*
+   * Wait for the button to come back up before resetting.
+   *
+   * PIN_UI_BUTTON is GPIO0, the download-mode strap, and the ESP32 re-samples
+   * its strapping pins on the system reset esp_restart() performs -- not only at
+   * power-on. Restarting with the button still down therefore lands in the ROM
+   * serial bootloader rather than in setup(), and the speaker looks dead until
+   * it is power-cycled. Waking requires a 400 ms hold, so at this point the
+   * button is by construction still pressed; without this loop the failure is
+   * not a race but the normal case.
+   *
+   * Bounded, because a shorted or stuck button must not strand the board here
+   * with both radios already down. Past the deadline the reset goes ahead: a
+   * chip in download mode is recoverable and an unresponsive one is not.
+   */
+  constexpr uint32_t RELEASE_WAIT_MS = 10000;
+  const uint32_t releaseDeadline = millis() + RELEASE_WAIT_MS;
+  while (digitalRead(PIN_UI_BUTTON) == LOW &&
+         (int32_t)(millis() - releaseDeadline) < 0) {
+    delay(10);
+  }
+  if (digitalRead(PIN_UI_BUTTON) == LOW) {
+    Serial.println("[power] BOOT still held after 10 s; restarting anyway. If "
+                   "the speaker comes back silent, the chip is in download mode "
+                   "-- release the button and reset it.");
+  }
+  delay(60);  // contact bounce on the release, well clear of the reset
   Serial.flush();
-  delay(50);
   ESP.restart();
   return true;  // unreachable; keeps the signature honest
 }

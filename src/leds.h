@@ -154,10 +154,23 @@ bool leds_resting();
 /// choices and survive, and this is lifted the moment saving ends. See power.h.
 void leds_set_power_save(bool on);
 
-/// Writes the ring black and parks its task. For standby: WS2812s latch, so a
-/// ring that is merely stopped stays lit at whatever it was showing, drawing
-/// its full current. There is no resume -- standby ends in a restart.
+/// Asks the render task to write the ring black and then park itself. For
+/// standby: WS2812s latch, so a ring that is merely stopped stays lit at
+/// whatever it was showing, drawing its full current. There is no resume --
+/// standby ends in a restart.
+///
+/// The blanking is done *by the render task*, not here, because that task owns
+/// the RMT channel and the symbol buffer; two writers on one channel is how a
+/// shutdown becomes a corrupted final frame that leaves the ring lit. Safe to
+/// call from any task, and safe to call twice. Use leds_suspended() to wait for
+/// the dark frame to have actually gone out.
 void leds_suspend();
+
+/// True once the render task has emitted the black frame and parked. Callers
+/// that are about to cut power or restart can wait on this rather than on a
+/// fixed delay; it becomes true within one frame period (~17 ms at 60 fps), and
+/// is true immediately when there is no ring to suspend.
+bool leds_suspended();
 
 /// Milliseconds since the ring last had a reason to be lit -- audio, or a
 /// change made from the dashboard. The countdown behind idleAfterS, shown on
@@ -182,5 +195,6 @@ inline bool leds_resting() { return false; }
 inline uint32_t leds_idle_ms() { return 0; }
 inline void leds_set_power_save(bool) {}
 inline void leds_suspend() {}
+inline bool leds_suspended() { return true; }
 inline bool leds_command(const char *) { return false; }
 #endif

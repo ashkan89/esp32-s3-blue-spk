@@ -60,6 +60,9 @@ static const size_t RMT_MEM_SYMBOLS = 192;
 static rmt_channel_handle_t rmt_channel;
 static rmt_encoder_handle_t rmt_encoder;
 static bool g_present;
+/// Whether the render task exists. Standby blanking is its job, so a shutdown
+/// that waits for the dark frame has to know there is somebody to draw it.
+static bool task_running;
 
 // ----------------------------------------------------------------- config ----
 /*
@@ -255,9 +258,21 @@ static volatile bool resting;
 /// the mode is worth having.
 static volatile bool powerSave;
 
-/// Standby. One black frame goes out, and then the task stops touching the RMT
-/// channel at all rather than clocking sixty frames a second of nothing.
-static volatile bool suspended;
+/*
+ * Standby. One black frame goes out, and then the task stops touching the RMT
+ * channel at all rather than clocking sixty frames a second of nothing.
+ *
+ * Two flags rather than one, because the request and the act belong to
+ * different tasks. `suspendRequested` is written by whoever is shutting the
+ * speaker down -- the Arduino loop, in practice -- and `suspendDone` is written
+ * by the render task once it has actually put the dark frame on the wire. The
+ * blanking must happen on the render task: it owns the RMT channel and the
+ * symbol buffer, the channel is configured with a queue depth of one, and a
+ * second task committing a frame into the middle of the render task's commit
+ * corrupts exactly the frame that was meant to leave the ring dark.
+ */
+static volatile bool suspendRequested;
+static volatile bool suspendDone;
 
 // ----------------------------------------------------------------- effects ---
 /*
@@ -581,7 +596,16 @@ static void leds_task(void *) {
   uint32_t last_ms = millis();
 
   for (;;) {
-    if (suspended) {
+    if (suspendRequested) {
+      // Black first, then park: the order is the whole point, because the
+      // pixels keep showing the last thing they were sent once the task stops
+      // sending. Done once, on the task that owns the channel.
+      if (!suspendDone) {
+        LedConfig off{};
+        fill(0);
+        commit(off, millis());
+        suspendDone = true;
+      }
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
@@ -684,13 +708,22 @@ bool leds_begin() {
 }
 
 void leds_start() {
-  if (!g_present) return;
+  if (!g_present || task_running) return;
   awake_ms = millis();  // a full idle period before the first rest
   // Core 0, priority 1: the same berth as the display task, and below both the
   // Bluetooth controller and the audio path, so a late frame of light is the
   // only thing a busy moment can cost. The stack carries a whole AudioVis copy
   // (a little over 200 bytes) on top of the effect locals.
-  xTaskCreatePinnedToCore(leds_task, "leds", 4096, nullptr, 1, nullptr, 0);
+  if (xTaskCreatePinnedToCore(leds_task, "leds", 4096, nullptr, 1, nullptr, 0) !=
+      pdPASS) {
+    // No task means no render loop and, more to the point, nobody to run the
+    // standby blanking -- so say so and let leds_suspended() answer honestly
+    // rather than making a shutdown wait for a frame that will never come.
+    Serial.println("[leds] could not start the render task; the ring stays dark");
+    g_present = false;
+    return;
+  }
+  task_running = true;
 }
 
 bool leds_present() { return g_present; }
@@ -754,14 +787,14 @@ bool leds_resting() { return resting; }
 uint32_t leds_idle_ms() { return millis() - awake_ms; }
 
 void leds_suspend() {
-  if (!g_present || suspended) return;
-  // Black first, then park: the order is the whole point, because the pixels
-  // keep showing the last thing they were sent once the task stops sending.
-  fill(0);
-  LedConfig off{};
-  commit(off, millis());
-  suspended = true;
+  if (!g_present) return;
+  // Only the request is made here. The render task does the blanking and then
+  // parks; see the note on suspendRequested for why the caller must not touch
+  // the RMT channel itself.
+  suspendRequested = true;
 }
+
+bool leds_suspended() { return !g_present || suspendDone; }
 
 void leds_set_power_save(bool on) {
   if (on == powerSave) return;
@@ -786,7 +819,10 @@ static void print_leds_status() {
 }
 
 bool leds_command(const char *line) {
+  // Whole word only; see the note in battery_command() for why a bare prefix
+  // test silently swallowed neighbouring commands.
   if (strncmp(line, "leds", 4) != 0) return false;
+  if (line[4] != 0 && line[4] != ' ') return false;
   const char *arg = line + 4;
   while (*arg == ' ') arg++;
 

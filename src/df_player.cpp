@@ -270,6 +270,8 @@ void writeFrame(uint8_t cmd, uint16_t param) {
   buf[9] = FRAME_END;
   Serial2.write(buf, FRAME_SIZE);
   Serial2.flush();
+  Locked lock;
+  if (lock.held) status.framesSent++;
 }
 
 /*
@@ -334,6 +336,11 @@ void readSerial() {
      * partial one after the module powers up, and a start-up error message that
      * always appears is worse than none.
      */
+    {
+      Locked lock;
+      if (lock.held) status.framesBad++;
+    }
+
     uint8_t next = 0;
     for (uint8_t k = 1; k < FRAME_SIZE; k++) {
       if (buf[k] == FRAME_START) {
@@ -365,6 +372,7 @@ void handleFrame(uint8_t cmd, uint16_t param) {
     if (lock.held) {
       status.online = true;
       status.lastFrameAt = millis();
+      status.framesGood++;
     }
   }
 
@@ -418,6 +426,10 @@ void handleFrame(uint8_t cmd, uint16_t param) {
       if (sleeping && (uint8_t)(param & 0xFF) == 0x02) {
         setError("The module is in standby and ignored that. Wake it first.");
         break;
+      }
+      {
+        Locked lock;
+        if (lock.held) status.errors++;
       }
       setError(error_text((uint8_t)(param & 0xFF)));
       break;
@@ -683,6 +695,7 @@ void driverTask(void *) {
         if (!asleep && status.online && status.lastFrameAt &&
             millis() - status.lastFrameAt > DF_ONLINE_TIMEOUT_MS) {
           status.online = false;
+          status.offlineEvents++;
         }
 #if PIN_DF_BUSY >= 0
         /*
@@ -1341,7 +1354,12 @@ const char *df_eq_name(uint8_t eq) {
 // --- console ----------------------------------------------------------------
 
 bool df_player_command(const char *line) {
+  // Whole word only. "dfplayer" is a radio-mode command handled earlier in
+  // poll_console(), and a bare prefix test here would claim it the moment that
+  // ordering changed. Every subcommand is "df <something>", so the character
+  // after the verb is a space or the end of the line.
   if (strncmp(line, "df", 2) != 0) return false;
+  if (line[2] != 0 && line[2] != ' ') return false;
   const char *arg = line + 2;
   while (*arg == ' ') arg++;
 
@@ -1481,7 +1499,8 @@ bool df_player_command(const char *line) {
                            : strcmp(s, "blink") == 0 ? DF_LED_BLINK
                                                      : DF_LED_AUTO;
     df_player_set_led(mode);
-    Serial.printf("[df] led %s\n", s && *s ? s : "auto");
+    // `s` is arg + 3 and cannot be null; only its emptiness is in question.
+    Serial.printf("[df] led %s\n", *s ? s : "auto");
     return true;
   }
 

@@ -119,6 +119,29 @@ static void apply_timezone() {
 #if USE_DS3231
 static const uint8_t DS3231_ADDR = 0x68;
 
+/// Control/status register, and the oscillator-stop flag in its top bit. See
+/// ds3231_oscillator_stopped() for why this matters more than it looks.
+static const uint8_t DS3231_REG_STATUS = 0x0F;
+static const uint8_t DS3231_OSF = 0x80;
+
+/// Whether a DS3231 was found and, if so, whether it had anything credible to
+/// say. Reported by soft_clock_rtc_state() so a clock that keeps coming back
+/// wrong can be diagnosed by asking rather than by guessing.
+static RtcState g_rtc_state = RTC_ABSENT;
+
+/*
+ * I2C transactions to the RTC that did not complete, since boot.
+ *
+ * The only I2C traffic this firmware issues and then checks the result of --
+ * U8g2 reports nothing about its own transfers -- so this is the bus health
+ * indicator the `diag` command has. It should stay at zero forever. A number
+ * that climbs means the bus itself is marginal: leads too long, both modules'
+ * pull-ups in parallel too weak for the capacitance, or the OLED's 400 kHz
+ * transfers colliding with something. The panel would be suffering equally and
+ * silently.
+ */
+static uint32_t g_rtc_i2c_errors;
+
 /// The DS3231 is rated for 400 kHz, and U8g2 re-asserts its own (possibly
 /// faster) bus clock before each of its own transfers -- so it is enough to set
 /// a safe clock here, around our own transfers, and let U8g2 put it back.
@@ -133,12 +156,76 @@ static bool ds3231_present() {
   return Wire.endTransmission() == 0;
 }
 
+/// Reads one register. `out` is left alone on failure.
+static bool ds3231_reg(uint8_t reg, uint8_t *out) {
+  ds3231_bus();
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission() != 0) {
+    g_rtc_i2c_errors++;
+    return false;
+  }
+  if (Wire.requestFrom((int)DS3231_ADDR, 1) != 1) {
+    g_rtc_i2c_errors++;
+    return false;
+  }
+  *out = (uint8_t)Wire.read();
+  return true;
+}
+
+/*
+ * The oscillator-stop flag, which is the only honest answer to "has this chip
+ * been counting the whole time?".
+ *
+ * The DS3231 sets OSF whenever its oscillator has been interrupted since the
+ * flag was last cleared -- a dead backup cell, a cell removed and refitted, or
+ * a first power-up out of the packet. The registers still read back *something*
+ * plausible afterwards, and a clock that has been stopped for a month is
+ * exactly as wrong as one that reads 2000-01-01, but only the second one looks
+ * wrong. Without this test the stale time was adopted as CLOCK_SRC_RTC, which
+ * outranks NVS, so a speaker with a flat coin cell came back with a confident
+ * and completely incorrect clock and no way to tell.
+ *
+ * Returns false when the register cannot be read at all -- an unreadable status
+ * register is a bus problem, and ds3231_read() will fail for the same reason.
+ */
+static bool ds3231_oscillator_stopped(bool *known) {
+  uint8_t reg = 0;
+  if (!ds3231_reg(DS3231_REG_STATUS, &reg)) {
+    if (known) *known = false;
+    return false;
+  }
+  if (known) *known = true;
+  return (reg & DS3231_OSF) != 0;
+}
+
+/// Clears OSF, after the chip has been given a time worth keeping. Read-modify-
+/// write rather than a blind zero: the other bits of 0x0F are the 32 kHz output
+/// enable and the two alarm flags, and clearing those uninvited would switch off
+/// an output somebody else's board may depend on.
+static void ds3231_clear_osf() {
+  uint8_t reg = 0;
+  if (!ds3231_reg(DS3231_REG_STATUS, &reg)) return;
+  if (!(reg & DS3231_OSF)) return;
+  ds3231_bus();
+  Wire.beginTransmission(DS3231_ADDR);
+  Wire.write(DS3231_REG_STATUS);
+  Wire.write((uint8_t)(reg & (uint8_t)~DS3231_OSF));
+  Wire.endTransmission();
+}
+
 static bool ds3231_read(struct tm *out) {
   ds3231_bus();
   Wire.beginTransmission(DS3231_ADDR);
   Wire.write((uint8_t)0x00);
-  if (Wire.endTransmission() != 0) return false;
-  if (Wire.requestFrom((int)DS3231_ADDR, 7) != 7) return false;
+  if (Wire.endTransmission() != 0) {
+    g_rtc_i2c_errors++;
+    return false;
+  }
+  if (Wire.requestFrom((int)DS3231_ADDR, 7) != 7) {
+    g_rtc_i2c_errors++;
+    return false;
+  }
 
   const uint8_t sec = Wire.read();
   const uint8_t min = Wire.read();
@@ -154,22 +241,40 @@ static bool ds3231_read(struct tm *out) {
     return false;
   }
 
-  memset(out, 0, sizeof(*out));
-  out->tm_sec = bcd_to_bin(sec & 0x7F);
-  out->tm_min = bcd_to_bin(min & 0x7F);
+  struct tm t;
+  memset(&t, 0, sizeof(t));
+  t.tm_sec = bcd_to_bin(sec & 0x7F);
+  t.tm_min = bcd_to_bin(min & 0x7F);
   // Bit 6 selects 12-hour mode. Every library writes 24-hour mode, but a chip
   // configured by something else could still be in 12-hour mode.
   if (hour & 0x40) {
     uint8_t h = bcd_to_bin(hour & 0x1F) % 12;
     if (hour & 0x20) h += 12;  // PM
-    out->tm_hour = h;
+    t.tm_hour = h;
   } else {
-    out->tm_hour = bcd_to_bin(hour & 0x3F);
+    t.tm_hour = bcd_to_bin(hour & 0x3F);
   }
-  out->tm_mday = bcd_to_bin(mday & 0x3F);
-  out->tm_mon = bcd_to_bin(month & 0x1F) - 1;
-  out->tm_year = bcd_to_bin(year) + 100;  // register year is 20xx
-  out->tm_isdst = 0;
+  t.tm_mday = bcd_to_bin(mday & 0x3F);
+  t.tm_mon = bcd_to_bin(month & 0x1F) - 1;
+  t.tm_year = bcd_to_bin(year) + 100;  // register year is 20xx
+  t.tm_isdst = 0;
+
+  /*
+   * Range-check before believing any of it.
+   *
+   * bcd_to_bin() is a shift and an add: it turns the nibble pair 0x9C into 96,
+   * and a register that came back garbled on a noisy bus -- a long lead, a
+   * marginal pull-up, an OLED transfer that collided -- produces month 14 or
+   * second 92 with no complaint. mktime() then normalises that into a date
+   * years away, which is adopted as the trusted time and pushed straight back
+   * into the chip and into NVS. One bad read would poison the clock for good.
+   */
+  if (t.tm_sec > 59 || t.tm_min > 59 || t.tm_hour > 23 || t.tm_mday < 1 ||
+      t.tm_mday > 31 || t.tm_mon < 0 || t.tm_mon > 11) {
+    return false;
+  }
+
+  *out = t;
   return true;
 }
 
@@ -184,9 +289,40 @@ static void ds3231_write(const struct tm &t) {
   Wire.write(bin_to_bcd((uint8_t)t.tm_mday));
   Wire.write(bin_to_bcd((uint8_t)(t.tm_mon + 1)));
   Wire.write(bin_to_bcd((uint8_t)(t.tm_year % 100)));
-  Wire.endTransmission();
+  if (Wire.endTransmission() != 0) return;
+  // The chip is now counting from a time we believe, so the "I lost track"
+  // flag no longer describes anything true. Clearing it is what makes the next
+  // boot's test mean something: left set, every boot from here would distrust a
+  // perfectly good clock.
+  ds3231_clear_osf();
 }
 #endif  // USE_DS3231
+
+RtcState soft_clock_rtc_state() {
+#if USE_DS3231
+  return g_rtc_state;
+#else
+  return RTC_ABSENT;
+#endif
+}
+
+uint32_t soft_clock_i2c_errors() {
+#if USE_DS3231
+  return g_rtc_i2c_errors;
+#else
+  return 0;
+#endif
+}
+
+const char *soft_clock_rtc_state_name() {
+  switch (soft_clock_rtc_state()) {
+    case RTC_STOPPED: return "oscillator stopped (check the coin cell)";
+    case RTC_UNSET: return "present, never set";
+    case RTC_OK: return "present, running";
+    case RTC_UNREADABLE: return "present but unreadable";
+    default: return "not fitted";
+  }
+}
 
 // ------------------------------------------------------------------- NTP -----
 /*
@@ -246,7 +382,13 @@ static void adopt_network_time() {
 #if USE_DS3231
   struct tm local;
   localtime_r(&now, &local);
-  if (ds3231_present()) ds3231_write(local);
+  // A network answer is the best time this speaker will ever have, so it is
+  // also what re-arms a chip whose oscillator had stopped: ds3231_write()
+  // clears OSF, and from here the RTC is trustworthy again.
+  if (ds3231_present()) {
+    ds3231_write(local);
+    g_rtc_state = RTC_OK;
+  }
 #endif
   persist_now();
 
@@ -295,12 +437,42 @@ void soft_clock_begin() {
   Wire.begin(PIN_OLED_SDA, PIN_OLED_SCL, 400000);
 
   if (ds3231_present()) {
+    /*
+     * Three questions, in this order, because a "yes" to the first makes the
+     * other two meaningless: has the oscillator been interrupted, do the
+     * registers read back sanely, and is the date one that was ever set.
+     */
+    bool osfKnown = false;
+    const bool stopped = ds3231_oscillator_stopped(&osfKnown);
     struct tm t;
-    if (ds3231_read(&t)) {
+    const bool readable = ds3231_read(&t);
+
+    if (osfKnown && stopped) {
+      /*
+       * The chip has not been counting continuously, so whatever it reads is
+       * fiction however plausible it looks. Do not adopt it and do not seed it
+       * either: the best time available right now is the NVS one already
+       * applied above, and writing that back would clear OSF and make the next
+       * boot trust a clock that is still only as good as the last save. The
+       * first real time from the network or the dashboard clears the flag; see
+       * ds3231_write().
+       */
+      g_rtc_state = RTC_STOPPED;
+      Serial.println("[clock] ds3231 reports its oscillator stopped -- the coin "
+                     "cell is flat or was refitted. Ignoring its time; using "
+                     "NVS/network instead. It is re-seeded and trusted again "
+                     "from the next real time set.");
+    } else if (readable) {
+      g_rtc_state = RTC_OK;
       apply_epoch(mktime(&t));
       g_source = CLOCK_SRC_RTC;
       Serial.println("[clock] ds3231");
+    } else if (!osfKnown) {
+      g_rtc_state = RTC_UNREADABLE;
+      Serial.println("[clock] ds3231 answered its address but not its registers "
+                     "-- check the pull-ups and the lead length");
     } else {
+      g_rtc_state = RTC_UNSET;
       Serial.println("[clock] ds3231 present but unset -- seeding it");
       struct tm seed;
       time_t now = time(nullptr);
@@ -308,6 +480,7 @@ void soft_clock_begin() {
       ds3231_write(seed);
     }
   } else {
+    g_rtc_state = RTC_ABSENT;
     Serial.println("[clock] no ds3231 on the bus");
   }
 #endif
@@ -395,10 +568,15 @@ void soft_clock_set(const struct tm &t, ClockSource source) {
   g_source = source;
 
 #if USE_DS3231
-  // Keep the hardware clock in step, so the next power cut is free.
+  // Keep the hardware clock in step, so the next power cut is free. This is
+  // also the manual route back from RTC_STOPPED: a time somebody typed in is a
+  // time worth keeping, and ds3231_write() clears the stop flag with it.
   struct tm norm;
   localtime_r(&epoch, &norm);
-  if (ds3231_present()) ds3231_write(norm);
+  if (ds3231_present()) {
+    ds3231_write(norm);
+    g_rtc_state = RTC_OK;
+  }
 #endif
   persist_now();
 }

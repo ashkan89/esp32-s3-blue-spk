@@ -108,6 +108,24 @@ enum UiSystemStatus : uint8_t {
   UI_STATUS_SUCCESS,
   UI_STATUS_ERROR,
   UI_STATUS_RESTART,
+  /*
+   * The two moments the speaker stops and starts being one, which get their own
+   * full-screen artwork rather than the bordered panel the others share.
+   *
+   * That is not decoration for its own sake. The panel is the shape this
+   * firmware uses for "something is happening, wait" -- an update, a reconnect,
+   * a countdown -- and going dark and silent immediately afterwards is the one
+   * case where that reads wrong: a speaker that shows "please wait" and then
+   * never comes back is indistinguishable from one that crashed. A farewell
+   * that is visibly a farewell says the shutdown was deliberate, which is the
+   * whole information content of the screen.
+   *
+   * GOODBYE is shown by power_sleep_now() before standby; WELCOME by setup()
+   * on the boot that follows one, so waking is acknowledged rather than looking
+   * like an unexplained reboot.
+   */
+  UI_STATUS_GOODBYE,
+  UI_STATUS_WELCOME,
 };
 
 /// Temporarily takes over the OLED for an important system operation. Progress

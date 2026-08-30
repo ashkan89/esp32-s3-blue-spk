@@ -66,6 +66,40 @@ enum ClockSource : uint8_t {
   CLOCK_SRC_NTP,        ///< network (SNTP)
 };
 
+/*
+ * What the hardware clock had to say for itself at boot.
+ *
+ * "Is there an RTC" and "is the RTC's time worth anything" are different
+ * questions, and the second one is the one that bites. A DS3231 whose backup
+ * cell has gone flat does not come back blank -- it comes back with whatever
+ * its registers powered up holding, or with the time it was last written before
+ * the cell died, and either is a plausible-looking date that would be adopted
+ * over NVS and over the build stamp. The chip says so itself in the
+ * oscillator-stop flag of register 0x0F: set whenever the oscillator has been
+ * interrupted since the flag was last cleared, which is exactly "everything I
+ * have been counting since then is fiction".
+ */
+enum RtcState : uint8_t {
+  RTC_ABSENT = 0,   ///< nothing answered on 0x68
+  RTC_STOPPED,      ///< present, but its oscillator stopped: time not believed
+  RTC_UNSET,        ///< present and running, never written (reads as 2000-01-01)
+  RTC_OK,           ///< present, running, and its time was adopted
+  RTC_UNREADABLE,   ///< present but the registers did not read back sanely
+};
+
+/// What the DS3231 probe found. RTC_ABSENT on a board with no RTC fitted, or
+/// with -DUSE_DS3231=0.
+RtcState soft_clock_rtc_state();
+
+/// One-line label for the above, for the info screen and the dashboard.
+const char *soft_clock_rtc_state_name();
+
+/// I2C transactions to the DS3231 that did not complete, since boot. The only
+/// bus-health number this firmware has -- U8g2 reports nothing about the
+/// panel's own transfers -- so a value that climbs is the shared bus being
+/// marginal for both devices. Always 0 with no RTC compiled in or fitted.
+uint32_t soft_clock_i2c_errors();
+
 /// Seeds the clock. Call after Wire has been set up (the DS3231 path needs it)
 /// and before a2dp_sink.start() (the NTP path needs the radio to itself).
 void soft_clock_begin();

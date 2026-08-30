@@ -70,6 +70,7 @@
 #include "battery.h"
 #include "ble_control.h"
 #include "df_player.h"
+#include "diagnostics.h"
 #include "hw_config.h"
 #include "leds.h"
 #include "management.h"
@@ -84,23 +85,27 @@
 // ---------------------------------------------------------------- config ----
 static const char *DEVICE_NAME = APP_NAME;
 
-static const int PIN_I2S_BCLK = 26;
-static const int PIN_I2S_LRCK = 25;
-// GPIO23, not the GPIO22 most I2S examples use: the OLED and the DS3231 share
-// the canonical I2C pair on GPIO21/22, and two signals cannot share a pin. See
-// the wiring note at the top of ui_config.h.
-static const int PIN_I2S_DOUT = 23;
+/*
+ * The pin map, and the compile-time check over the whole of it.
+ *
+ * pin_check.h holds the I2S pins and the status LED -- they used to be local
+ * constants here, which meant nothing else in the build could see them to check
+ * them against -- and asserts every GPIO in the firmware against the classic
+ * ESP32's restrictions and against each other. It emits no code and costs no
+ * flash; a clash or an impossible pin is a build error that names both ends.
+ *
+ * Everything stays overridable from build_flags exactly as before:
+ *
+ *     build_flags = -DPIN_MAP_I2S_DOUT=19 -DPIN_STATUS_LED=-1
+ *
+ * The status LED is what status_led.h drives as a real indicator: a distinct
+ * blink pattern per state, plus one-shot blips for events.
+ */
+#include "pin_check.h"
 
-// The on-board LED of most WROOM-32D devkits. It is the only indicator this
-// board has, so status_led.h drives it as a real one: a distinct blink pattern
-// per state, plus one-shot blips for events. Override either from build_flags
-// if your board wires the LED the other way round or brings it out elsewhere.
-#ifndef PIN_STATUS_LED
-#define PIN_STATUS_LED 2
-#endif
-#ifndef STATUS_LED_ACTIVE_HIGH
-#define STATUS_LED_ACTIVE_HIGH 1
-#endif
+static const int PIN_I2S_BCLK = PIN_MAP_I2S_BCLK;
+static const int PIN_I2S_LRCK = PIN_MAP_I2S_LRCK;
+static const int PIN_I2S_DOUT = PIN_MAP_I2S_DOUT;
 
 // Bluetooth "Audio/Video" minor device class 0x05, Loudspeaker. The IDF header
 // only names the major classes, so this one is spelled out.
@@ -211,6 +216,8 @@ static void print_help() {
       "  leds                      WS2812 ring status ('leds' alone lists its\n"
       "                            own commands: on, off, fx, list, color,\n"
       "                            bright, speed, react)\n"
+      "  diag                      full report: reset reason, heap, task stacks,\n"
+      "                            what was detected, link counters, partitions\n"
       "  help"));
 }
 
@@ -247,6 +254,10 @@ static void poll_console() {
       management_store_leds();
       continue;
     }
+    // Last of the handlers, because "diag" is a whole word nothing else claims
+    // and because the report is long enough that a mistyped command reaching it
+    // by accident would be a nuisance.
+    if (diagnostics_command(buf)) continue;
     if (strcmp(buf, "help") == 0 || strcmp(buf, "?") == 0) {
       print_help();
       continue;
@@ -1204,6 +1215,42 @@ void setup() {
   service_network_audio();
   // The DFPlayer needs nothing from the network, so it starts here too.
   service_dfplayer();
+
+  /*
+   * The self-test line: what this boot actually found.
+   *
+   * Every optional part of this speaker is absent-tolerant by design -- no
+   * panel, no RTC, no ring, no module, no cell, and the firmware carries on
+   * without mentioning it again. That is the right behaviour and it has one
+   * cost: a peripheral that is fitted but not working is indistinguishable from
+   * one that was never fitted, and the only difference between them is a line
+   * of log at boot that nobody wrote. This is that line, and it is also what
+   * `diag` prints in more detail later.
+   */
+  Serial.printf("[boot] self-test: oled %s | rtc %s | ring %s | dfplayer %s | "
+                "battery %s\n",
+                ui_present() ? "yes" : "no", soft_clock_rtc_state_name(),
+                have_leds ? "yes" : "no",
+                !radio_mode_has_dfplayer(management_radio_mode()) ? "n/a in this mode"
+                : df_player_running()                            ? "starting"
+                                                                 : "not started",
+                battery_present() ? "reading" : "no cell / gauge off");
+
+  /*
+   * Say hello, but only when there was a goodbye.
+   *
+   * On an ordinary boot the splash ui_begin() already drew is the greeting and
+   * a second one would just delay the first useful screen. Waking from standby
+   * is the case that needs acknowledging: the panel went dark deliberately, and
+   * coming back to a carousel mid-rotation gives no sign that the button press
+   * was what did it. The overlay is raised before ui_start() so it is the first
+   * thing the task draws.
+   */
+  if (power_woke_from_sleep()) {
+    Serial.println("[boot] woke from standby");
+    ui_show_system_status(UI_STATUS_WELCOME, "Good morning", DEVICE_NAME, -1,
+                          2600);
+  }
 
   // Radio is up: hand the panel over to the UI task, which from here on owns it.
   if (have_display) ui_start();
