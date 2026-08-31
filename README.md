@@ -403,6 +403,8 @@ pio run -t clean               # throw the build away and start again
 pio check -e esp32dev --skip-packages   # cppcheck over src/ only
 python scripts/test_pin_check.py        # the pin map, checked on the host
 python scripts/test_settings_backup.py  # the settings backup format, ditto
+python scripts/test_arabic_shaping.py   # Persian shaping and bidi
+python scripts/gen_arabic_tables.py     # ...and its tables, vs Unicode
 ```
 
 There is one environment, `esp32dev`, so `pio run` and `pio run -e esp32dev` are
@@ -1297,6 +1299,83 @@ disconnect, one on a track change. Override `PIN_STATUS_LED` or
 `STATUS_LED_ACTIVE_HIGH` from `build_flags` for boards that wire it differently.
 
 
+### Persian, Arabic, and other scripts
+
+Track titles and device names arrive from a phone in UTF-8, and until recently
+anything above U+00FF was replaced with a question mark on the way in — so a
+Persian title reached the panel as `????????` and no font could have rescued it.
+Codepoints now survive intact, and three things happen between the tag and the
+glass.
+
+**A font that has the letters.** The Latin fonts here are u8g2's `_tf` variants,
+which stop at U+00FF: they carry an accented `e` and nothing whatever above it.
+Arabic-script text is drawn with `u8g2_font_unifont_t_arabic` instead, which has
+the whole Arabic block, the contextual shapes, and ASCII besides — so a title
+mixing Persian and Latin needs one font, not two. It costs 8.9 KB of flash.
+
+**Shaping.** Arabic script is cursive: every letter has up to four shapes —
+isolated, initial, medial, final — and which is correct depends on whether its
+neighbours join. Unicode keeps the letters in one block and the shapes in
+another, so handing the letters straight to a font draws them all isolated,
+legible only in the way `S O M E T H I N G  L I K E  T H I S` is legible. Some
+pairs — lam followed by alef — must combine into one glyph and are simply wrong
+apart. [src/text_arabic.cpp](src/text_arabic.cpp) does this.
+
+**Ordering.** Persian reads right to left; u8g2 draws left to right. So the
+string is handed over reversed — but only its right-to-left parts, because a
+Latin word or a number embedded in a Persian title still reads left to right and
+reversing those would turn `ESP32` into `23PSE`.
+
+The one entertaining detail is farsi yeh, `ی`, the commonest letter in Persian.
+Its own contextual shapes are U+FBFC..FBFF and **none of the three Arabic fonts
+u8g2 ships contains them** — established by parsing `u8g2_fonts.c`, not assumed.
+So it borrows shapes that do exist, and the borrowing is correct rather than
+merely convenient: Persian yeh drops its two dots when isolated or final and
+keeps them when initial or medial, so it takes the dotless alef-maksura shapes
+(U+FEEF/FEF0) for the first two and the dotted Arabic yeh shapes
+(U+FEF3/FEF4) for the other two.
+
+#### What it does not do
+
+This is not a full implementation of UAX #9, the bidirectional algorithm. There
+are no explicit embedding controls, no bracket-pair resolution, and a neutral run
+simply inherits the direction of whatever precedes it. That is deliberate: the
+whole of UAX #9 arbitrates cases that do not arise in a track title on a 128×32
+panel, and getting the common case right in a page of code is the better trade.
+A string of Persian, a string of Latin, and either with the other embedded in it
+all come out correct.
+
+The real constraint is vertical. `unifont_t_arabic` is 16 px tall against the 6
+to 8 px the rows on a 32 px panel were spaced for, so a Persian line takes half
+the display. `draw_marquee()` pushes the baseline down far enough to keep the
+glyphs on screen and clips each line to its own glyph box, so a tall line cannot
+paint over its neighbours — but on the now-playing screen, which stacks four
+rows into 32 px, a Persian title is close-fitting and may crowd the row beneath
+it by a pixel or two. Latin rendering is byte-for-byte unchanged: the taller font
+and the tighter clip only apply to strings that actually contain Arabic.
+
+#### Checking it
+
+Two host-side scripts, because the interesting failures are all silent ones:
+
+```sh
+python scripts/gen_arabic_tables.py     # tables still agree with Unicode
+python scripts/test_arabic_shaping.py   # shaping is right, and the font has it
+python scripts/test_arabic_shaping.py --art   # ...and draw it, to be looked at
+```
+
+`gen_arabic_tables.py` derives the shaping tables rather than trusting them: the
+Presentation Forms-B block is laid out in letter order, so walking the base
+letters reproduces all 140-odd shapes, and the walk is checked against sixteen
+anchors from the Unicode charts. `test_arabic_shaping.py` checks the algorithm
+against Persian words whose correct output was worked out by hand, and then
+checks every shape the shaper can emit against the font's actual glyph table —
+which is how the farsi yeh problem was found rather than shipped.
+
+`--art` draws the result with the font's real bitmaps. That is the check the
+codepoint assertions cannot make, and it is worth running once after any change
+here: a table can be perfectly self-consistent and still be the wrong letter.
+
 ### Where the display gets its data
 
 Two read-only sources, and no path back into the audio:
@@ -2163,6 +2242,12 @@ group — most of the pass criteria below are one line of that report.
 
 - [ ] From the dashboard or the idle timer, enter standby. The **Goodbye**
       screen animates (moon rises, stars appear), then the panel goes dark.
+- [ ] **Nothing on the Goodbye or Good morning screen runs off the edge.** Both
+      draw their text into a 66 px column on the right, and both put text in it
+      that does not fit — "Good morning" alone is 69 px, and the detail line
+      carries the device name, which the owner chooses. The two lines must be
+      clipped to the column and scroll if they overflow, and the moon and stars
+      on the left must not be drawn over.
 - [ ] **The ring is genuinely dark**, not frozen mid-effect. WS2812s latch: a
       ring still showing colour here means the blanking frame did not go out.
 - [ ] The DFPlayer stops before standby, not after.
@@ -2244,6 +2329,16 @@ group — most of the pass criteria below are one line of that report.
       is `(int32_t)(now - deadline) >= 0` or `now - then >= interval`, never
       `now > deadline`.
 
+- [ ] **A Persian track title.** Play something with a Persian title, or set
+      the Bluetooth name to one. The letters must be **joined**, not a row of
+      separate shapes, and must read right to left. A Latin word or a number
+      inside it must still read left to right.
+- [ ] **A Persian name on the greeting screen.** Wake from standby with a
+      Persian device name: it must stay inside the right-hand panel and scroll
+      if it is too long, not run off the edge.
+- [ ] **Latin is unchanged.** Compare the now-playing screen against the
+      previous firmware with an ASCII title — it should be pixel-identical.
+
 ### 7. Persistence
 
 - [ ] Change several settings, power-cycle, confirm they survive.
@@ -2304,6 +2399,11 @@ group — most of the pass criteria below are one line of that report.
 | [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |
 | [scripts/test_pin_check.py](scripts/test_pin_check.py) | host-side test that the pin assertions actually assert — 21 cases, no board needed |
 | [scripts/test_settings_backup.py](scripts/test_settings_backup.py) | host-side test that the settings backup and restore agree, key by key, and cover every stored preference |
+| [src/text_arabic.h](src/text_arabic.h) / [.cpp](src/text_arabic.cpp) | Arabic-script shaping and right-to-left ordering: four contextual shapes per letter, lam-alef ligatures, mixed Latin runs |
+| [scripts/gen_arabic_tables.py](scripts/gen_arabic_tables.py) | derives the shaping tables from Unicode and checks the committed ones still match |
+| [scripts/test_arabic_shaping.py](scripts/test_arabic_shaping.py) | host-side test of the shaping and ordering, plus every emitted glyph against the font's real glyph table |
+| [scripts/font_bitmap.py](scripts/font_bitmap.py) | decodes u8g2 glyph bitmaps to draw text as ASCII art — the only way to see whether Persian came out looking like Persian |
+| [scripts/font_coverage.py](scripts/font_coverage.py) | parses u8g2_fonts.c to report which codepoints a font actually contains |
 
 ## Notes on the toolchain
 

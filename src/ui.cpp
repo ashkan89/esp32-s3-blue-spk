@@ -17,6 +17,7 @@
 #include "power.h"
 #include "soft_clock.h"
 #include "status_led.h"
+#include "text_arabic.h"
 #include "ui_assets.h"
 #include "ui_config.h"
 
@@ -95,6 +96,26 @@ static void draw_battery(int x, int y, const BatteryStatus &b) {
 #define FONT_TEXT u8g2_font_5x7_tf
 #define FONT_SMALL u8g2_font_4x6_tf
 #define FONT_BIGNUM u8g2_font_logisoso16_tn
+/*
+ * The one font here that can draw Persian.
+ *
+ * The Latin fonts above are "_tf", which means they stop at U+00FF: they
+ * carry an accented e and nothing whatever above it, so an Arabic-script
+ * title drew as a row of blank gaps. This one carries the whole Arabic
+ * block, the presentation forms the shaper emits, and ASCII besides -- so a
+ * title mixing Persian and Latin needs only this one font, not two.
+ *
+ * It costs 8.9 KB of flash and, more awkwardly, it is 16 px tall against the
+ * 6 to 8 px the rows on a 32 px panel were spaced for. draw_marquee() pushes
+ * the baseline down where it has to and clips to the glyph box, so a tall
+ * line cannot bleed into its neighbours; on the tightest rows that leaves
+ * Persian legible but close-fitting.
+ */
+#define FONT_ARABIC u8g2_font_unifont_t_arabic
+
+/// Enough for the longest string any screen draws (SystemOverlay::detail is
+/// 80 bytes) once shaping has grown it by half. See text_arabic_cap().
+static const size_t SHAPED_MAX = text_arabic_cap(80);
 
 static inline uint8_t *fb() { return u8g2.getBufferPtr(); }
 
@@ -310,6 +331,26 @@ static uint32_t str_hash(const char *s) {
 static void draw_marquee(MqSlot slot, int x, int baseline, int w, const char *s,
                          uint32_t dt_ms, bool center_if_short = false) {
   if (s == nullptr || s[0] == 0) return;
+
+  /*
+   * Arabic-script text is shaped, reordered and given the font that can draw
+   * it -- here, because every screen's text already funnels through this one
+   * function. Callers keep setting whichever Latin font they want and never
+   * have to know this exists.
+   */
+  char shaped[SHAPED_MAX];
+  bool arabic = false;
+  if (text_has_arabic(s)) {
+    s = text_arabic_visual(s, shaped, sizeof(shaped));
+    u8g2.setFont(FONT_ARABIC);
+    arabic = true;
+    // A baseline chosen for a 7 px font puts the top of a 16 px glyph above
+    // the top of the panel, where it is simply lost. Pushed down by the
+    // least that keeps it on screen.
+    const int ascent = u8g2.getAscent();
+    if (baseline < ascent) baseline = ascent;
+  }
+
   Marquee &m = mq[slot];
   const uint32_t h = str_hash(s);
   if (m.hash != h) {
@@ -319,7 +360,20 @@ static void draw_marquee(MqSlot slot, int x, int baseline, int w, const char *s,
   }
 
   const int tw = u8g2.getUTF8Width(s);
-  u8g2.setClipWindow(x, 0, x + w, H);
+  /*
+   * Latin keeps the full-height clip it always had, so those screens render
+   * exactly as before. The Arabic font is taller than the row it is given,
+   * so it is clipped to its own glyph box instead -- which cannot crop
+   * anything it draws, but does stop a tall line from painting over the row
+   * above or below it.
+   */
+  if (arabic) {
+    const int top = baseline - u8g2.getAscent();
+    const int bottom = baseline - u8g2.getDescent() + 1;  // descent is <= 0
+    u8g2.setClipWindow(x, top < 0 ? 0 : top, x + w, bottom > H ? H : bottom);
+  } else {
+    u8g2.setClipWindow(x, 0, x + w, H);
+  }
   if (tw <= w) {
     u8g2.drawUTF8(center_if_short ? x + (w - tw) / 2 : x, baseline, s);
   } else {
@@ -1029,7 +1083,7 @@ static bool system_overlay_snapshot(SystemOverlay *out, uint32_t now) {
  * no frame buffers.
  */
 static void draw_farewell(const SystemOverlay &status, bool leaving,
-                          uint32_t now) {
+                          uint32_t now, uint32_t dt) {
   // Full-screen erase rather than draw_panel()'s bordered box. The overlays are
   // composed on top of whatever screen was drawn first, so something has to
   // clear it -- and a border here would put this back in the "busy, please
@@ -1044,6 +1098,10 @@ static void draw_farewell(const SystemOverlay &status, bool leaving,
   // Ease out, so the movement settles rather than stopping dead.
   const float eased = 1.0f - (1.0f - phase) * (1.0f - phase);
   const float travel = leaving ? eased : 1.0f - eased;
+
+  // Where the text column starts, and therefore how much room the animation
+  // on the left has. Named because four things below depend on it agreeing.
+  static const int PANEL_X = 62;
 
   // The moon climbs the left third on the way out and sets on the way back.
   const int moon_y = 20 - (int)(travel * 12.0f);
@@ -1069,24 +1127,36 @@ static void draw_farewell(const SystemOverlay &status, bool leaving,
     u8g2.drawPixel(star[0], star[1] + 2);
   }
 
+  /*
+   * Clipped and scrolled, not just drawn.
+   *
+   * The panel is 66 px wide and the text put in it is not: "Good morning"
+   * alone is 69 px in FONT_TITLE, and the detail line carries the device
+   * name, which the owner chooses and can make any length. Drawn straight,
+   * both ran off the right-hand edge -- and because the rest of this screen
+   * is drawn from arithmetic rather than into a panel, there was nothing to
+   * clip them. draw_marquee() does both, and the two MQ_SYSTEM slots are
+   * the same ones the other overlay uses: only one of the two can be on
+   * screen at a time, so they cannot collide.
+   */
   u8g2.setFont(FONT_TITLE);
-  u8g2.drawUTF8(62, 14, status.title);
+  draw_marquee(MQ_SYSTEM_A, PANEL_X, 14, W - PANEL_X - 2, status.title, dt);
   u8g2.setFont(FONT_SMALL);
-  u8g2.drawUTF8(62, 25, status.detail);
+  draw_marquee(MQ_SYSTEM_B, PANEL_X, 25, W - PANEL_X - 2, status.detail, dt);
 
   /*
    * A rule that draws itself in as the animation runs, so there is a visible
    * sense of a countdown finishing rather than a static screen that then goes
    * black without warning. On the way back it retracts.
    */
-  const int rule = (int)(travel * (W - 66));
-  if (rule > 0) u8g2.drawHLine(62, 29, rule);
+  const int rule = (int)(travel * (W - PANEL_X - 4));
+  if (rule > 0) u8g2.drawHLine(PANEL_X, 29, rule);
 }
 
 static void draw_system_overlay(const SystemOverlay &status, uint32_t dt,
                                 uint32_t now) {
   if (status.kind == UI_STATUS_GOODBYE || status.kind == UI_STATUS_WELCOME) {
-    draw_farewell(status, status.kind == UI_STATUS_GOODBYE, now);
+    draw_farewell(status, status.kind == UI_STATUS_GOODBYE, now, dt);
     return;
   }
 

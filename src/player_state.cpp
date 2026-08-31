@@ -33,9 +33,16 @@ static inline void end_write() {
  *     sends a multi-line comment cannot break the layout;
  *   - runs of spaces collapse and the result is trimmed, because padded
  *     fixed-width tags are common and they look like a rendering bug;
- *   - UTF-8 sequences above U+00FF become a question mark. U8g2 "_tf" fonts
- *     carry Latin-1 and nothing more, so a CJK or emoji title would otherwise
- *     draw as invisible gaps.
+ *   - anything that is not valid UTF-8 is taken as a Latin-1 byte and
+ *     re-encoded, because plenty of players send tags that way.
+ *
+ * What it deliberately does NOT do any more is flatten everything above
+ * U+00FF to a question mark. That was here because the "_tf" fonts carry
+ * Latin-1 and nothing else, so anything else drew as an invisible gap -- but
+ * it meant a Persian or Arabic title arrived at the display as a row of
+ * question marks, and no font could have saved it. Codepoints now survive
+ * this function intact; picking a font that can draw them is ui.cpp's job,
+ * and text_arabic.cpp shapes them on the way to the panel.
  */
 static void copy_sanitised(char *dst, size_t cap, const char *src) {
   if (src == nullptr) {
@@ -58,7 +65,8 @@ static void copy_sanitised(char *dst, size_t cap, const char *src) {
       p += 2;
     } else if ((c & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 &&
                (p[2] & 0xC0) == 0x80) {
-      cp = 0xFFFD;  // three-byte: always beyond Latin-1
+      cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) |
+           (uint32_t)(p[2] & 0x3F);
       p += 3;
     } else if ((c & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
                (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
@@ -73,6 +81,9 @@ static void copy_sanitised(char *dst, size_t cap, const char *src) {
        * 0xC0 test, so the checks terminate the sequence safely and the byte is
        * handled by the Latin-1 fallback below.
        */
+      // Astral plane: emoji and the like. Decoded so the loop advances
+      // correctly, then dropped -- no font on this device has these, and a
+      // 16x16 emoji would not fit a 32 px panel anyway.
       cp = 0xFFFD;
       p += 4;
     } else {
@@ -92,15 +103,22 @@ static void copy_sanitised(char *dst, size_t cap, const char *src) {
       if (o + 1 >= cap) break;
     }
 
+    // Re-encoded as UTF-8 rather than stored as a codepoint, because
+    // drawUTF8() is what renders this and the width helpers measure it.
     if (cp < 0x80) {
       dst[o++] = (char)cp;
-    } else if (cp <= 0xFF) {
-      // Re-encode as UTF-8, because drawUTF8() is what renders this.
+    } else if (cp < 0x800) {
       if (o + 2 >= cap) break;
       dst[o++] = (char)(0xC0 | (cp >> 6));
       dst[o++] = (char)(0x80 | (cp & 0x3F));
-    } else {
-      dst[o++] = '?';
+    } else if (cp != 0xFFFD) {
+      // Three bytes. Arabic and Persian are two, but the presentation
+      // forms the shaper emits are three, so a title that already
+      // arrived shaped has to survive this too.
+      if (o + 3 >= cap) break;
+      dst[o++] = (char)(0xE0 | (cp >> 12));
+      dst[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+      dst[o++] = (char)(0x80 | (cp & 0x3F));
     }
   }
 

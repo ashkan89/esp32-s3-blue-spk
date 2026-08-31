@@ -2,3 +2,4 @@
 .vscode/
 !.vscode/extensions.json
 CMakeListsPrivate.txt
+scripts/__pycache__/
