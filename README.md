@@ -402,6 +402,7 @@ pio device monitor             # serial log at 115200
 pio run -t clean               # throw the build away and start again
 pio check -e esp32dev --skip-packages   # cppcheck over src/ only
 python scripts/test_pin_check.py        # the pin map, checked on the host
+python scripts/test_settings_backup.py  # the settings backup format, ditto
 ```
 
 There is one environment, `esp32dev`, so `pio run` and `pio run -e esp32dev` are
@@ -757,7 +758,118 @@ The console provides:
 - the mode switch between Wi-Fi and Bluetooth;
 - every OLED screen, carousel, wake and brightness control;
 - browser clock sync, device identity, restart, and full factory reset;
+- a settings backup to download and restore, covering every stored preference,
+  with the credentials in it encrypted under a passphrase of your choosing;
 - firmware upload and background check/install from the latest GitHub Release.
+
+### Backing up and restoring settings
+
+**Settings → Backup & restore** downloads every stored preference as one JSON
+file, and takes the same file back. It exists for the two cases that otherwise
+mean retyping the whole Settings page: a board that has been erased and
+reflashed, and a board that has been replaced.
+
+What is in the file is everything `saveSettings()` puts in NVS — identity, the
+Wi-Fi network, the GitHub release source, the DFPlayer start-up defaults, the
+battery pack description, panel blanking, power saving and standby, the whole
+ring configuration — plus the three clock preferences, which live in their own
+NVS namespace. That is 42 keys, and
+[scripts/test_settings_backup.py](scripts/test_settings_backup.py) holds it to
+that: it diffs the backup writer against the restore reader key by key and
+counts both against what `saveSettings()` actually stores, because a key added
+to one and forgotten in the other is a setting that silently does not survive.
+
+Two stored keys are left out on purpose. `radioMode` would let a file taken in
+Bluetooth mode restore a speaker that boots with no dashboard to undo it from;
+`bootFail` is the boot sentinel’s strike count, which describes a boot rather
+than a preference.
+
+#### The four secrets
+
+A backup without the Wi-Fi passphrase, the dashboard password, the setup hotspot
+password and the GitHub token restores a speaker that cannot reach the network
+and does not answer to its own password — which is not a restore. Writing them
+in clear text makes the file as dangerous as the credentials in it. So they
+travel in an authenticated envelope under a passphrase you choose at download
+time, and everything else in the file stays readable:
+
+| | |
+|---|---|
+| key derivation | PBKDF2-HMAC-SHA256, 50 000 iterations, 16-byte salt from the hardware RNG |
+| cipher | AES-256-GCM, 12-byte IV, 16-byte tag, no AAD |
+| plaintext | a small JSON object of the four values |
+
+GCM rather than CBC because the tag is what turns a wrong passphrase into a
+clean refusal instead of four settings quietly restored as line noise. **The
+envelope is decrypted and verified before any setting is touched, so a wrong
+passphrase changes nothing at all.**
+
+50 000 iterations is well below what you would use on a server, and that is a
+deliberate trade: this runs on a 240 MHz microcontroller inside an HTTP handler,
+where it is order-of-a-second with the SHA accelerator. The derivation yields
+every 2 048 rounds so the web server, the audio path and the task watchdog all
+survive it, and the restore reads the iteration count *out of the file* — so
+raising the constant later never orphans an old backup.
+
+**A blank passphrase does not mean "write them in clear text" — it means leave
+them out.** The firmware never produces a plaintext secret. It will still *read*
+one: a hand-written file, or a v1 backup from before the envelope existed, can
+carry any of the four next to the ordinary settings and they are applied the
+same way. That falls out of the format's one rule — only the keys present are
+applied — and it is what lets you type a new Wi-Fi password into a backup
+destined for a different network.
+
+The key comes from the passphrase alone, not from anything on this chip. Binding
+it to the eFuse MAC would be stronger against a stolen file and would also mean
+a backup only ever restores to the board it came from, which is half the reason
+the feature exists.
+
+Nothing here is homemade except the iteration loop, which is plain RFC 2898 and
+is checked against `hashlib.pbkdf2_hmac` — so a backup is readable by any
+standard tool, not just by this firmware:
+
+```python
+import base64, hashlib, json
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+doc = json.load(open("esp32-blue-spk-settings.json"))
+env = doc["secrets"]
+b64 = base64.b64decode
+key = hashlib.pbkdf2_hmac("sha256", b"YOUR PASSPHRASE",
+                          b64(env["salt"]), env["iterations"], dklen=32)
+print(json.loads(AESGCM(key).decrypt(
+    b64(env["iv"]), b64(env["data"]) + b64(env["tag"]), None)))
+```
+
+#### Restoring
+
+Restoring applies whatever keys the file carries, leaves the rest alone, writes
+NVS and restarts — a restore changes the hostname, the network and the dashboard
+password at once, none of which take effect without a reboot anyway. **If the
+backup carries a different dashboard password, signing back in needs that one.**
+
+Both ends are ordinary authenticated endpoints. Backup is a `POST` rather than a
+`GET` so the passphrase never lands in a URL, and therefore never in browser
+history or a proxy log:
+
+```sh
+# Download. Omit the passphrase and the four secrets are left out of the file.
+curl -u admin:PASSWORD -X POST -H "Content-Type: application/json" \
+     -d '{"passphrase":"correct horse battery staple"}' \
+     -OJ http://esp32-blue-spk.local/api/settings/backup
+
+# Restore, then the speaker restarts. The passphrase rides alongside the file.
+jq '. + {passphrase:"correct horse battery staple"}' \
+     esp32-blue-spk-settings.json |
+  curl -u admin:PASSWORD -H "Content-Type: application/json" --data-binary @- \
+       http://esp32-blue-spk.local/api/settings/restore
+```
+
+The file is pretty-printed on purpose: this is the one response here somebody
+may want to open, compare against another speaker, or hand-edit before restoring
+— which is most of the argument for encrypting the four secrets rather than the
+whole document. A trimmed-down file is valid, so a single card can be copied
+from one speaker to another by deleting the rest.
 
 ### Initial OTA migration
 
@@ -2015,7 +2127,9 @@ To make the ESP32 forget the paired phone, call
 
 Everything in this firmware that can be checked without a board already is: it
 compiles with no warnings, `pio check` reports no high-severity findings in
-`src/`, and `scripts/test_pin_check.py` proves the pin assertions still assert.
+`src/`, `scripts/test_pin_check.py` proves the pin assertions still assert, and
+`scripts/test_settings_backup.py` proves a settings backup still round-trips
+every stored preference.
 None of that says anything about how the speaker *behaves*, and the list below
 is what does. Work down it; the order is roughly worst-consequence-first.
 
@@ -2133,6 +2247,26 @@ group — most of the pass criteria below are one line of that report.
 ### 7. Persistence
 
 - [ ] Change several settings, power-cycle, confirm they survive.
+- [ ] **Settings backup round trip.** Download a backup with a passphrase,
+      factory reset, then restore the file. Every card on the Settings page
+      should come back as it was, the ring included, and the speaker should
+      rejoin the same Wi-Fi network on its own. Sign back in with the password
+      the *backup* carries. Time the download: the PBKDF2 pass should be around
+      a second, and **nothing should glitch in whatever is playing**.
+- [ ] **A wrong passphrase.** Restore the same file with one character changed.
+      It must be refused, and *nothing* may change — check the Wi-Fi network and
+      the dashboard password are still what they were, and that no restart
+      happened.
+- [ ] **A blank passphrase.** Download without one. The file must contain no
+      `secrets` block and no credential anywhere in it — read it and confirm.
+      Restoring it leaves the current passwords alone.
+- [ ] **A file the restore should refuse.** Drop some other `.json` on the card:
+      it must be rejected in the browser without a request being sent. Then
+      `curl` a `{}` body at `/api/settings/restore` — 400, and nothing changes.
+- [ ] **A trimmed backup.** Delete everything but the `leds` object from a
+      backup and restore it. The ring comes back; nothing else moves.
+- [ ] **Decrypt it off the device** with the Python snippet in the backup
+      section. If that fails, the file format is not what it claims to be.
 - [ ] **Power cycle during a settings write** — pull power repeatedly while
       saving from the dashboard. NVS should either keep the old value or take
       the new one; it must never fail to mount on the next boot.
@@ -2169,6 +2303,7 @@ group — most of the pass criteria below are one line of that report.
 | [src/pin_check.h](src/pin_check.h) | the whole pin map in one place, asserted at compile time — no code, no flash |
 | [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |
 | [scripts/test_pin_check.py](scripts/test_pin_check.py) | host-side test that the pin assertions actually assert — 21 cases, no board needed |
+| [scripts/test_settings_backup.py](scripts/test_settings_backup.py) | host-side test that the settings backup and restore agree, key by key, and cover every stored preference |
 
 ## Notes on the toolchain
 

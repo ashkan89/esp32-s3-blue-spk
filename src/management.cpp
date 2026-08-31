@@ -14,6 +14,11 @@
 #include <esp_bt.h>
 #include <esp_gap_bt_api.h>
 #include <esp_ota_ops.h>
+#include <esp_random.h>
+#include <mbedtls/base64.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/md.h>
+#include <mbedtls/platform_util.h>
 #include <nvs_flash.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -2220,6 +2225,664 @@ void handleSettingsSave() {
   sendJson(reply);
 }
 
+/*
+ * Settings backup and restore.
+ *
+ * One JSON file carrying every stored preference, so a board that has been
+ * reflashed -- or replaced outright -- can be put back the way it was without
+ * walking the whole Settings page again. handleSettingsBackup() writes the file
+ * and handleSettingsRestore() reads it back, and the two are kept next to each
+ * other on purpose: a key added to one and forgotten in the other is a setting
+ * that silently does not survive, which is the one failure a backup feature
+ * must not have. scripts/test_settings_backup.py holds them to that.
+ *
+ * Two stored keys are deliberately not in here, and they are the only two.
+ * radioMode decides which of Wi-Fi and Bluetooth owns the antenna, and a file
+ * taken in Bluetooth mode would restore a speaker that boots with no dashboard
+ * to undo it from -- the same reasoning as the boot sentinel above: a setting
+ * the user can change from a web page has to leave a way back. bootFail is that
+ * sentinel's own strike count, which describes this boot rather than any
+ * preference, and restoring somebody else's is meaningless.
+ *
+ *
+ * The four secrets, and why they are encrypted rather than left out.
+ *
+ * A backup without the Wi-Fi passphrase, the dashboard password, the setup
+ * hotspot password and the GitHub token restores a speaker that cannot reach
+ * the network and does not answer to its own password, which is not a restore.
+ * Writing them in clear text makes the file as dangerous as the credentials in
+ * it. So they travel in an authenticated envelope under a passphrase the owner
+ * chooses at download time, and everything else stays readable:
+ *
+ *   PBKDF2-HMAC-SHA256 over the passphrase, 16-byte salt from the hardware RNG
+ *   AES-256-GCM, 12-byte IV, 16-byte tag, over a small JSON of the four values
+ *
+ * GCM rather than CBC because the tag is what turns a wrong passphrase into a
+ * clean refusal instead of four settings quietly restored as line noise. The
+ * plaintext is decrypted and verified before any setting is touched, so a bad
+ * passphrase changes nothing at all.
+ *
+ * A blank passphrase does not mean "write them in clear text" -- it means leave
+ * them out. The firmware never produces a plaintext secret. It will still read
+ * one: a hand-written file, or a v1 backup from before this envelope existed,
+ * can carry any of the four next to the ordinary settings and they are applied
+ * the same way. That falls out of the format's one rule -- only the keys
+ * present are applied -- and it is what lets somebody type a new Wi-Fi password
+ * into a backup destined for a different network.
+ *
+ * The key is derived from the passphrase alone, not from anything on this chip.
+ * Binding it to the eFuse MAC would be stronger against a stolen file and would
+ * also mean a backup only ever restores to the board it came from, which is
+ * half the reason the feature exists.
+ */
+constexpr uint16_t SETTINGS_BACKUP_VERSION = 2;
+
+// PBKDF2 cost. Well below what a server would use, because this runs on a
+// 240 MHz microcontroller inside an HTTP handler: at 50k the derivation is
+// order-of-a-second with the SHA accelerator, and the yield below keeps the web
+// server, the audio path and the task watchdog alive through it. Restores read
+// the count out of the file, so raising this never orphans an old backup.
+constexpr uint32_t SETTINGS_BACKUP_ITERATIONS = 50000;
+// What a file is allowed to ask for, so a hostile or corrupt one cannot park
+// the loop task in a key derivation for ten minutes.
+constexpr uint32_t SETTINGS_BACKUP_ITERATIONS_MAX = 400000;
+constexpr size_t SETTINGS_BACKUP_SALT_LEN = 16;
+constexpr size_t SETTINGS_BACKUP_IV_LEN = 12;
+constexpr size_t SETTINGS_BACKUP_TAG_LEN = 16;
+// The four secrets as JSON, with room to spare: a 63-character Wi-Fi
+// passphrase, two passwords and a GitHub token come to about 350 bytes.
+constexpr size_t SETTINGS_BACKUP_SECRETS_MAX = 768;
+// The passphrase floor. Short enough not to be a nuisance, long enough that the
+// iteration count above is doing useful work rather than decorating a PIN.
+constexpr size_t SETTINGS_BACKUP_PASSPHRASE_MIN = 8;
+
+const char *const SETTINGS_SECRET_KEYS[] = {"wifiPassword", "apPassword",
+                                            "adminPassword", "githubToken"};
+
+String base64Encode(const uint8_t *data, size_t len) {
+  size_t needed = 0;
+  mbedtls_base64_encode(nullptr, 0, &needed, data, len);
+  char *buf = (char *)malloc(needed + 1);
+  if (!buf) return String();
+  size_t written = 0;
+  String out;
+  if (mbedtls_base64_encode((unsigned char *)buf, needed, &written, data, len) == 0) {
+    buf[written] = '\0';
+    out = buf;
+  }
+  free(buf);
+  return out;
+}
+
+// Decoded length, or 0 if the text is not base64 or does not fit.
+size_t base64Decode(const String &text, uint8_t *out, size_t outMax) {
+  size_t written = 0;
+  if (mbedtls_base64_decode(out, outMax, &written,
+                            (const unsigned char *)text.c_str(),
+                            text.length()) != 0) {
+    return 0;
+  }
+  return written;
+}
+
+/*
+ * PBKDF2-HMAC-SHA256, one 32-byte block, written out rather than handed to
+ * mbedtls_pkcs5_pbkdf2_hmac().
+ *
+ * The library call is a single blocking loop with no way in, and fifty thousand
+ * HMACs inside the loop task is long enough to stall the I2S writer and to put
+ * the task watchdog in an interesting mood. Doing the iteration here costs
+ * twenty lines and buys a vTaskDelay() every few thousand rounds, which is the
+ * difference between a busy second and a glitch in whatever is playing.
+ */
+bool deriveBackupKey(const String &passphrase, const uint8_t *salt,
+                     size_t saltLen, uint32_t iterations, uint8_t out[32]) {
+  const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (!info || !iterations) return false;
+  mbedtls_md_context_t ctx;
+  mbedtls_md_init(&ctx);
+  if (mbedtls_md_setup(&ctx, info, 1) != 0) {
+    mbedtls_md_free(&ctx);
+    return false;
+  }
+  const unsigned char *key = (const unsigned char *)passphrase.c_str();
+  const size_t keyLen = passphrase.length();
+  uint8_t block[32], u[32];
+  const uint8_t counter[4] = {0, 0, 0, 1};  // one output block, so INT(1)
+  bool ok = mbedtls_md_hmac_starts(&ctx, key, keyLen) == 0 &&
+            mbedtls_md_hmac_update(&ctx, salt, saltLen) == 0 &&
+            mbedtls_md_hmac_update(&ctx, counter, sizeof(counter)) == 0 &&
+            mbedtls_md_hmac_finish(&ctx, u) == 0;
+  memcpy(block, u, sizeof(block));
+  for (uint32_t i = 1; ok && i < iterations; ++i) {
+    ok = mbedtls_md_hmac_starts(&ctx, key, keyLen) == 0 &&
+         mbedtls_md_hmac_update(&ctx, u, sizeof(u)) == 0 &&
+         mbedtls_md_hmac_finish(&ctx, u) == 0;
+    for (size_t j = 0; j < sizeof(block); ++j) block[j] ^= u[j];
+    if ((i & 0x7FF) == 0) vTaskDelay(1);
+  }
+  mbedtls_md_free(&ctx);
+  if (ok) memcpy(out, block, 32);
+  mbedtls_platform_zeroize(block, sizeof(block));
+  mbedtls_platform_zeroize(u, sizeof(u));
+  return ok;
+}
+
+void handleSettingsBackup() {
+  if (!requireAuth()) return;
+
+  /*
+   * The passphrase arrives in a POST body, not a query string: this endpoint
+   * used to be a GET, and a secret in a URL ends up in browser history and in
+   * every log between here and there. A missing body is not an error -- it is
+   * the unencrypted case, which is to say the one where the secrets are left
+   * out -- so this deliberately does not go through readBody().
+   */
+  String passphrase;
+  if (server.hasArg("plain")) {
+    JsonDocument request;
+    if (deserializeJson(request, server.arg("plain"))) {
+      sendError(400, "Invalid JSON request body");
+      return;
+    }
+    passphrase = request["passphrase"] | "";
+  }
+  if (passphrase.length() && passphrase.length() < SETTINGS_BACKUP_PASSPHRASE_MIN) {
+    sendError(400, String("Backup passphrase must be at least ") +
+                       SETTINGS_BACKUP_PASSPHRASE_MIN +
+                       " characters, or blank to leave the secrets out");
+    return;
+  }
+
+  JsonDocument doc;
+  doc["app"] = APP_NAME;
+  doc["backupVersion"] = SETTINGS_BACKUP_VERSION;
+  doc["firmware"] = FW_VERSION;
+  doc["device"] = settings.deviceName;
+  doc["hostname"] = settings.hostname;
+  // Zero if the clock has never been set, which the dashboard shows as an
+  // unknown date rather than as 1970.
+  doc["createdEpoch"] = (uint32_t)time(nullptr);
+  // So the page, and anyone reading the file later, can tell at a glance which
+  // of the two kinds of backup this is without decrypting anything.
+  doc["encrypted"] = passphrase.length() > 0;
+
+  JsonObject s = doc["settings"].to<JsonObject>();
+  s["hostname"] = settings.hostname;
+  s["deviceName"] = settings.deviceName;
+  s["ssid"] = settings.ssid;
+  s["apAlways"] = settings.apAlways;
+  s["githubRepo"] = settings.githubRepo;
+  s["githubAsset"] = settings.githubAsset;
+
+  JsonObject df = s["dfplayer"].to<JsonObject>();
+  df["source"] = settings.dfSource;
+  df["volume"] = settings.dfVolume;
+  df["eq"] = settings.dfEq;
+  df["loop"] = settings.dfLoop;
+  df["loopFolder"] = settings.dfLoopFolder;
+  df["autoplay"] = settings.dfAutoplay;
+
+  JsonObject bat = s["battery"].to<JsonObject>();
+  bat["enabled"] = settings.batteryEnabled;
+  bat["divider"] = serialized(String(settings.batteryDivider, 3));
+  bat["calibration"] = serialized(String(settings.batteryCalibration, 4));
+  bat["cells"] = settings.batteryCells;
+  bat["full"] = serialized(String(settings.batteryFull, 2));
+  bat["empty"] = serialized(String(settings.batteryEmpty, 2));
+  bat["low"] = settings.batteryLow;
+  bat["critical"] = settings.batteryCritical;
+
+  JsonObject oled = s["display"].to<JsonObject>();
+  oled["blankMode"] = settings.oledBlankMode;
+  oled["blankAfterSeconds"] = settings.oledBlankAfterS;
+
+  JsonObject pwr = s["power"].to<JsonObject>();
+  pwr["mode"] = settings.powerMode;
+  pwr["threshold"] = settings.powerThreshold;
+  pwr["sleepMode"] = settings.sleepMode;
+  pwr["sleepAfterSeconds"] = settings.sleepAfterS;
+
+  JsonObject led = s["leds"].to<JsonObject>();
+  led["enabled"] = settings.leds.enabled;
+  led["effect"] = settings.leds.effect;
+  led["brightness"] = settings.leds.brightness;
+  led["speed"] = settings.leds.speed;
+  led["reactivity"] = settings.leds.reactivity;
+  led["color"] = colorText(settings.leds.color);
+  led["color2"] = colorText(settings.leds.color2);
+  led["idleOff"] = settings.leds.idleOff;
+  led["idleAfterSeconds"] = settings.leds.idleAfterS;
+
+  // The clock keeps its preferences in its own NVS namespace, so they come
+  // through the soft_clock API rather than out of `settings`. The time itself is
+  // not backed up -- it would be wrong by however long the file sat around.
+  JsonObject clk = s["clock"].to<JsonObject>();
+  clk["use24h"] = soft_clock_use_24h();
+  clk["autoSync"] = soft_clock_auto_sync();
+  clk["offsetMinutes"] = soft_clock_utc_offset_min();
+
+  // The four secrets, as their own document, so what gets encrypted is a
+  // self-describing object rather than four values in a fixed order that a
+  // later version would have to keep forever.
+  JsonDocument secretsDoc;
+  JsonObject sec = secretsDoc.to<JsonObject>();
+  sec["wifiPassword"] = settings.wifiPassword;
+  sec["apPassword"] = settings.apPassword;
+  sec["adminPassword"] = settings.adminPassword;
+  sec["githubToken"] = settings.githubToken;
+
+  if (passphrase.length()) {
+    String plain;
+    serializeJson(secretsDoc, plain);
+    if (plain.length() > SETTINGS_BACKUP_SECRETS_MAX) {
+      sendError(500, "Stored credentials are too long to fit in a backup");
+      return;
+    }
+    uint8_t salt[SETTINGS_BACKUP_SALT_LEN], iv[SETTINGS_BACKUP_IV_LEN];
+    uint8_t tag[SETTINGS_BACKUP_TAG_LEN], key[32];
+    esp_fill_random(salt, sizeof(salt));
+    esp_fill_random(iv, sizeof(iv));
+    if (!deriveBackupKey(passphrase, salt, sizeof(salt),
+                         SETTINGS_BACKUP_ITERATIONS, key)) {
+      sendError(500, "Could not derive a key from that passphrase");
+      return;
+    }
+    uint8_t *cipher = (uint8_t *)malloc(plain.length());
+    if (!cipher) {
+      mbedtls_platform_zeroize(key, sizeof(key));
+      sendError(500, "Out of memory encrypting the backup");
+      return;
+    }
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (rc == 0) {
+      rc = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT, plain.length(),
+                                     iv, sizeof(iv), nullptr, 0,
+                                     (const unsigned char *)plain.c_str(),
+                                     cipher, sizeof(tag), tag);
+    }
+    mbedtls_gcm_free(&gcm);
+    mbedtls_platform_zeroize(key, sizeof(key));
+    if (rc != 0) {
+      free(cipher);
+      sendError(500, "Could not encrypt the backup");
+      return;
+    }
+    JsonObject env = doc["secrets"].to<JsonObject>();
+    env["cipher"] = "AES-256-GCM";
+    env["kdf"] = "PBKDF2-HMAC-SHA256";
+    env["iterations"] = SETTINGS_BACKUP_ITERATIONS;
+    env["salt"] = base64Encode(salt, sizeof(salt));
+    env["iv"] = base64Encode(iv, sizeof(iv));
+    env["tag"] = base64Encode(tag, sizeof(tag));
+    env["data"] = base64Encode(cipher, plain.length());
+    free(cipher);
+    // The plaintext lived in a String, which reallocates and does not scrub, so
+    // this is the best that can be done short of not using one.
+    mbedtls_platform_zeroize((void *)plain.c_str(), plain.length());
+  }
+
+  /*
+   * Pretty-printed, and sent with a filename attached.
+   *
+   * Indented because a backup nobody can read is a backup nobody trusts: this
+   * is the one file here a person may want to open, compare against another
+   * speaker, or hand-edit before restoring -- which is most of the argument for
+   * encrypting the four secrets rather than the whole document.
+   *
+   * Content-Disposition is for the curl case. The dashboard fetches this with
+   * an Authorization header and names the blob itself, because a plain link
+   * would arrive unauthenticated.
+   */
+  String body;
+  serializeJsonPretty(doc, body);
+  char disposition[128];
+  snprintf(disposition, sizeof(disposition),
+           "attachment; filename=\"%s-settings.json\"",
+           settings.hostname.c_str());
+  server.sendHeader("Cache-Control", "no-store");
+  server.sendHeader("Content-Disposition", disposition);
+  server.send(200, "application/json", body);
+  ui_show_system_status(UI_STATUS_SUCCESS, "Settings backed up",
+                        passphrase.length() ? "Encrypted, downloaded"
+                                            : "No secrets, downloaded",
+                        -1, 3000);
+}
+
+void handleSettingsRestore() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+
+  /*
+   * Is this actually one of our backup files?
+   *
+   * `app` is not compared against APP_NAME: that name can be overridden with a
+   * build flag, and refusing a file because the two firmwares were built with
+   * different -DAPP_NAME would be a restore that fails for no reason. Its
+   * presence, alongside a `settings` object, is enough to tell a backup from
+   * whatever other JSON got dropped on the page by accident.
+   *
+   * The version is the half that matters later: a format change bumps it, and
+   * an older firmware then refuses the file outright instead of applying the
+   * half of it that still parses. Version 1 predates the encrypted envelope and
+   * carried the four secrets in clear text; it still restores, because the
+   * plaintext path below never went away.
+   */
+  JsonObjectConst s = body["settings"].as<JsonObjectConst>();
+  if (s.isNull() || body["app"].isNull()) {
+    sendError(400, "That file is not a settings backup");
+    return;
+  }
+  const uint16_t version = body["backupVersion"] | (uint16_t)0;
+  if (!version || version > SETTINGS_BACKUP_VERSION) {
+    sendError(400, String("Backup format version ") + version +
+                       " is not supported; this firmware reads up to " +
+                       SETTINGS_BACKUP_VERSION);
+    return;
+  }
+
+  /*
+   * The secrets, from whichever of the two places they are in.
+   *
+   * Plaintext keys sitting next to the ordinary settings are folded in first --
+   * that is a v1 file, or one somebody hand-wrote -- and then the encrypted
+   * envelope overwrites them, so a file carrying both ends up with the
+   * authenticated copy. Everything here happens before the first setting is
+   * touched: a wrong passphrase has to leave the speaker exactly as it was.
+   */
+  JsonDocument secretsDoc;
+  JsonObject sec = secretsDoc.to<JsonObject>();
+  for (const char *name : SETTINGS_SECRET_KEYS) {
+    if (!s[name].isNull()) sec[name] = s[name].as<String>();
+  }
+
+  JsonObjectConst env = body["secrets"].as<JsonObjectConst>();
+  if (!env.isNull()) {
+    const String passphrase = body["passphrase"] | "";
+    if (!passphrase.length()) {
+      sendError(400, "This backup is encrypted; it needs the passphrase it was "
+                     "downloaded with");
+      return;
+    }
+    const String cipherName = env["cipher"] | "";
+    const String kdfName = env["kdf"] | "";
+    if (cipherName != "AES-256-GCM" || kdfName != "PBKDF2-HMAC-SHA256") {
+      sendError(400, "This backup uses an encryption scheme this firmware does "
+                     "not know");
+      return;
+    }
+    const uint32_t iterations = env["iterations"] | (uint32_t)0;
+    if (!iterations || iterations > SETTINGS_BACKUP_ITERATIONS_MAX) {
+      sendError(400, "That backup asks for an unreasonable key derivation cost");
+      return;
+    }
+    uint8_t salt[SETTINGS_BACKUP_SALT_LEN], iv[SETTINGS_BACKUP_IV_LEN];
+    uint8_t tag[SETTINGS_BACKUP_TAG_LEN], key[32];
+    const String saltText = env["salt"] | "";
+    const String ivText = env["iv"] | "";
+    const String tagText = env["tag"] | "";
+    const String dataText = env["data"] | "";
+    if (base64Decode(saltText, salt, sizeof(salt)) != sizeof(salt) ||
+        base64Decode(ivText, iv, sizeof(iv)) != sizeof(iv) ||
+        base64Decode(tagText, tag, sizeof(tag)) != sizeof(tag)) {
+      sendError(400, "That backup's encryption header is malformed");
+      return;
+    }
+    uint8_t *cipher = (uint8_t *)malloc(SETTINGS_BACKUP_SECRETS_MAX);
+    if (!cipher) {
+      sendError(500, "Out of memory decrypting the backup");
+      return;
+    }
+    const size_t cipherLen =
+        base64Decode(dataText, cipher, SETTINGS_BACKUP_SECRETS_MAX);
+    if (!cipherLen) {
+      free(cipher);
+      sendError(400, "That backup's encrypted block is malformed or too long");
+      return;
+    }
+    if (!deriveBackupKey(passphrase, salt, sizeof(salt), iterations, key)) {
+      free(cipher);
+      sendError(500, "Could not derive a key from that passphrase");
+      return;
+    }
+    // One byte of headroom so the decrypted JSON can be terminated in place.
+    uint8_t *plain = (uint8_t *)malloc(cipherLen + 1);
+    if (!plain) {
+      free(cipher);
+      mbedtls_platform_zeroize(key, sizeof(key));
+      sendError(500, "Out of memory decrypting the backup");
+      return;
+    }
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+    if (rc == 0) {
+      rc = mbedtls_gcm_auth_decrypt(&gcm, cipherLen, iv, sizeof(iv), nullptr, 0,
+                                    tag, sizeof(tag), cipher, plain);
+    }
+    mbedtls_gcm_free(&gcm);
+    mbedtls_platform_zeroize(key, sizeof(key));
+    free(cipher);
+    if (rc != 0) {
+      mbedtls_platform_zeroize(plain, cipherLen);
+      free(plain);
+      // MBEDTLS_ERR_GCM_AUTH_FAILED is overwhelmingly a typed-it-wrong, and
+      // saying so beats a number. It is also the only answer a tampered file
+      // gets, which is the point of the tag.
+      Serial.printf("[web] settings restore: secrets did not authenticate (%d)\n",
+                    rc);
+      sendError(400, "The passphrase does not match this backup, or the file "
+                     "has been altered. Nothing was changed.");
+      return;
+    }
+    plain[cipherLen] = '\0';
+    JsonDocument decoded;
+    const DeserializationError error = deserializeJson(decoded, (const char *)plain);
+    mbedtls_platform_zeroize(plain, cipherLen);
+    free(plain);
+    if (error) {
+      sendError(400, "That backup decrypted to something that is not settings");
+      return;
+    }
+    for (const char *name : SETTINGS_SECRET_KEYS) {
+      if (!decoded[name].isNull()) sec[name] = decoded[name].as<String>();
+    }
+  }
+
+  /*
+   * Applied key by key, and only where the key is present, so a file from an
+   * older firmware -- or one somebody trimmed by hand -- restores what it
+   * carries and leaves the rest of the speaker alone.
+   *
+   * The validation mirrors loadSettings() rather than handleSettingsSave().
+   * That difference is deliberate: saving is somebody choosing a new value, and
+   * a six-character minimum on a new dashboard password belongs there.
+   * Restoring is reproducing a state the speaker was already in, and the stock
+   * password is "admin" -- five characters. Held to the stricter rule, a backup
+   * of a fresh speaker would silently not restore its own password.
+   */
+  if (!s["hostname"].isNull()) {
+    settings.hostname = cleanHostname(s["hostname"].as<String>());
+  }
+  if (!s["deviceName"].isNull()) {
+    settings.deviceName = cleanDeviceName(s["deviceName"].as<String>(), APP_NAME);
+  }
+  if (!s["ssid"].isNull()) settings.ssid = s["ssid"].as<String>();
+  if (!s["apAlways"].isNull()) settings.apAlways = s["apAlways"].as<bool>();
+  if (!s["githubRepo"].isNull()) settings.githubRepo = s["githubRepo"].as<String>();
+  if (!s["githubAsset"].isNull()) {
+    settings.githubAsset = s["githubAsset"].as<String>();
+  }
+
+  if (!sec["wifiPassword"].isNull()) {
+    settings.wifiPassword = sec["wifiPassword"].as<String>();
+  }
+  if (!sec["apPassword"].isNull()) {
+    const String password = sec["apPassword"].as<String>();
+    if (password.length() >= 8) settings.apPassword = password;
+  }
+  if (!sec["adminPassword"].isNull()) {
+    const String password = sec["adminPassword"].as<String>();
+    if (password.length()) settings.adminPassword = password;
+  }
+  // Unlike the Settings form, an empty token here is not "leave it alone": it
+  // means the backup came from a speaker with no token, and clearing it is the
+  // correct restore.
+  if (!sec["githubToken"].isNull()) {
+    settings.githubToken = sec["githubToken"].as<String>();
+  }
+
+  JsonObjectConst df = s["dfplayer"].as<JsonObjectConst>();
+  if (!df.isNull()) {
+    if (!df["source"].isNull()) {
+      const int want = df["source"].as<int>();
+      if (want == DF_SRC_USB || want == DF_SRC_SD || want == DF_SRC_FLASH ||
+          want == DF_SRC_AUX) {
+        settings.dfSource = (uint8_t)want;
+      }
+    }
+    if (!df["volume"].isNull()) {
+      settings.dfVolume =
+          (uint8_t)constrain(df["volume"].as<int>(), 0, (int)DF_VOLUME_MAX);
+    }
+    if (!df["eq"].isNull()) {
+      settings.dfEq = (uint8_t)constrain(df["eq"].as<int>(), 0, 5);
+    }
+    if (!df["loop"].isNull()) {
+      settings.dfLoop =
+          (uint8_t)constrain(df["loop"].as<int>(), 0, (int)DF_LOOP_RANDOM);
+    }
+    if (!df["loopFolder"].isNull()) {
+      settings.dfLoopFolder =
+          (uint8_t)constrain(df["loopFolder"].as<int>(), 1, 99);
+    }
+    if (!df["autoplay"].isNull()) settings.dfAutoplay = df["autoplay"].as<bool>();
+  }
+
+  JsonObjectConst bat = s["battery"].as<JsonObjectConst>();
+  if (!bat.isNull()) {
+    if (!bat["enabled"].isNull()) {
+      settings.batteryEnabled = bat["enabled"].as<bool>();
+    }
+    if (!bat["divider"].isNull()) {
+      settings.batteryDivider = bat["divider"].as<float>();
+    }
+    if (!bat["calibration"].isNull()) {
+      settings.batteryCalibration = bat["calibration"].as<float>();
+    }
+    if (!bat["cells"].isNull()) {
+      settings.batteryCells = (uint8_t)constrain(bat["cells"].as<int>(), 1, 4);
+    }
+    if (!bat["full"].isNull()) settings.batteryFull = bat["full"].as<float>();
+    if (!bat["empty"].isNull()) settings.batteryEmpty = bat["empty"].as<float>();
+    if (!bat["low"].isNull()) {
+      settings.batteryLow = (uint8_t)constrain(bat["low"].as<int>(), 1, 90);
+    }
+    if (!bat["critical"].isNull()) {
+      settings.batteryCritical =
+          (uint8_t)constrain(bat["critical"].as<int>(), 1, 50);
+    }
+  }
+
+  JsonObjectConst oled = s["display"].as<JsonObjectConst>();
+  if (!oled.isNull()) {
+    if (!oled["blankMode"].isNull()) {
+      settings.oledBlankMode = (uint8_t)constrain(oled["blankMode"].as<int>(), 0,
+                                                  (int)UI_BLANK_ALWAYS);
+    }
+    if (!oled["blankAfterSeconds"].isNull()) {
+      settings.oledBlankAfterS = (uint16_t)constrain(
+          oled["blankAfterSeconds"].as<int>(), (int)UI_BLANK_AFTER_S_MIN,
+          (int)UI_BLANK_AFTER_S_MAX);
+    }
+  }
+
+  JsonObjectConst pwr = s["power"].as<JsonObjectConst>();
+  if (!pwr.isNull()) {
+    if (!pwr["mode"].isNull()) {
+      settings.powerMode =
+          (uint8_t)constrain(pwr["mode"].as<int>(), 0, (int)POWER_MODE_AUTO);
+    }
+    if (!pwr["threshold"].isNull()) {
+      settings.powerThreshold =
+          (uint8_t)constrain(pwr["threshold"].as<int>(), 0, 100);
+    }
+    if (!pwr["sleepMode"].isNull()) {
+      settings.sleepMode = (uint8_t)constrain(pwr["sleepMode"].as<int>(), 0,
+                                              (int)SLEEP_MODE_SAVING);
+    }
+    if (!pwr["sleepAfterSeconds"].isNull()) {
+      settings.sleepAfterS = (uint16_t)constrain(
+          pwr["sleepAfterSeconds"].as<int>(), (int)POWER_SLEEP_AFTER_S_MIN,
+          (int)POWER_SLEEP_AFTER_S_MAX);
+    }
+  }
+
+  JsonObjectConst led = s["leds"].as<JsonObjectConst>();
+  if (!led.isNull()) {
+    if (!led["enabled"].isNull()) settings.leds.enabled = led["enabled"].as<bool>();
+    if (!led["effect"].isNull()) {
+      const int want = led["effect"].as<int>();
+      if (want >= 0 && want < LED_FX_COUNT) settings.leds.effect = (uint8_t)want;
+    }
+    if (!led["brightness"].isNull()) {
+      settings.leds.brightness =
+          (uint8_t)constrain(led["brightness"].as<int>(), 0, 255);
+    }
+    if (!led["speed"].isNull()) {
+      settings.leds.speed = (uint8_t)constrain(led["speed"].as<int>(), 0, 255);
+    }
+    if (!led["reactivity"].isNull()) {
+      settings.leds.reactivity =
+          (uint8_t)constrain(led["reactivity"].as<int>(), 0, 100);
+    }
+    // parseColor() keeps the current colour on anything unparseable, which is
+    // what the live /api/leds endpoint does with a bad value too.
+    settings.leds.color = parseColor(led["color"], settings.leds.color);
+    settings.leds.color2 = parseColor(led["color2"], settings.leds.color2);
+    if (!led["idleOff"].isNull()) settings.leds.idleOff = led["idleOff"].as<bool>();
+    if (!led["idleAfterSeconds"].isNull()) {
+      settings.leds.idleAfterS = (uint16_t)constrain(
+          led["idleAfterSeconds"].as<int>(), (int)LED_IDLE_AFTER_S_MIN,
+          (int)LED_IDLE_AFTER_S_MAX);
+    }
+  }
+
+  JsonObjectConst clk = s["clock"].as<JsonObjectConst>();
+  if (!clk.isNull()) {
+    if (!clk["use24h"].isNull()) soft_clock_set_use_24h(clk["use24h"].as<bool>());
+    if (!clk["autoSync"].isNull()) {
+      soft_clock_set_auto_sync(clk["autoSync"].as<bool>());
+    }
+    if (clk["offsetMinutes"].is<int32_t>()) {
+      soft_clock_set_utc_offset_min(clk["offsetMinutes"].as<int32_t>());
+    }
+  }
+
+  /*
+   * Persist, then restart, and do not bother applying anything live.
+   *
+   * Every other write path here applies what it can immediately, because the
+   * card the value came from is about what the speaker is doing while you are
+   * looking at it. A restore is the opposite: it changes the hostname, the
+   * network and the dashboard password at once, none of which can take effect
+   * without a reboot anyway -- and that reboot runs loadSettings(), which is
+   * the same clamping and the same leds_configure() / power_configure() /
+   * ui_set_blank() calls this would otherwise have to repeat by hand.
+   */
+  saveSettings();
+  JsonDocument reply;
+  reply["ok"] = true;
+  reply["message"] = "Settings restored; restarting";
+  sendJson(reply);
+  ui_show_system_status(UI_STATUS_RESTART, "Settings restored",
+                        "Restarting speaker", -1, 0);
+  scheduleReboot(900);
+}
+
 void handleDisplay() {
   if (!requireAuth()) return;
   JsonDocument body;
@@ -2534,6 +3197,8 @@ void configureRoutes() {
   server.on("/api/wifi", HTTP_POST, handleWifiSave);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
   server.on("/api/settings", HTTP_POST, handleSettingsSave);
+  server.on("/api/settings/backup", HTTP_POST, handleSettingsBackup);
+  server.on("/api/settings/restore", HTTP_POST, handleSettingsRestore);
   server.on("/api/dfplayer", HTTP_POST, handleDfPlayer);
   server.on("/api/dfplayer/library", HTTP_GET, handleDfLibrary);
   server.on("/api/battery", HTTP_POST, handleBattery);
