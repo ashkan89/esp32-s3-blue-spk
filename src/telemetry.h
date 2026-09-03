@@ -81,10 +81,18 @@ bool telemetry_begin();
 /// all but one pass in several thousand.
 void telemetry_loop();
 
-/// Copies the history out, oldest first, into an array of at least
-/// TELEMETRY_SAMPLES entries. Returns how many were written -- fewer than the
-/// full ring until the speaker has been up for two hours.
-uint16_t telemetry_history(TelemetrySample *out, uint16_t max);
+/*
+ * The history, oldest first, read one sample at a time and without a copy.
+ *
+ * Handing out 240 samples at once would need somewhere to put them, and the one
+ * caller -- the web handler that serialises them -- had that somewhere as a
+ * 2.9 kB static buffer, resident for the life of the firmware so that one
+ * endpoint could format a document. Both the ring and the handler run on the
+ * Arduino loop task, so there is nothing to copy for: `index` counts from the
+ * oldest sample, and false means there is no sample there.
+ */
+uint16_t telemetry_count();
+bool telemetry_at(uint16_t index, TelemetrySample *out);
 
 /// The most recent sample, taken now rather than read from the ring, so a
 /// dashboard that polls faster than the sample interval still shows live

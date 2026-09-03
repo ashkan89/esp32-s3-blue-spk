@@ -23,16 +23,21 @@ using namespace audio_tools;
 namespace {
 
 /*
- * The jitter buffer.
+ * The jitter buffer, and when it exists.
  *
- * 24 kB is the largest that leaves comfortable room for the decoder (about
- * 29 kB for MP3, more for AAC), the Wi-Fi driver's own buffers and the web
- * server, in the roughly 250 kB Wi-Fi mode has. At 128 kbps -- the commonest
- * stream rate -- it holds a second and a half, which is enough to ride out the
- * pauses a domestic connection produces and not enough to hide a genuinely
- * inadequate one, which is the right place for that line to sit.
+ * 20 kB holds about a second and a quarter of a 128 kbps stream -- enough to
+ * ride out the pauses a domestic connection produces, not enough to hide a
+ * genuinely inadequate one, which is the right place for that line to sit.
+ *
+ * It is allocated when a stream starts and freed when it ends, and that is not
+ * a detail. This buffer, the socket chunk and the decoder feed together are
+ * over 20 kB, and holding them from boot on a speaker that may never play a
+ * station costs the firmware updater its TLS handshake: the check in
+ * management.cpp wants 60 kB free and a 34 kB contiguous block, and a 24 kB
+ * allocation made early sits in the middle of the heap splitting exactly the
+ * block the handshake needs. Idle radio now costs nothing at all.
  */
-const size_t RING_BYTES = 24 * 1024;
+const size_t RING_BYTES = 20 * 1024;
 
 /// How full the ring has to be before decoding starts, as a percentage. Filling
 /// it completely would make every station take twice as long to start for no
@@ -40,9 +45,10 @@ const size_t RING_BYTES = 24 * 1024;
 /// found its level.
 const uint8_t PREBUFFER_PERCENT = 55;
 
-/// How much is read from the socket in one go. A quarter of the ring, so a
-/// single burst can make real progress, and a multiple of the MTU.
-const size_t READ_CHUNK = 1460 * 4;
+/// How much is read from the socket in one go: two MTUs. Larger reads made no
+/// measurable difference to the buffer level and every byte of this is resident
+/// for the whole stream.
+const size_t READ_CHUNK = 1460 * 2;
 
 /// How much encoded audio is handed to the decoder at a time. Small enough that
 /// the socket gets looked at often, large enough to amortise the call.
@@ -68,8 +74,6 @@ const uint32_t CONNECT_TIMEOUT_MS = 12000;
 const uint32_t STALL_TIMEOUT_MS = 10000;
 
 Preferences prefs;
-RadioStation stations[RADIO_MAX_STATIONS];
-uint8_t stationCount;
 
 SemaphoreHandle_t lock;
 RadioStatus status;
@@ -106,8 +110,43 @@ uint32_t volumeDirtyAt;
 const uint32_t VOLUME_PERSIST_QUIET_MS = 4000;
 
 I2SStream *i2s;
-uint8_t *ring;
+
+/*
+ * One allocation for all three working buffers.
+ *
+ * The ring, the socket chunk and the decoder feed have exactly the same
+ * lifetime -- a stream -- so making them one block rather than three means one
+ * malloc, one free, and no chance of leaving the heap with three
+ * differently-sized holes in it after every station change.
+ */
+const size_t STREAM_ARENA = RING_BYTES + READ_CHUNK + DECODE_CHUNK;
+uint8_t *arena;
+uint8_t *ring;    // arena
+uint8_t *chunk;   // arena + RING_BYTES
+uint8_t *feed;    // arena + RING_BYTES + READ_CHUNK
 size_t ringHead, ringTail, ringUsed;
+
+/// The favourites. On the heap and not in .bss because 2.4 kB of DRAM that only
+/// two of the three radio modes can ever use is 2.4 kB Bluedroid does not get
+/// in the third.
+RadioStation *stations;
+uint8_t stationCount;
+
+bool arenaAcquire() {
+  if (arena) return true;
+  arena = (uint8_t *)malloc(STREAM_ARENA);
+  if (!arena) return false;
+  ring = arena;
+  chunk = arena + RING_BYTES;
+  feed = chunk + READ_CHUNK;
+  return true;
+}
+
+void arenaRelease() {
+  free(arena);
+  arena = nullptr;
+  ring = chunk = feed = nullptr;
+}
 
 /// Set by the metadata callback, which the HTTP reader calls from inside
 /// readBytes() -- so on the radio task, but at a point where taking the status
@@ -194,7 +233,7 @@ void loadStations() {
   if (volume127 > 127) volume127 = 127;
   autostart = prefs.getBool("auto", false);
 
-  const size_t want = sizeof(stations);
+  const size_t want = sizeof(RadioStation) * RADIO_MAX_STATIONS;
   const size_t have = prefs.getBytesLength("list");
   if (have > 0 && have <= want) {
     prefs.getBytes("list", stations, have);
@@ -324,7 +363,9 @@ class RadioOutput : public AudioOutput {
   }
 
  private:
-  static const size_t STEREO_FRAMES = 512;
+  /// Frames of the mono-to-stereo scratch buffer. Small on purpose: this is
+  /// resident for the life of the firmware, and emit() loops over it anyway.
+  static const size_t STEREO_FRAMES = 128;
   int16_t stereo[STEREO_FRAMES * 2];
   uint16_t channels = 2;
   uint32_t lastRate = 0;
@@ -530,6 +571,23 @@ void runStream(const char *url, bool *stopped) {
   copyString(status.codec, sizeof(status.codec), aac ? "AAC" : "MP3");
   statusUnlock();
 
+  /*
+   * The working buffers, claimed only now.
+   *
+   * After the handshake rather than before it: an https connection's peak heap
+   * use is during the certificate walk, and holding 22 kB across that is the
+   * difference between a station that plays and one that reports being out of
+   * memory. The socket has not been read from yet, so nothing is lost by
+   * waiting.
+   */
+  if (!arenaAcquire()) {
+    stream->end();
+    delete stream;
+    delete tls;
+    setState(RADIO_ERROR, "Not enough memory left for the stream buffer");
+    return;
+  }
+
   // Built here and destroyed at the end of the stream, so the ~30 kB the codec
   // needs is only held while something is playing. In a mode where the web
   // server may be asked to do TLS at any moment, that is not a small thing.
@@ -539,6 +597,7 @@ void runStream(const char *url, bool *stopped) {
       codec ? new (std::nothrow) EncodedAudioStream(&output, codec) : nullptr;
   if (!decoder) {
     delete codec;
+    arenaRelease();
     stream->end();
     delete stream;
     delete tls;
@@ -552,8 +611,6 @@ void runStream(const char *url, bool *stopped) {
   setState(RADIO_BUFFERING);
   adoptMetadata();
 
-  static uint8_t chunk[READ_CHUNK];
-  static uint8_t feed[DECODE_CHUNK];
   const size_t prebuffer = RING_BYTES * PREBUFFER_PERCENT / 100;
   bool decoding = false;
   uint32_t lastByteAt = millis();
@@ -570,7 +627,7 @@ void runStream(const char *url, bool *stopped) {
     // Fill.
     const size_t space = RING_BYTES - ringUsed;
     if (space >= 512 && stream->available() > 0) {
-      const size_t want = min(space, sizeof(chunk));
+      const size_t want = min(space, READ_CHUNK);
       const size_t got = stream->readBytes(chunk, want);
       if (got > 0) {
         ringWrite(chunk, got);
@@ -631,7 +688,7 @@ void runStream(const char *url, bool *stopped) {
       continue;
     }
 
-    const size_t take = ringRead(feed, sizeof(feed));
+    const size_t take = ringRead(feed, DECODE_CHUNK);
     // This blocks inside the I2S write, which is what paces the whole loop.
     decoder->write(feed, take);
   }
@@ -641,6 +698,9 @@ void runStream(const char *url, bool *stopped) {
   stream->end();
   delete stream;
   delete tls;
+  // Everything this stream held goes back before the next attempt, so a station
+  // that is retrying on a backoff is not sitting on 22 kB while it waits.
+  arenaRelease();
 
   *stopped = request.changed && !request.play;
 }
@@ -703,8 +763,42 @@ void radioTask(void *) {
   }
 }
 
+/*
+ * Brings the decoder task up, if it is not already.
+ *
+ * Created on the first station rather than at boot, for the same reason the
+ * buffers are: a task's stack comes out of the heap, and ten kilobytes held
+ * from boot on a speaker nobody has asked to play anything is ten kilobytes the
+ * updater's TLS handshake does not have. Once created it stays -- tearing a
+ * task down and standing it up again around every stop is a race for a saving
+ * that no longer matters once the arena is gone.
+ */
+bool ensureTask() {
+  if (task) return true;
+  /*
+   * 10 kB. The deepest thing that happens on this task by a wide margin is the
+   * TLS handshake for an https station, which walks a certificate chain against
+   * the Mozilla root bundle; libhelix keeps its frame buffers on the heap, so
+   * the decoder itself is shallow.
+   */
+  const BaseType_t ok =
+      xTaskCreatePinnedToCore(radioTask, "radio", 10240, nullptr, 2, &task, 1);
+  if (ok != pdPASS) {
+    task = nullptr;
+    Serial.println("[radio] not enough memory to start the decoder task");
+    statusLock();
+    copyString(status.error, sizeof(status.error),
+               "Not enough memory to start the decoder");
+    status.state = RADIO_ERROR;
+    statusUnlock();
+    return false;
+  }
+  return true;
+}
+
 /// Hands the task a new destination. Safe from any task.
 void requestPlay(bool play, int8_t station, const char *url, const char *name) {
+  if (play && !ensureTask()) return;
   request.play = play;
   request.station = station;
   copyString(request.url, sizeof(request.url), url);
@@ -722,9 +816,9 @@ bool net_radio_begin(void *out) {
   lock = xSemaphoreCreateMutex();
   if (!lock) return false;
 
-  ring = (uint8_t *)malloc(RING_BYTES);
-  if (!ring) {
-    Serial.println("[radio] no room for the jitter buffer; internet radio is off "
+  stations = (RadioStation *)calloc(RADIO_MAX_STATIONS, sizeof(RadioStation));
+  if (!stations) {
+    Serial.println("[radio] no room for the station list; internet radio is off "
                    "this boot");
     vSemaphoreDelete(lock);
     lock = nullptr;
@@ -738,32 +832,24 @@ bool net_radio_begin(void *out) {
   loadStations();
 
   /*
-   * Core 1, alongside the Arduino loop, and deliberately not core 0.
+   * No task and no buffers yet.
    *
-   * Core 0 runs the Wi-Fi and lwIP tasks and the UI render task. Putting a
-   * decoder that wants a steady share of a core on top of the stack that is
-   * feeding it is how a stream that is fine on the bench underruns on a busy
-   * network. Priority 2 puts it above loop() and below the network stack, which
-   * is the order the audio actually needs.
+   * Everything the radio needs to run -- a 10 kB task stack and a 22 kB arena --
+   * is claimed on the first station and given back when the stream ends. A
+   * speaker that is never asked to play one pays for the station list and
+   * nothing else, which is what keeps the firmware updater's TLS handshake
+   * possible. See ensureTask() and arenaAcquire().
    *
-   * 12 kB of stack because libhelix's frame buffers are on the heap but its
-   * working state is not, and the TLS handshake for an https station is the
-   * deepest thing that happens on this task by a wide margin.
+   * The task, when it is created, goes on core 1 alongside the Arduino loop and
+   * deliberately not on core 0: core 0 runs the Wi-Fi and lwIP tasks and the UI
+   * render task, and putting a decoder that wants a steady share of a core on
+   * top of the stack that is feeding it is how a stream that is fine on the
+   * bench underruns on a busy network. Priority 2 puts it above loop() and
+   * below the network stack, which is the order the audio actually needs.
    */
-  const BaseType_t ok = xTaskCreatePinnedToCore(radioTask, "radio", 12288, nullptr,
-                                                2, &task, 1);
-  if (ok != pdPASS) {
-    free(ring);
-    ring = nullptr;
-    vSemaphoreDelete(lock);
-    lock = nullptr;
-    Serial.println("[radio] the decoder task would not start");
-    return false;
-  }
-
   running = true;
-  Serial.printf("[radio] ready, %u stations, %u kB buffer\n",
-                (unsigned)stationCount, (unsigned)(RING_BYTES / 1024));
+  Serial.printf("[radio] ready, %u stations, %u kB buffer when playing\n",
+                (unsigned)stationCount, (unsigned)(STREAM_ARENA / 1024));
 
   if (autostart && stationCount > 0) {
     Serial.println("[radio] resuming the last station");
@@ -1051,7 +1137,26 @@ bool net_radio_command(const char *line) {
     Serial.printf(" | buffer %u%%", (unsigned)s.bufferPercent);
     if (s.underruns) Serial.printf(" | %u underruns", (unsigned)s.underruns);
     if (s.error[0]) Serial.printf(" | %s", s.error);
-    Serial.printf(" | volume %u\n", (unsigned)volume127);
+    Serial.printf(" | volume %u", (unsigned)volume127);
+    /*
+     * The two ways this feature can go wrong on a chip this size, as numbers.
+     *
+     * An https handshake is by a wide margin the deepest thing that runs on the
+     * decoder task, so a stack margin down to a few hundred bytes is a crash
+     * waiting for a longer certificate chain. And "arena" is the 22 kB a stream
+     * holds while it plays -- if that says "held" with nothing playing, it has
+     * leaked, and the heap figures next to it are what the firmware updater's
+     * TLS handshake has to work with.
+     */
+    if (task) {
+      Serial.printf(" | task stack %u B free",
+                    (unsigned)(uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t)));
+    } else {
+      Serial.print(" | task not started");
+    }
+    Serial.printf(" | arena %s | heap %u free, %u largest\n",
+                  arena ? "held" : "released", (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
     for (uint8_t i = 0; i < stationCount; i++) {
       Serial.printf("  %u%c %-28s %s\n", (unsigned)(i + 1),
                     s.station == (int8_t)i ? '*' : '.', stations[i].name,

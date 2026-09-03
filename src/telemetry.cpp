@@ -138,15 +138,15 @@ void telemetry_loop() {
   if (ringCount < TELEMETRY_SAMPLES) ringCount++;
 }
 
-uint16_t telemetry_history(TelemetrySample *out, uint16_t max) {
-  if (!out || !ring || ringCount == 0) return 0;
-  const uint16_t want = ringCount < max ? ringCount : max;
-  // Oldest first. The oldest is the one `want` places behind the head, wrapping.
-  const uint16_t start = (uint16_t)((ringHead + TELEMETRY_SAMPLES - want) % TELEMETRY_SAMPLES);
-  for (uint16_t i = 0; i < want; i++) {
-    out[i] = ring[(start + i) % TELEMETRY_SAMPLES];
-  }
-  return want;
+uint16_t telemetry_count() { return ring ? ringCount : 0; }
+
+bool telemetry_at(uint16_t index, TelemetrySample *out) {
+  if (!out || !ring || index >= ringCount) return false;
+  // The oldest sample sits `ringCount` places behind the head, wrapping.
+  const uint16_t start =
+      (uint16_t)((ringHead + TELEMETRY_SAMPLES - ringCount) % TELEMETRY_SAMPLES);
+  *out = ring[(start + index) % TELEMETRY_SAMPLES];
+  return true;
 }
 
 void telemetry_now(TelemetrySample *out) {

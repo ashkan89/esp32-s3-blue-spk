@@ -28,12 +28,22 @@
  *
  * The buffer, and why there is one. A radio stream arrives in whatever lumps
  * the internet felt like sending, and a decoder consumes it at a constant rate.
- * Between them sits a ring buffer of about 24 kB -- three seconds of a 64 kbps
- * stream, one and a half of a 128 kbps one -- which is filled ahead before
- * playback starts and topped up between decodes. What the dashboard shows as a
- * buffering indicator is how full it is, and an underrun is counted rather than
- * hidden: a station that will not stay above the floor is a station that is too
- * far away or too fast for this link, and that is worth being able to see.
+ * Between them sits a ring buffer of 20 kB -- two and a half seconds of a
+ * 64 kbps stream, a little over one of a 128 kbps one -- which is filled ahead
+ * before playback starts and topped up between decodes. What the dashboard
+ * shows as a buffering indicator is how full it is, and an underrun is counted
+ * rather than hidden: a station that will not stay above the floor is a station
+ * that is too far away or too fast for this link, and that is worth being able
+ * to see.
+ *
+ * Nothing is allocated until a station is played. The buffer, the socket chunk
+ * and the decoder feed are one 22 kB block claimed when a stream starts and
+ * freed when it ends, and the decoder task's 10 kB stack is created on the
+ * first station and then kept. That is not tidiness: held from boot, they cost
+ * the firmware updater its TLS handshake, which wants 60 kB free and a 34 kB
+ * contiguous block -- and a 24 kB allocation made early sits in the middle of
+ * the heap splitting exactly the block the handshake needs. A speaker that
+ * never plays a station now pays for the station list and nothing else.
  *
  * Reconnection. Streams drop, and they drop most often for reasons that fix
  * themselves. A failure retries on a backoff that widens to a minute, forever,

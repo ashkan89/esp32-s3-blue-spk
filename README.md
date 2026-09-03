@@ -2081,10 +2081,10 @@ mode never had.
 ### The buffer, and what the indicator means
 
 A stream arrives in whatever lumps the internet felt like sending and a decoder
-consumes it at a constant rate. Between them sits a 24 kB ring — about a second
-and a half of a 128 kbps stream — filled ahead before playback starts and topped
-up between decodes. What the dashboard draws as a buffering bar is how full it
-is, with a tick at the 55% mark playback begins from.
+consumes it at a constant rate. Between them sits a 20 kB ring — a little over a
+second of a 128 kbps stream — filled ahead before playback starts and topped up
+between decodes. What the dashboard draws as a buffering bar is how full it is,
+with a tick at the 55% mark playback begins from.
 
 The number matters because it is the only warning that arrives *before* the
 sound stops. A buffer that sits high is a healthy link; one that sags towards
@@ -2103,6 +2103,38 @@ likes.
 **In DFPlayer mode both can make a sound**, since the module's analog output and
 the PCM5102A meet at the same jack. Starting a station pauses the module first,
 and that is the whole of the arbitration.
+
+### What it costs when it is not playing
+
+Nothing. This matters more than it sounds on a chip with 320 kB of DRAM and no
+PSRAM, because the firmware updater needs a *contiguous* 34 kB block for its TLS
+handshake against the Mozilla root bundle — and an early 24 kB allocation sits in
+the middle of the heap splitting exactly the block the handshake wants. The first
+version of this feature took its buffers and its task at boot in both Wi-Fi
+modes, and the visible symptom was **Check for updates** failing with "not enough
+memory for a secure connection" on a speaker that had never played a station.
+
+So the radio is allocated on demand:
+
+| | When it exists | Size |
+|---|---|---|
+| Station list | boot, in Wi-Fi modes only | 2.4 kB |
+| Decoder task stack | the first station you play | 10 kB |
+| Ring + socket chunk + decoder feed | one block, while a stream runs | 22 kB |
+| MP3 or AAC decoder | while a stream runs | ~30 kB |
+
+The arena is claimed *after* the TLS handshake for an https station, not before,
+because a certificate walk is where an https connection's heap use peaks.
+
+An update check **while the radio is playing** will still be refused — a stream
+genuinely is holding ~52 kB — and the message says so and tells you to stop it,
+rather than telling you to restart a speaker that would do the same thing again.
+
+```
+station                also prints the task's remaining stack, whether the
+                       stream arena is held, and free/largest-block heap
+diag                   the heap trio and every task's stack high-water mark
+```
 
 ```
 station                status, and the favourites with the playing one marked
@@ -2230,8 +2262,10 @@ the clock takes a full POSIX TZ rule as well as a plain offset; see
 ## Graphs
 
 Two hours of history, sampled every thirty seconds into a fixed ring of 240 —
-about 2.4 kB of RAM, allocated once at boot. The dashboard's **Graphs** page
-draws four of them:
+2.9 kB of heap, allocated once at boot and never grown. The endpoint that serves
+it walks the ring in place rather than copying it, so there is no second buffer:
+both the ring and the web handler run on the Arduino loop task, which is what
+makes that safe. The dashboard's **Graphs** page draws four of them:
 
 | Series | Why it is worth a line rather than a number |
 |--------|---------------------------------------------|

@@ -1029,9 +1029,15 @@ bool startGithubJob(bool install) {
   const uint32_t heap = ESP.getFreeHeap();
   const uint32_t block = ESP.getMaxAllocHeap();
   if (heap < TLS_HEAP_FLOOR || block < TLS_BLOCK_FLOOR) {
-    const String message = String("Not enough memory for a secure connection (") +
-                           (unsigned)heap + " B free, largest block " +
-                           (unsigned)block + " B). Restart the speaker.";
+    // Naming the one thing that is probably holding the memory beats telling
+    // somebody to restart a speaker that will do exactly the same thing again.
+    String message = String("Not enough memory for a secure connection (") +
+                     (unsigned)heap + " B free, largest block " +
+                     (unsigned)block + " B). ";
+    message += net_radio_active()
+                   ? "Stop the internet radio and try again -- a stream holds "
+                     "the decoder and its buffer for as long as it is playing."
+                   : "Restart the speaker and try again before playing anything.";
     updateSet("error", message.c_str(), false);
     return false;
   }
@@ -3747,8 +3753,7 @@ void handleAlarmsPost() {
 void handleTelemetry() {
   if (!requireAuth()) return;
 
-  static TelemetrySample samples[TELEMETRY_SAMPLES];
-  const uint16_t count = telemetry_history(samples, TELEMETRY_SAMPLES);
+  const uint16_t count = telemetry_count();
 
   JsonDocument doc;
   doc["ok"] = true;
@@ -3767,7 +3772,8 @@ void handleTelemetry() {
   JsonArray flags = doc["flags"].to<JsonArray>();
 
   for (uint16_t i = 0; i < count; i++) {
-    const TelemetrySample &sample = samples[i];
+    TelemetrySample sample;
+    if (!telemetry_at(i, &sample)) break;
     if (sample.millivolts) {
       volts.add(serialized(String(sample.millivolts / 1000.0f, 3)));
       percent.add(sample.percent);
