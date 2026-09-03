@@ -66,13 +66,19 @@
 
 #include "AudioTools.h"
 #include "app_config.h"
+#include "alarm_clock.h"
+#include "audio_eq.h"
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
 #include "diagnostics.h"
 #include "hw_config.h"
 #include "leds.h"
+#include "home_assistant.h"
 #include "management.h"
+#include "net_radio.h"
+#include "telemetry.h"
+#include "voice.h"
 #include "player_state.h"
 #include "power.h"
 #include "soft_clock.h"
@@ -187,8 +193,9 @@ static void print_help() {
       "  time 2026-08-18 14:30     set date and time\n"
       "  date 2026-08-18           set the date\n"
       "  next                      next display screen\n"
-      "  screen 0..6               hold one screen (0 now playing, 1 spectrum,\n"
-      "                            2 VU, 3 scope, 4 waterfall, 5 clock, 6 info)\n"
+      "  screen 0..7               hold one screen (0 now playing, 1 spectrum,\n"
+      "                            2 VU, 3 scope, 4 waterfall, 5 radio,\n"
+      "                            6 clock, 7 info)\n"
       "  auto                      resume the screen carousel\n"
       "  bright 0..255             fix the contrast (0 = automatic)\n"
       "  ui                        display status\n"
@@ -202,6 +209,18 @@ static void print_help() {
       "                            own commands: play, folder, source, eq,\n"
       "                            loop, io1, key1, led, reset, ...)\n"
       "  bat                       battery voltage, percentage and state\n"
+      "  station                   internet radio status and the favourites\n"
+      "  station <n>|<url>         play a favourite, or any stream address\n"
+      "  station stop|next|prev    transport for the network player\n"
+      "  eq                        the five-band equaliser ('eq' alone shows it;\n"
+      "                            eq music|voice|bass|night|flat, eq <band> <dB>)\n"
+      "  say                       announcements: settings and every clip in\n"
+      "                            this firmware ('say <id>' plays one)\n"
+      "  alarm                     alarms and the next one due\n"
+      "  alarm off|snooze|test<n>  stop, snooze, or fire one now\n"
+      "  sleep <minutes>           start the sleep timer ('sleep off' cancels)\n"
+      "  graph                     voltage, temperature and heap as sparklines\n"
+      "  mqtt                      Home Assistant connection state\n"
       "  bat calib <volts>         trim the gauge to a meter reading\n"
       "  leds                      WS2812 ring status ('leds' alone lists its\n"
       "                            own commands: on, off, fx, list, color,\n"
@@ -238,6 +257,19 @@ static void poll_console() {
     // these three is what keeps them from shadowing each other.
     if (df_player_command(buf)) continue;
     if (battery_command(buf)) continue;
+    // "station" rather than "radio": radio_command() above already owns "radio"
+    // for the mode switch, and one word cannot mean both.
+    if (net_radio_command(buf)) continue;
+    if (alarm_command(buf)) continue;
+    if (telemetry_command(buf)) continue;
+    if (ha_command(buf)) continue;
+    if (voice_command(buf)) continue;
+    // Persisted for the same reason the lighting below is: a curve set over the
+    // console is a setting, not a live experiment.
+    if (audio_eq_command(buf)) {
+      management_store_audio();
+      continue;
+    }
     // Persisted straight away: a colour set over the console is a setting
     // like any other, and losing it at the next reboot would be a surprise.
     if (leds_command(buf)) {
@@ -294,6 +326,27 @@ class LoudVolumeControl : public A2DPVolumeControl {
       data[i].channel1 = shape(data[i].channel1);
       data[i].channel2 = shape(data[i].channel2);
     }
+
+    /*
+     * The tone stack and the announcements, in that order, and both after the
+     * volume shaping above.
+     *
+     * After, because both are defined relative to what the owner is actually
+     * hearing: an equaliser applied before the volume control would have its
+     * headroom eaten by a slider it cannot see, and an announcement mixed in
+     * before it would be attenuated along with the music it is supposed to be
+     * heard over.
+     *
+     * A Frame is two int16s and the array is contiguous, so it is already the
+     * interleaved stereo buffer both of these want; the cast is a
+     * reinterpretation and not a copy. Both return immediately when there is
+     * nothing to do, which on this task is the common case and the reason they
+     * can be called unconditionally.
+     */
+    int16_t *pcm = reinterpret_cast<int16_t *>(data);
+    audio_eq_process(pcm, frameCount);
+    voice_mix(pcm, frameCount);
+
     // The display taps the stream here, after shaping, so the meters show what
     // actually leaves the DAC. It is a downmix and a store per sample pair and
     // nothing else -- see audio_probe.h for why that matters on this task.
@@ -452,6 +505,33 @@ static void play_melody(const Note *notes, size_t count) {
 /// network player, which is a different task with exactly the same problem.
 static bool dac_busy();
 
+/*
+ * Plays whatever the announcement queue is holding, straight into I2S.
+ *
+ * The mirror of voice_mix(): that one runs on an audio task and folds a clip
+ * into a stream that is already flowing, and this one runs here, on the Arduino
+ * task, for the case where nothing else is using the DAC at all. voice.cpp
+ * decides between them -- whichever asks first owns the clip -- so this can be
+ * called on every pass without checking anything but the DAC.
+ *
+ * Structured exactly like play_note() above, and for the same reasons: a
+ * blocking I2S write is what paces it, the analyser is fed so the display moves
+ * with the words, and the status LED is ticked because loop() is stalled for
+ * the length of the clip.
+ */
+static void service_voice() {
+  if (!voice_busy()) return;
+  if (dac_busy()) return;
+
+  static int16_t frames[TONE_CHUNK_FRAMES * 2];
+  size_t written;
+  while ((written = voice_render(frames, TONE_CHUNK_FRAMES)) > 0) {
+    audio_probe_feed((const Frame *)frames, (uint16_t)written);
+    i2s.write((const uint8_t *)frames, written * 4);
+    status_led_tick();
+  }
+}
+
 /// Plays whatever a callback queued. Called from loop(), never from the
 /// Bluetooth task.
 static void service_melody() {
@@ -600,6 +680,13 @@ static void update_status_led() {
 static bool dac_busy() {
   if (a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED) return true;
   /*
+   * The network player is a different task writing into the same I2S channel,
+   * which is the one case where a melody would not merely talk over the music
+   * but interleave samples with it. The comment above this function has always
+   * said so; this is the line that makes it true.
+   */
+  if (net_radio_active()) return true;
+  /*
    * The DFPlayer does not share the I2S channel -- its audio is analog and joins
    * further downstream -- so a melody here cannot interleave samples with it the
    * way it could with A2DP. It can still talk over it, because both land on the
@@ -607,6 +694,52 @@ static bool dac_busy() {
    * be played on top of a song.
    */
   return df_player_active();
+}
+
+/*
+ * The three things alarm_clock.cpp cannot reach on its own.
+ *
+ * The alarm needs to set the volume of whatever source is live, to make a noise
+ * with no source at all, and to stop again. The first is management.cpp's
+ * business because only it knows which source this mode is running; the other
+ * two are here because the melodies and the I2S channel are.
+ */
+static void alarm_set_volume(uint8_t volume127) {
+  management_media_action("volume", volume127);
+}
+
+/*
+ * The alarm chime.
+ *
+ * A repeating figure rather than the three-note melodies above: those are
+ * acknowledgements, meant to be noticed and then over, and an alarm has the
+ * opposite job. It is left to loop() to repeat, so it can be interrupted
+ * between figures rather than only after all of it -- pressing dismiss should
+ * stop the sound now, not in two seconds.
+ */
+static bool alarm_chime_active;
+
+static bool alarm_chime(bool start) {
+  alarm_chime_active = start;
+  return true;
+}
+
+static void service_alarm_chime() {
+  if (!alarm_chime_active) return;
+  if (dac_busy() || voice_busy()) return;
+
+  // Two rising thirds and a rest, at about one figure a second.
+  static const Note CHIME[] = {{880, 140}, {1109, 140}, {0, 90},
+                               {880, 140}, {1109, 260}, {0, 420}};
+  for (const Note &note : CHIME) {
+    if (!alarm_chime_active) break;  // dismissed mid-figure
+    play_note(note);
+  }
+}
+
+static void alarm_stop_audio() {
+  alarm_chime_active = false;
+  management_media_action("pause", 0);
 }
 
 /// Radio state and the mode switch, from the serial console. Handy precisely
@@ -714,11 +847,35 @@ static void log_state_changes() {
   if (s.connected != seen_connected) {
     seen_connected = s.connected;
     seen_peer[0] = 0;
+    /*
+     * Announced from here rather than from the A2DP callback that raised the
+     * flag, for the same reason the melody is: that callback runs in line with
+     * the audio path, and the device-name lookup below reads a string out of
+     * the settings. Neither belongs on that task.
+     */
+    if (!s.connected) voice_say(VOICE_BT_DISCONNECTED, VOICE_CAT_CONNECTION);
   }
   if (s.connected && s.peer[0] && strcmp(s.peer, seen_peer) != 0) {
     strncpy(seen_peer, s.peer, sizeof(seen_peer) - 1);
     seen_peer[sizeof(seen_peer) - 1] = 0;
     Serial.printf("[bt] peer: %s\n", seen_peer);
+
+    /*
+     * "Connected", or the clip somebody recorded for this particular phone.
+     *
+     * The speaker cannot synthesise a name it has never heard, so the phrase
+     * file gets the name instead: add a line, regenerate, and map the phone's
+     * Bluetooth address to it on the Sound page. Waiting for the peer *name*
+     * rather than announcing on the connection event is deliberate -- the
+     * address is known immediately but the name arrives a moment later, and
+     * announcing twice would be worse than announcing a beat late.
+     */
+    const uint8_t mapped = management_voice_clip_for(s.peer_addr);
+    if (mapped < voice_clip_count()) {
+      voice_say_index(mapped, VOICE_CAT_CONNECTION);
+    } else {
+      voice_say(VOICE_BT_CONNECTED, VOICE_CAT_CONNECTION);
+    }
   }
   /*
    * The battery, on transitions only.
@@ -741,6 +898,31 @@ static void log_state_changes() {
         battery_snapshot(&b);
         Serial.printf("[bat] %s: %u%% (%.2f V)\n", battery_state_name(now_state),
                       (unsigned)b.percent, b.volts);
+        /*
+         * The one announcement that earns interrupting music for.
+         *
+         * A speaker on battery has no other way to tell you it is about to stop
+         * -- the display may be blanked, the dashboard is not open, and in
+         * Bluetooth mode there is no dashboard at all. Only the transition is
+         * announced, so a cell sitting at the low threshold says it once rather
+         * than every time the reading wobbles across the line.
+         */
+        switch (now_state) {
+          case BAT_CRITICAL:
+            voice_say(VOICE_BATTERY_CRITICAL, VOICE_CAT_BATTERY);
+            break;
+          case BAT_LOW:
+            voice_say(VOICE_BATTERY_LOW, VOICE_CAT_BATTERY);
+            break;
+          case BAT_CHARGING:
+            voice_say(VOICE_BATTERY_CHARGING, VOICE_CAT_BATTERY);
+            break;
+          case BAT_FULL:
+            voice_say(VOICE_BATTERY_FULL, VOICE_CAT_BATTERY);
+            break;
+          default:
+            break;
+        }
       }
     }
   }
@@ -1114,12 +1296,41 @@ void setup() {
   // switched off, this fires immediately and nothing is delayed.
   service_bluetooth_start();
 
+  /*
+   * The history ring, the alarms and the announcements: every mode, including
+   * Bluetooth.
+   *
+   * None of the three needs a network. The alarm runs on soft_clock, the
+   * announcements are in flash, and the graph history is what makes a battery
+   * that died overnight explicable in the morning -- and Bluetooth mode, which
+   * has no dashboard, is the mode where a spoken battery warning is the only
+   * warning there is.
+   */
+  telemetry_begin();
+  alarm_set_hooks(alarm_set_volume, alarm_chime, alarm_stop_audio);
+  alarm_begin();
+  audio_eq_set_sample_rate(SAMPLE_RATE);
+  voice_set_sample_rate(SAMPLE_RATE);
+
+  /*
+   * Internet radio, in the two modes that have Wi-Fi.
+   *
+   * After management_begin(), because it needs to know whether this mode raised
+   * a network at all, and it hands over the I2S stream that was opened above --
+   * in Wi-Fi mode nothing else is writing to it, which is exactly why there is
+   * room for a radio there.
+   */
+  if (radio_mode_has_wifi(management_radio_mode())) {
+    net_radio_begin(&i2s);
+  }
+
   // The mode decides which audio path exists at all, and the screens say
   // different things for each -- there is no "pair your phone" on a speaker
   // that receives over the network. Fixed here and never changed again;
   // switching modes reboots.
   ps_set_source(radio_mode_has_a2dp(management_radio_mode())     ? PS_SRC_BLUETOOTH
                 : radio_mode_has_dfplayer(management_radio_mode()) ? PS_SRC_DFPLAYER
+                : net_radio_running()                             ? PS_SRC_RADIO
                                                                   : PS_SRC_NONE);
   // The DFPlayer needs nothing from the network, so it starts here.
   service_dfplayer();
@@ -1179,6 +1390,10 @@ void loop() {
   service_bluetooth_identity();
   service_dfplayer();
   service_melody();
+  // After the melodies: a connect chime and an announcement queued by the same
+  // event should be heard in that order, which is the order they happened in.
+  service_voice();
+  service_alarm_chime();
   // Before update_status_led(): the LED asks whether the cell is critical, and a
   // sample taken after that decision is one frame stale in the one indicator
   // that is meant to be urgent.
@@ -1192,6 +1407,11 @@ void loop() {
   soft_clock_tick();
   management_loop();
   df_player_loop();
+  net_radio_loop();
+  // After the sources have published their state, so an alarm that starts one
+  // sees it running on the same pass rather than the next.
+  alarm_loop();
+  telemetry_loop();
 
   poll_console();
   delay(10);

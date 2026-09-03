@@ -145,6 +145,49 @@ int32_t soft_clock_utc_offset_min();
 /// Accepts -840..840 (UTC-14 to UTC+14); anything else is ignored.
 void soft_clock_set_utc_offset_min(int32_t minutes);
 
+/*
+ * A real time zone, with its daylight-saving rule.
+ *
+ * The offset above is what this device shipped with, and for a clock on a shelf
+ * it is enough: it is wrong for half the year in most of the world, and being
+ * an hour out on a display nobody sets an appointment by costs nothing.
+ *
+ * An alarm is a different matter. An alarm that fires an hour late on the last
+ * Sunday in March is not a clock that drifted, it is an alarm that failed, and
+ * the owner finds out by oversleeping. So the zone can also be given as a POSIX
+ * TZ rule -- the same string /etc/localtime is compiled from -- and newlib,
+ * which is already linked in, applies the transitions itself:
+ *
+ *   CET-1CEST,M3.5.0,M10.5.0/3          central Europe
+ *   EST5EDT,M3.2.0,M11.1.0              US eastern
+ *   <+0330>-3:30<+0430>,J80/0,J264/0    Iran, which changes on fixed days
+ *
+ * There is no zone database on the device and there is not going to be one --
+ * it is 700 KB and it goes stale. The dashboard carries the list of rules and
+ * sends the one the owner picked, which puts the maintenance in the half of the
+ * system that is rewritten on every firmware update anyway.
+ *
+ * When a rule is set it wins, and soft_clock_utc_offset_min() below reports
+ * whatever that rule works out to *right now* -- so it keeps meaning what it
+ * always meant, and changes by itself twice a year.
+ */
+
+/// The stored POSIX TZ rule, or "" when the clock is running on a fixed offset.
+const char *soft_clock_zone();
+
+/// Installs a POSIX TZ rule and re-derives local time immediately. Pass "" or
+/// nullptr to go back to the fixed offset. Rejects anything that does not parse
+/// into a zone newlib can use, so a typo cannot leave the clock unreadable.
+bool soft_clock_set_zone(const char *tz);
+
+/// What the zone calls itself at this moment -- "CET", "CEST", "+0330". Comes
+/// from tzname[], so it follows the daylight-saving rule like everything else.
+const char *soft_clock_zone_abbrev();
+
+/// True while the rule says daylight saving is in force. Always false on a
+/// fixed offset, which has no opinion.
+bool soft_clock_dst_active();
+
 // ------------------------------------------------------------ presentation --
 /*
  * How the time is written down, rather than what it is. Kept here, next to the

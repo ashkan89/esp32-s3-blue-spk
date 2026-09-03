@@ -13,6 +13,8 @@
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
+#include "alarm_clock.h"
+#include "net_radio.h"
 #include "player_state.h"
 #include "power.h"
 #include "soft_clock.h"
@@ -126,6 +128,7 @@ enum UiScreen : uint8_t {
   SCR_VU,
   SCR_SCOPE,
   SCR_WATERFALL,
+  SCR_RADIO,
   SCR_CLOCK,
   SCR_INFO,
   SCR_ROTATE_COUNT,  // everything above this is part of the carousel
@@ -301,6 +304,7 @@ enum MqSlot : uint8_t {
   MQ_NAME,
   MQ_PEER,
   MQ_STATS,
+  MQ_STATION,
   MQ_TOAST_A,
   MQ_TOAST_B,
   MQ_SYSTEM_A,
@@ -751,13 +755,40 @@ static void draw_clock_screen(uint32_t now, uint32_t dt) {
            soft_clock_trusted() ? "" : "?");
   u8g2.drawUTF8(rx, 19, line);
 
+  /*
+   * The seconds, or the next alarm.
+   *
+   * The bottom right of this screen is the only spare row on it, and an armed
+   * alarm is worth more there than a seconds counter -- "is my alarm actually
+   * set" is a question people get out of bed to check. The seconds come back
+   * whenever no alarm is armed, and the blinking colon above already says the
+   * clock is live, so nothing is lost.
+   */
   u8g2.setFont(FONT_SMALL);
-  if (ampm != nullptr) {
+  AlarmStatus alarm;
+  alarm_status(&alarm);
+  Alarm next;
+  if (alarm.next >= 0 && alarm_get((uint8_t)alarm.next, &next)) {
+    u8g2.drawXBMP(rx, 21, 8, 8, ICON_ALARM);
+    int alarmHour = next.hour;
+    const char *alarmAmPm = "";
+    if (!soft_clock_use_24h()) {
+      alarmAmPm = alarmHour < 12 ? "a" : "p";
+      alarmHour = alarmHour % 12;
+      if (alarmHour == 0) alarmHour = 12;
+    }
+    snprintf(line, sizeof(line), "%d:%02d%s", alarmHour, (int)next.minute, alarmAmPm);
+    u8g2.drawUTF8(rx + 10, 28, line);
+    // A skipped occurrence still shows its time -- it is still the next one --
+    // with a line through the bell to say it will not sound.
+    if (next.skipNext) u8g2.drawHLine(rx, 25, 8);
+  } else if (ampm != nullptr) {
     snprintf(line, sizeof(line), ":%02d %s", t.tm_sec, ampm);
+    u8g2.drawUTF8(rx, 27, line);
   } else {
     snprintf(line, sizeof(line), ":%02d", t.tm_sec);
+    u8g2.drawUTF8(rx, 27, line);
   }
-  u8g2.drawUTF8(rx, 27, line);
 
   // Seconds sweep along the bottom edge: a whole minute at a glance.
   const int sweep = (int)(((t.tm_sec * 1000 + (now % 1000)) * W) / 60000);
@@ -890,6 +921,95 @@ static void draw_info(const PlayerInfo &s, const AudioVis &v, uint32_t now,
   draw_marquee(MQ_STATS, 0, 30, W, line, dt);
 }
 
+/*
+ * The internet radio screen.
+ *
+ * A stream has none of what draw_now_playing() is built around -- no track
+ * length, no position, no track numbers -- and drawing that layout with every
+ * field empty would look like a fault. So this is its own screen, laid out
+ * around what a station actually sends:
+ *
+ *   row 1   the mast, then the station's name
+ *   row 2   the now-playing text, which on most stations is "artist - title"
+ *   row 3   the spectrum while it plays; the buffer bar while it does not
+ *   row 4   codec, bitrate, sample rate, and the buffer level as a number
+ *
+ * The third row is the one doing real work. A radio that is playing wants a
+ * spectrum like any other source; a radio that is buffering wants to show how
+ * far along it is, because that is the difference between "wait a moment" and
+ * "this is not going to work" -- and it is exactly the moment somebody is
+ * looking at the display to find out which.
+ */
+static void draw_radio(const AudioVis &v, uint32_t dt) {
+  RadioStatus r;
+  net_radio_snapshot(&r);
+
+  u8g2.drawXBMP(0, 0, 8, 8, ICON_RADIO);
+  u8g2.setFont(FONT_TITLE);
+  draw_marquee(MQ_STATION, 10, 8, W - 10, r.name[0] ? r.name : "Internet radio", dt);
+
+  u8g2.setFont(FONT_TEXT);
+  const char *second = r.title[0] ? r.title
+                       : r.error[0] ? r.error
+                                    : net_radio_state_name(r.state);
+  draw_marquee(MQ_ARTIST, 0, 17, W, second, dt);
+
+  const bool playing = r.state == RADIO_PLAYING;
+  if (playing && v.active) {
+    draw_mini_spectrum(v, 19, 6);
+  } else {
+    /*
+     * The buffering indicator: a bar of how full the jitter buffer is, with a
+     * tick at the level playback starts from. The tick is what makes the bar
+     * readable -- without it, "40%" means nothing, and with it the answer to
+     * "is it nearly there" is one glance.
+     */
+    const int bar_x = 0, bar_y = 20, bar_w = W - 34, bar_h = 5;
+    u8g2.drawFrame(bar_x, bar_y, bar_w, bar_h);
+    const int fill = (bar_w - 2) * r.bufferPercent / 100;
+    if (fill > 0) u8g2.drawBox(bar_x + 1, bar_y + 1, fill, bar_h - 2);
+    const int mark = bar_x + 1 + (bar_w - 2) * 55 / 100;  // PREBUFFER_PERCENT
+    u8g2.drawVLine(mark, bar_y - 2, 2);
+
+    u8g2.setFont(FONT_SMALL);
+    char label[16];
+    snprintf(label, sizeof(label), "%u%%", (unsigned)r.bufferPercent);
+    draw_right(W, bar_y + bar_h, label);
+  }
+
+  // --- row 4: what the stream actually is ---
+  u8g2.setFont(FONT_SMALL);
+  char stats[48];
+  if (r.sampleRate) {
+    // "MP3 128k 44.1k stereo" does not fit, so the sample rate is dropped first
+    // -- it is the one a listener is least likely to care about.
+    if (r.bitrate) {
+      snprintf(stats, sizeof(stats), "%s %uk %s", r.codec, (unsigned)r.bitrate,
+               r.channels == 1 ? "mono" : "stereo");
+    } else {
+      snprintf(stats, sizeof(stats), "%s %u.%u kHz %s", r.codec,
+               (unsigned)(r.sampleRate / 1000), (unsigned)((r.sampleRate / 100) % 10),
+               r.channels == 1 ? "mono" : "stereo");
+    }
+  } else {
+    snprintf(stats, sizeof(stats), "%s", net_radio_state_name(r.state));
+  }
+  u8g2.drawUTF8(0, 31, stats);
+
+  // The right-hand end carries whichever number is the interesting one: the
+  // buffer while playing (it is the early warning), the underrun count once
+  // there have been any, because that is the number that explains the gaps.
+  char right[16];
+  if (r.underruns) {
+    snprintf(right, sizeof(right), "%lu drop", (unsigned long)r.underruns);
+  } else if (playing) {
+    snprintf(right, sizeof(right), "buf %u%%", (unsigned)r.bufferPercent);
+  } else {
+    right[0] = 0;
+  }
+  if (right[0]) draw_right(W, 31, right);
+}
+
 static void draw_pairing(uint32_t now, uint32_t dt) {
   /*
    * Animated beacon: rings expanding out of the Bluetooth rune, on the right
@@ -902,8 +1022,9 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
   // "Waiting for something to play" is the same screen whichever mode we are
   // in; only the words change. The beacon animates whenever a source is
   // actually listening -- an advertising A2DP sink, or a mounted card.
-  const bool listening =
-      s.bt_active || (s.source == PS_SRC_DFPLAYER && s.connected);
+  const bool listening = s.bt_active ||
+                        (s.source == PS_SRC_DFPLAYER && s.connected) ||
+                        (s.source == PS_SRC_RADIO && s.connected);
 
   const int cx = 12, cy = 16;
   u8g2.drawXBMP(cx - 8, cy - 8, 16, 16, ICON_BT_BIG);
@@ -932,6 +1053,7 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
                          : s.source == PS_SRC_DFPLAYER ? (s.connected
                                                               ? "Card ready"
                                                               : "No module")
+                         : s.source == PS_SRC_RADIO    ? "Internet radio"
                                                        : "Wi-Fi mode";
   u8g2.drawUTF8(32, 11, headline);
 
@@ -944,6 +1066,12 @@ static void draw_pairing(uint32_t now, uint32_t dt) {
                  s.title[0] ? s.title : "Waiting for the module", dt);
   } else if (s.bt_active) {
     draw_marquee(MQ_NAME, 32, 21, W - 32, ps_device_name(), dt);
+
+  } else if (s.source == PS_SRC_RADIO) {
+    // Whatever the player last had to say -- "Could not reach the station" is
+    // exactly what somebody standing in front of a silent speaker needs, and
+    // it is more useful here than the device name.
+    draw_marquee(MQ_NAME, 32, 21, W - 32, net_radio_screen_line(), dt);
 
   } else {
     draw_marquee(MQ_NAME, 32, 21, W - 32,
@@ -1290,6 +1418,11 @@ static bool screen_eligible(UiScreen s, const PlayerInfo &info, uint32_t now) {
     case SCR_SCOPE:
     case SCR_WATERFALL:
       return audio;
+    case SCR_RADIO:
+      // Only in the modes that have a radio, and only once it is doing
+      // something. A station that is stopped has nothing to say that the clock
+      // does not say better.
+      return net_radio_running() && net_radio_screen_wanted();
     case SCR_CLOCK:
     case SCR_INFO:
       return true;
@@ -1615,6 +1748,7 @@ static void ui_frame() {
     case SCR_VU: draw_vu(info, vis, dt); break;
     case SCR_SCOPE: draw_scope(vis); break;
     case SCR_WATERFALL: draw_waterfall(vis); break;
+    case SCR_RADIO: draw_radio(vis, dt); break;
     case SCR_CLOCK: draw_clock_screen(now, dt); break;
     case SCR_INFO: draw_info(info, vis, now, dt); break;
     case SCR_PAIRING: draw_pairing(now, dt); break;

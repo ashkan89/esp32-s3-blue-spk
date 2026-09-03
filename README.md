@@ -19,6 +19,22 @@ mounts as a drive, so loading it needs no card reader. There is also an optional
 indicator on the display, the LED and the dashboard. Both are absent-tolerant in
 the same way the display is.
 
+Nor does audio have to arrive at all. In the two modes that bring up Wi-Fi the
+speaker is an **internet radio**: favourites stored on the device, MP3 and AAC
+decoded on the chip itself, ICY metadata on the OLED, and a jitter buffer whose
+level you can watch. On top of that sit a **five-band equaliser** in the sample
+path of every source, **spoken announcements** recorded into flash at build time,
+a **smart alarm clock** with per-weekday scheduling and a wake-up fade, a **sleep
+timer**, **two hours of graphed history** for voltage, temperature, memory and
+signal, and **Home Assistant** over MQTT with the discovery documents that make
+the speaker appear complete without anybody writing YAML.
+
+Everything in that second paragraph needs the network, so all of it is confined
+to **Wi-Fi only** and **DFPlayer + Wi-Fi** mode — with three deliberate
+exceptions that work in every mode including Bluetooth, because they are the
+ones that matter most when there is no dashboard to look at: the equaliser, the
+alarm, and the announcements.
+
 ## Hardware requirement
 
 This needs a **classic ESP32** (WROOM-32, -32D, -32E, or a WROVER). Bluetooth
@@ -543,14 +559,33 @@ console is available at the IP printed on the serial monitor, at
 working, the setup network comes back after 15 seconds, so the speaker cannot be
 locked out by a router change.
 
-Seven pages: **Overview** (the transport, the source card for whichever mode is
-running, the battery, the radio mode picker, firmware), **Devices** (Bluetooth
-pairings), **Media** (the DFPlayer library and every one of its controls),
-**Lighting** (the WS2812 ring: effects, both colour pickers, and how much of the
-music is allowed to show), **Wi-Fi**, **Updates** and **Settings**. Pages that do not apply to the running
-mode say so and explain how to get to one where they do, rather than showing
-dead controls — the Devices page in a mode with no A2DP sink, the Media page in a
-mode with no DFPlayer.
+Twelve pages:
+
+| Page | What is on it |
+|------|---------------|
+| **Overview** | the transport, the source card for whichever mode is running, the internet radio and alarm cards when either has something to say, the battery, the radio mode picker, firmware |
+| **Devices** | Bluetooth pairings, and the addresses the announcement mapping needs |
+| **Media** | the DFPlayer library and every one of its controls |
+| **Radio** | internet radio: the favourites, the transport, the buffer level, the stream's own numbers |
+| **Sound** | the five-band equaliser and its presets, the output level, and the spoken announcements |
+| **Alarms** | five alarms, the sleep timer, and the time-zone rule the alarms depend on |
+| **Lighting** | the WS2812 ring: effects, both colour pickers, and how much of the music is allowed to show |
+| **Graphs** | two hours of voltage, chip temperature, free memory and Wi-Fi signal |
+| **Wi-Fi** | scanning and joining a network |
+| **Home Assistant** | the MQTT broker, and what the speaker publishes |
+| **Updates** | the A/B firmware updater |
+| **Settings** | identity, access, the OLED, power saving, standby, the battery gauge, backup and restore |
+
+Pages that do not apply to the running mode say so and explain how to get to one
+where they do, rather than showing dead controls — the Devices page in a mode
+with no A2DP sink, the Media page in a mode with no DFPlayer, the Radio and Home
+Assistant pages in a mode with no Wi-Fi.
+
+The three that keep working everywhere are deliberate: the **equaliser**, the
+**alarms** and the **announcements** are all in the sample path or on the wall
+clock rather than on the network, so a curve dialled in over Wi-Fi and an alarm
+set from the dashboard both still apply after you switch to Bluetooth mode,
+where there is no dashboard at all.
 
 ### Three radio modes
 
@@ -561,9 +596,13 @@ and the OTA download need comes from:
 
 | Mode | Wi-Fi | Bluetooth | Audio arrives over |
 |------|-------|-----------|--------------------|
-| **Wi-Fi only** | station, or setup hotspot if no network is saved | not started at all; its DRAM goes back to the heap | nothing |
+| **Wi-Fi only** | station, or setup hotspot if no network is saved | not started at all; its DRAM goes back to the heap | **the internet**, as MP3 or AAC decoded on the chip |
 | **Bluetooth only** | never initialised | A2DP sink owns the antenna | A2DP |
-| **DFPlayer + Wi-Fi** | station, or setup hotspot; identical to Wi-Fi only mode | neither half is started; the *whole* controller goes back to the heap | **a microSD card or USB drive**, over serial |
+| **DFPlayer + Wi-Fi** | station, or setup hotspot; identical to Wi-Fi only mode | neither half is started; the *whole* controller goes back to the heap | **a microSD card or USB drive** over serial, **or the internet** |
+
+Wi-Fi only mode used to have no audio path at all — it brought up a dashboard
+and a clock and then sat there with an idle DAC. Internet radio is what fills
+that column, and it needed no hardware that was not already fitted.
 
 The mode is remembered across restarts, so a power cut brings the speaker back
 doing whatever it was doing. A factory-fresh board starts in Wi-Fi only mode
@@ -1050,7 +1089,7 @@ then fail to boot from it.
 
 ## The display
 
-Nine screens. Seven of them rotate on a nine-second carousel, skipping any that
+Ten screens. Eight of them rotate on a nine-second carousel, skipping any that
 have nothing to say; the other two take over when they apply.
 
 **Now playing** — title, artist, and a progress bar that keeps moving between the
@@ -1091,10 +1130,31 @@ tone sits still instead of sliding sideways, on a dotted graticule.
 **Waterfall** — a scrolling spectrogram: one column per frame, one row per band,
 intensity by ordered dithering. Time runs right to left, frequency bottom to top.
 
+**Radio** — only in the modes that have one, and only once it is doing
+something. The station's name, the now-playing text it sent, and a bottom row of
+codec, bitrate and channels. The third row is the spectrum while it plays and the
+**buffering bar** while it does not, with a tick at the level playback starts
+from — without that mark "40%" means nothing, and with it the answer to "is it
+nearly there" is one glance. The right-hand end shows the buffer level, or the
+underrun count once there have been any, because that is the number that
+explains the gaps.
+
+```
+ ⌂ SomaFM Groove Salad
+ Tycho - Awake
+      ▁▃▅█▆▄▂▁▂▄▆█▇▅▃▁▂▃▅▇  ▏
+ MP3 128k stereo      buf 78%
+```
+
 **Clock** — seven-segment hours and minutes with a colon that blinks once a
 second, the date beside it, and the seconds as a sweep along the bottom edge.
 The whole layout shifts a pixel sideways as the minutes pass, because OLEDs do
 burn in.
+
+The bottom right carries **the next alarm** rather than the seconds whenever one
+is armed — "is my alarm actually set" is a question people get out of bed to
+check, and the blinking colon already says the clock is live. A bell with a line
+through it is an alarm whose next occurrence has been skipped.
 
 ```
  ███ ███ ▪ ███ ███   TUE 18
@@ -1541,6 +1601,36 @@ matter is closed. `CLOCK_TZ_OFFSET_MIN` in [src/ui_config.h](src/ui_config.h)
 (minutes east of UTC) is only the starting value, for a speaker that is never
 opened in a browser.
 
+That is enough for a clock on a shelf: it is wrong for half the year in most of
+the world, and being an hour out on a display nobody sets an appointment by
+costs nothing.
+
+An **alarm** is a different matter. So the zone can also be given as a full
+POSIX TZ rule — the same string `/etc/localtime` is compiled from — and newlib,
+which is already linked in, applies the daylight-saving transitions itself:
+
+```
+CET-1CEST,M3.5.0,M10.5.0/3           central Europe
+EST5EDT,M3.2.0,M11.1.0               US eastern
+<+0330>-3:30<+0430>,J80/0,J264/0     Iran, which changes on fixed days
+```
+
+Pick one from the dropdown on the dashboard's **Alarms** page and the speaker
+follows the changes on its own; `soft_clock_utc_offset_min()` keeps meaning what
+it always meant and simply changes by itself twice a year, so nothing downstream
+had to learn anything new.
+
+There is no zone database on the device and there is not going to be one — it is
+700 kB and it goes stale. The list of rules lives in the dashboard, which is to
+say in the half of the system that is rewritten by every firmware update anyway,
+and the speaker stores the one string it was handed. A rule that stops parsing
+between firmware versions is rejected at boot and the clock falls back to the
+fixed offset rather than taking the alarm down with it.
+
+While a rule is installed it outranks a bare offset, and **Sync browser time**
+will not quietly demote it — otherwise one press would undo the daylight-saving
+handling and the next transition would be missed.
+
 ### Without a network
 
 The clock still works offline, from whichever of these you set up:
@@ -1903,6 +1993,312 @@ each note is faded in and out over ~4 ms — skip that and every note edge click
 
 The chimes are fed to the analyser as well, so the display moves in time with
 them.
+
+
+## The equaliser
+
+Five biquad sections per channel, in the sample path of whatever is playing:
+
+| Band | Kind | What it is for |
+|------|------|----------------|
+| 60 Hz | low shelf | the bottom, as a whole |
+| 250 Hz | peaking | warmth, and where a small cabinet booms |
+| 1 kHz | peaking | presence — vocals sit here |
+| 4 kHz | peaking | articulation, consonants, snare attack |
+| 12 kHz | high shelf | air, as a whole |
+
+The two ends are shelves and the three in the middle are peaking filters, which
+is the arrangement a physical five-band tone stack uses and for the same reason:
+a peaking filter at 60 Hz leaves the bottom octave — where a small speaker has
+nothing anyway — alone, while a shelf lifts the whole of it, which is what "more
+bass" means to the person turning the knob.
+
+Five presets, on the dashboard's **Sound** page and from the console:
+
+| Preset | Shape |
+|--------|-------|
+| Flat | everything at zero |
+| Music | a gentle smile: a little at each end, a shallow dip in the upper mid |
+| Voice | bass and top cut, presence lifted at 1 kHz and 4 kHz |
+| Bass Boost | a large low shelf, a small top lift, the middle left alone |
+| Night | deep bass pulled down hard, mid brought up — a loudness curve run backwards, so speech stays intelligible at a volume that will not wake anybody |
+
+Moving a slider makes the curve **Custom**; picking a preset again overwrites it.
+
+**Where it runs.** From inside `LoudVolumeControl::update_audio_data()` for A2DP
+and from the radio player's output stage for network audio — both after the
+volume control, so the headroom is measured against what you are actually
+hearing. It is single-precision float, about 4.4 million operations a second at
+44.1 kHz stereo, which is roughly 2% of one core against the ~15% the SBC decoder
+itself costs. With every band at zero it returns after one comparison, so an
+owner who never opens the page pays nothing.
+
+**Headroom.** Boosting a band pushes samples past full scale and a full-scale
+stream has none to give. Two things guard that: an automatic preamp that pulls
+the whole signal down by however much the largest boost adds, and the same
+quadratic soft knee the volume path uses, so whatever still arrives over the
+ceiling is rounded off rather than clipped flat. The automatic preamp can be
+switched off from the dashboard by an owner who would rather have the loudness.
+
+**In DFPlayer mode the module does the work instead.** Its audio never passes
+through this chip — it comes out of the module's own DAC and joins at the jack —
+so there is nothing here to filter. The chosen curve is mapped to the nearest of
+the YX5200's six hardware presets and pushed over the serial link, and the
+dashboard says so rather than showing five sliders that do nothing.
+
+```
+eq                     show the curve, the preamp and whether it is active
+eq music               pick a preset (flat, music, voice, bass, night)
+eq 1 +6                band 1 (60 Hz) to +6 dB
+eq off                 bypass
+eq auto                toggle the automatic preamp
+```
+
+## Internet radio
+
+In **Wi-Fi only** and **DFPlayer + Wi-Fi** mode the speaker plays streams from
+the network. The I2S channel is opened in `setup()` before the radio mode is even
+consulted, so in Wi-Fi mode it is simply free — this is the audio source that
+mode never had.
+
+- **Codecs**: MP3 and AAC, through [libhelix](https://github.com/pschatzmann/arduino-libhelix).
+  Between them they cover essentially all of Shoutcast and Icecast. Ogg and Opus
+  are not supported: neither has a decoder that fits in the RAM this chip has
+  left once Wi-Fi has taken its share.
+- **HTTP and HTTPS**. TLS uses the same Mozilla root bundle the firmware updater
+  trusts.
+- **Twelve favourites**, stored on the device, editable and reorderable from the
+  dashboard's **Radio** page. Four public stations are seeded on first boot so
+  there is something to press.
+- **ICY metadata**: the station name, genre and the now-playing text, on the
+  OLED and the dashboard, plus the bitrate the station reports.
+- **Automatic reconnection** on a backoff that widens to a minute and then stays
+  there, forever. Giving up after five tries would mean a speaker that is silent
+  when the network comes back an hour later.
+- **Resumes after a power cut** — the station and the intent to be playing are
+  both persisted.
+
+### The buffer, and what the indicator means
+
+A stream arrives in whatever lumps the internet felt like sending and a decoder
+consumes it at a constant rate. Between them sits a 24 kB ring — about a second
+and a half of a 128 kbps stream — filled ahead before playback starts and topped
+up between decodes. What the dashboard draws as a buffering bar is how full it
+is, with a tick at the 55% mark playback begins from.
+
+The number matters because it is the only warning that arrives *before* the
+sound stops. A buffer that sits high is a healthy link; one that sags towards
+zero is a connection that cannot keep up, and the underrun counter next to it
+says how often it has already run dry. Below about −75 dBm of Wi-Fi signal a
+stream starts running out of buffer before it runs out of bandwidth, which is
+why the Graphs page plots the signal too.
+
+**Where it runs.** On its own FreeRTOS task pinned to core 1, not in `loop()`.
+That is not a preference: `loop()` serves HTTP, plays melodies and talks to the
+DFPlayer, and any one of those blocks for tens of milliseconds at a time. On its
+own task the decode is paced by the blocking I2S write itself — which is exactly
+the clock a stream should run on — and the web server can take as long as it
+likes.
+
+**In DFPlayer mode both can make a sound**, since the module's analog output and
+the PCM5102A meet at the same jack. Starting a station pauses the module first,
+and that is the whole of the arbitration.
+
+```
+station                status, and the favourites with the playing one marked
+station 3              play favourite 3
+station http://…       play any stream address
+station stop|next|prev
+```
+
+## Spoken announcements
+
+The speaker can say things: "battery critically low", "Wi-Fi connected",
+"connecting to the station", "good morning, your alarm is going off".
+
+There is no synthesiser on the chip. Everything it can say was written into
+[scripts/voice_phrases.txt](scripts/voice_phrases.txt), spoken by the Windows
+speech engine, and embedded as IMA ADPCM by
+[scripts/make_voice_clips.py](scripts/make_voice_clips.py) — about 355 kB of
+flash for 45 seconds of speech at 16 kHz, at exactly 4:1 compression. The build
+never runs that script; `src/voice_clips.h` is committed, so a build works on a
+machine with no speech engine and produces the same bytes everywhere.
+
+That trade buys the two properties that matter for the things worth announcing:
+a battery warning works with **no network, in every radio mode including
+Bluetooth**, and it sounds like a person. What it costs is equally plain — the
+speaker cannot read out a name it has never been given.
+
+### Changing what it says, and adding your own
+
+```
+notepad scripts\voice_phrases.txt          # id | the words to speak
+python scripts\make_voice_clips.py         # respeaks and rewrites voice_clips.h
+pio run -t upload
+```
+
+`--list-voices` prints the installed voices and `--voice "Microsoft David"`
+picks one. The ids marked `[fixed]` in the file are referenced by the firmware
+and should keep their names; everything else is yours.
+
+This is also the answer to "announce which phone connected". Add a line —
+`ash_iphone | Ashkan's iPhone is connected.` — regenerate, rebuild, then map the
+phone's Bluetooth address to it on the dashboard's **Sound** page. Addresses are
+on the Devices page.
+
+### What may speak
+
+Five categories, each switchable, because announcements differ enormously in how
+welcome they are:
+
+| Category | Default | What it covers |
+|----------|---------|----------------|
+| System | on | boot, shutdown, radio mode |
+| Connections | **off** | a phone or the network coming and going |
+| Battery | on | low, critical, charging, full |
+| Internet radio | on | connecting to a station, and failing to |
+| Alarms | on | the alarm, snooze, the sleep timer |
+
+Connection announcements start off on purpose: a phone drifting in and out of
+range at the edge of the house would otherwise have the speaker talking to an
+empty room all afternoon, and that is the single most common reason somebody
+switches a feature like this off and never switches it back on.
+
+### How a clip reaches the speaker
+
+Two paths, because there are two situations. With nothing playing, `loop()`
+renders the clip into a buffer and writes it to I2S — the same shape the melodies
+use. With music playing, the clip is mixed into the stream on the audio task and
+the music is ducked underneath it, ramping over about 60 ms down and 170 ms back
+up: fast enough to be out of the way of the first syllable, slow enough not to
+sound like a fault. They share one decoder and one queue, and an ownership flag
+decides which drains it, so a clip can never be played twice at half speed.
+
+```
+say                    the settings, and every clip in this firmware
+say battery_low        play one
+say off                switch announcements off
+```
+
+## The alarm clock and the sleep timer
+
+Five alarms, on the dashboard's **Alarms** page and visible on the OLED's clock
+screen. Each has its own days, its own source and its own wake-up ramp.
+
+- **It wakes you with something.** An internet radio station, a folder on the
+  DFPlayer's card, or the built-in chime. Waking to the news is a different
+  thing from waking to a beep.
+- **It fades up**, from near silence to the target over up to ten minutes. This
+  is the single feature that makes an alarm pleasant and it costs a variable and
+  a multiply.
+- **It falls back.** If the station will not connect — the router is down, the
+  stream moved — the chime takes over after twenty seconds. An alarm that
+  silently fails to make a sound is not an alarm, and a network it depends on
+  will eventually be down at 6 a.m.
+- **It knows what day it is**: per-weekday scheduling, plus a one-shot mode that
+  disarms itself afterwards.
+- **It can be skipped.** Tomorrow's occurrence can be waved off without
+  disarming the alarm, which is what everybody actually wants on a Friday night.
+- **It stops itself**, after anywhere from five minutes to an hour, so a house
+  nobody is in does not play the radio for a week.
+
+Alarms work in **every mode**. The comparison is arithmetic on the wall clock and
+the chime plays through the same I2S channel the melodies use, so an alarm set
+from the dashboard in Wi-Fi mode still goes off in Bluetooth mode, where there is
+no dashboard to set it from. Only the sources differ, which is also why the chime
+is the fallback.
+
+The **sleep timer** is the same idea pointing the other way: plays for as long as
+you say, fades out over the last minute, and stops — optionally going into
+standby proper afterwards, which is what you want overnight on a battery.
+
+```
+alarm                  the alarms, and the next one due
+alarm off | snooze     stop or snooze a ringing one
+alarm test2            fire alarm 2 now
+sleep 45               start the sleep timer
+sleep off              cancel it
+```
+
+### Why the time zone matters here
+
+An alarm that fires an hour late on the last Sunday in March is not a clock that
+drifted — it is an alarm that failed, and the owner finds out by oversleeping. So
+the clock takes a full POSIX TZ rule as well as a plain offset; see
+[The clock](#the-clock) below.
+
+## Graphs
+
+Two hours of history, sampled every thirty seconds into a fixed ring of 240 —
+about 2.4 kB of RAM, allocated once at boot. The dashboard's **Graphs** page
+draws four of them:
+
+| Series | Why it is worth a line rather than a number |
+|--------|---------------------------------------------|
+| Battery voltage | 3.8 V is fine or nearly flat depending entirely on which way it is moving |
+| Chip temperature | a speaker cooking in the sun, or a charge current heating the board, shows up as a trend |
+| Free memory | only ever diagnostic as a slope — a line drifting down is a leak, and the difference between a mysterious reboot tonight and a known cause |
+| Wi-Fi signal | below about −75 dBm a stream runs out of buffer before it runs out of bandwidth |
+
+The stretches where something was playing are shaded behind the curve, which is
+usually the whole explanation for a battery line that suddenly steepens.
+
+**About that temperature.** It is the ESP32's internal sensor, and it measures
+the *die*, not the room. On the original silicon it is an undocumented ROM
+routine with a coarse step and a per-chip offset nobody calibrated, and it reads
+ten to twenty degrees above ambient after the radio has been busy. It is genuinely
+useful for what it is good at — spotting a trend — and it is not a thermometer.
+The dashboard says so next to the graph, and no decision in this firmware is made
+from it.
+
+The ring is in RAM and not in flash on purpose: this is for looking at a running
+speaker, and writing a sample to NVS every thirty seconds would wear the chip out
+inside a year for a history nobody reads after a reboot. Total runtime and the
+boot count *are* persisted, once every ten minutes.
+
+```
+graph                  the three series as sparklines, with the ranges
+```
+
+## Home Assistant, over MQTT
+
+The dashboard in this firmware is complete, and it is also a thing you have to
+open. Half of what a speaker in a house should do is conditional on something
+else — turn the radio on when the bedroom alarm goes off, drop the volume when
+the doorbell rings — and none of that can live in the speaker, because the
+speaker does not know about the doorbell. So it publishes what it knows and
+subscribes to what it can be told, and the automation lives where the rest of the
+house's automation already lives.
+
+Put your broker's address on the dashboard's **Home Assistant** page and the
+speaker appears in Home Assistant within a second of connecting, complete, with
+one device and these entities:
+
+| Kind | Entities |
+|------|----------|
+| Controls | volume, mute, play/pause, next, previous, equaliser preset, radio station, the LED ring as a light with colour and effects, the sleep timer, one switch per alarm, standby |
+| Readings | source, now playing, connected device, battery, voltage, charging, chip temperature, free memory, Wi-Fi signal, uptime, total runtime, radio status and buffer level |
+
+Discovery is what makes that work. Home Assistant will happily talk to a device
+publishing to hand-written topics, provided somebody writes about eighty lines of
+YAML per entity and keeps it in step with the firmware — and nobody does that
+twice. Publishing the discovery documents means the entity list follows the
+firmware instead: add a radio station and the dropdown has one more option the
+next time the speaker connects.
+
+The standby switch turns off and cannot turn back on. That is the honest shape
+for it — a chip in deep sleep is not listening to MQTT, and no amount of protocol
+will change that — and the entity's own name says so.
+
+MQTT is TCP, so this needs Wi-Fi; in Bluetooth mode the page says why. It runs
+from `loop()` through the ordinary synchronous PubSubClient, alongside the web
+server, deliberately rather than through an async client: the radio's decoder
+task already wants a steady share of the network stack, and a second task doing
+keepalives would be contention for a few hundred bytes every ten seconds.
+
+```
+mqtt                   connection state, message counts, discovery status
+```
 
 ## Output level
 
@@ -2394,6 +2790,14 @@ group — most of the pass criteria below are one line of that report.
 | [src/ui.h](src/ui.h) / [.cpp](src/ui.cpp) | the screens, overlays, transitions, marquees, 7-segment |
 | [src/leds.h](src/leds.h) / [.cpp](src/leds.cpp) | the WS2812 ring: fifteen effects, the music sync, the RMT wire protocol |
 | [src/power.h](src/power.h) / [.cpp](src/power.cpp) | power saving: the three modes, the battery policy, and the four things it switches off |
+| [src/audio_eq.h](src/audio_eq.h) / [.cpp](src/audio_eq.cpp) | the five-band equaliser: cookbook biquads, the presets, the automatic preamp |
+| [src/net_radio.h](src/net_radio.h) / [.cpp](src/net_radio.cpp) | internet radio: the decoder task, the jitter buffer, ICY metadata, reconnection, the favourites |
+| [src/voice.h](src/voice.h) / [.cpp](src/voice.cpp) | spoken announcements: the ADPCM decoder, the resampler, the ducking mixer, the queue |
+| [src/voice_clips.h](src/voice_clips.h) | the clips themselves — generated, committed, never rebuilt by a build |
+| [src/alarm_clock.h](src/alarm_clock.h) / [.cpp](src/alarm_clock.cpp) | alarms and the sleep timer: scheduling, the wake-up ramp, the fallback to the chime |
+| [src/telemetry.h](src/telemetry.h) / [.cpp](src/telemetry.cpp) | the history ring behind the graphs, and the runtime counter |
+| [src/home_assistant.h](src/home_assistant.h) / [.cpp](src/home_assistant.cpp) | MQTT and the Home Assistant discovery documents |
+| [scripts/make_voice_clips.py](scripts/make_voice_clips.py) | speaks [scripts/voice_phrases.txt](scripts/voice_phrases.txt) and embeds it as IMA ADPCM — run by hand, not by the build |
 | [src/ui_assets.h](src/ui_assets.h) | hand-drawn XBM icons |
 | [src/pin_check.h](src/pin_check.h) | the whole pin map in one place, asserted at compile time — no code, no flash |
 | [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |

@@ -53,6 +53,7 @@ static const char *EPOCH_KEY = "utc";
 static const char *OFFSET_KEY = "tzmin";
 static const char *H24_KEY = "h24";
 static const char *SYNC_KEY = "autosync";
+static const char *ZONE_KEY = "tzrule";
 
 /// Presentation, not time: 24-hour or 12-hour with AM/PM. CLOCK_24H is only the
 /// value a speaker that has never been opened in a browser comes up with.
@@ -108,11 +109,82 @@ static void timezone_string(char *out, size_t len) {
            (long)(magnitude / 60), (long)(magnitude % 60));
 }
 
+/*
+ * The POSIX TZ rule, when one has been chosen, and the offset it works out to
+ * right now.
+ *
+ * These two are kept in step deliberately. Everything else in the firmware --
+ * the SNTP path, the DS3231 write, the dashboard, the alarm -- was written
+ * against a single integer offset, and the honest way to slide a zone with a
+ * daylight-saving rule underneath all of it is to let that integer keep meaning
+ * what it always meant and simply recompute it whenever the rule says it has
+ * changed. Nothing downstream had to learn anything new.
+ */
+static char g_zone[48];
+
+/// How often the cached offset is re-derived from the rule. See soft_clock_tick().
+static const uint32_t ZONE_RECHECK_MS = 60000;
+static uint32_t g_last_zone_check_ms;
+
+/// The offset the installed zone is on at instant `when`, in minutes east of
+/// UTC. Derived the only way a POSIX zone can be interrogated: ask for the same
+/// instant twice, once local and once UTC, and subtract.
+static int32_t zone_offset_at(time_t when) {
+  struct tm local = {}, utc = {};
+  localtime_r(&when, &local);
+  gmtime_r(&when, &utc);
+  local.tm_isdst = 0;
+  utc.tm_isdst = 0;
+  const double delta = difftime(mktime(&local), mktime(&utc));
+  return (int32_t)(delta / 60.0);
+}
+
 static void apply_timezone() {
+  if (g_zone[0]) {
+    setenv("TZ", g_zone, 1);
+    tzset();
+    // The rule is authoritative now, so the stored offset becomes a readout of
+    // it rather than a setting of its own. It is re-derived on every tick as
+    // well, which is what carries the clock across a daylight-saving
+    // transition without anybody having to do anything.
+    const int32_t derived = zone_offset_at(time(nullptr));
+    if (derived >= -840 && derived <= 840) g_offset_min = derived;
+    return;
+  }
   char tz[24];
   timezone_string(tz, sizeof(tz));
   setenv("TZ", tz, 1);
   tzset();
+}
+
+/*
+ * Is this string something newlib can actually use?
+ *
+ * There is no validator in the C library -- tzset() accepts anything and falls
+ * back to UTC on nonsense without a word -- so this checks it the one way that
+ * is available: install it, ask what it works out to, and see whether the
+ * answer is a zone at all. A rule that lands on exactly UTC, under the name
+ * "UTC", when the owner did not ask for UTC is how a typo presents, and
+ * rejecting it beats a clock that is quietly eight hours wrong.
+ */
+static bool zone_is_usable(const char *tz) {
+  if (!tz || !tz[0]) return false;
+  if (strlen(tz) >= sizeof(g_zone)) return false;
+  char saved[sizeof(g_zone)];
+  const char *current = getenv("TZ");
+  snprintf(saved, sizeof(saved), "%s", current ? current : "");
+
+  setenv("TZ", tz, 1);
+  tzset();
+  const int32_t offset = zone_offset_at(time(nullptr));
+  const bool named = tzname[0] && tzname[0][0] && strcmp(tzname[0], "UTC") != 0;
+  const bool ok = offset >= -840 && offset <= 840 &&
+                  (named || strncmp(tz, "UTC", 3) == 0);
+
+  if (saved[0]) setenv("TZ", saved, 1);
+  else unsetenv("TZ");
+  tzset();
+  return ok;
 }
 
 // ---------------------------------------------------------------- DS3231 -----
@@ -413,6 +485,17 @@ void soft_clock_begin() {
     if (g_offset_min < -840 || g_offset_min > 840) g_offset_min = CLOCK_TZ_OFFSET_MIN;
     g_use_24h = g_prefs.getBool(H24_KEY, CLOCK_24H != 0);
     g_auto_sync = g_prefs.getBool(SYNC_KEY, true);
+    // Read into a scratch buffer and vet it before it becomes the live zone: a
+    // rule that stopped parsing between firmware versions must not take the
+    // clock with it, because the clock is what the alarm runs on.
+    char stored[sizeof(g_zone)];
+    const String rule = g_prefs.getString(ZONE_KEY, "");
+    if (rule.length() && rule.length() < sizeof(stored)) {
+      snprintf(stored, sizeof(stored), "%s", rule.c_str());
+      if (zone_is_usable(stored)) snprintf(g_zone, sizeof(g_zone), "%s", stored);
+      else Serial.printf("[clock] stored zone \"%s\" no longer parses; keeping "
+                         "the fixed offset\n", stored);
+    }
   }
   apply_timezone();
 
@@ -542,6 +625,12 @@ int32_t soft_clock_utc_offset_min() { return g_offset_min; }
 
 void soft_clock_set_utc_offset_min(int32_t minutes) {
   if (minutes < -840 || minutes > 840) return;
+  // A zone rule outranks a bare offset, and the browser sends its offset along
+  // with every clock sync -- so without this, one press of "Sync browser time"
+  // would quietly demote a configured zone back to a fixed offset and the next
+  // daylight-saving change would be missed. Choosing the zone is the Settings
+  // page's job, and it goes through soft_clock_set_zone().
+  if (g_zone[0]) return;
   if (minutes == g_offset_min) return;
   g_offset_min = minutes;
   apply_timezone();
@@ -554,11 +643,59 @@ void soft_clock_set_utc_offset_min(int32_t minutes) {
   if (g_ntp_running) soft_clock_network_begin();
 }
 
+const char *soft_clock_zone() { return g_zone; }
+
+bool soft_clock_set_zone(const char *tz) {
+  if (!tz || !tz[0]) {
+    if (!g_zone[0]) return true;
+    g_zone[0] = 0;
+    if (g_prefs_ok) g_prefs.remove(ZONE_KEY);
+    apply_timezone();
+    Serial.println("[clock] zone cleared; back to the fixed offset");
+    return true;
+  }
+  if (!zone_is_usable(tz)) {
+    Serial.printf("[clock] \"%s\" is not a POSIX TZ rule this C library "
+                  "understands\n", tz);
+    return false;
+  }
+  if (strcmp(g_zone, tz) == 0) return true;
+  snprintf(g_zone, sizeof(g_zone), "%s", tz);
+  apply_timezone();
+  if (g_prefs_ok) g_prefs.putString(ZONE_KEY, g_zone);
+  Serial.printf("[clock] zone %s -> %s, %+ld min\n", g_zone,
+                soft_clock_zone_abbrev(), (long)g_offset_min);
+  if (g_ntp_running) soft_clock_network_begin();
+  return true;
+}
+
+const char *soft_clock_zone_abbrev() {
+  if (!g_zone[0]) return "UTC";
+  struct tm local = {};
+  const time_t now = time(nullptr);
+  localtime_r(&now, &local);  // fills tzname[] for the current instant
+  const int which = local.tm_isdst > 0 ? 1 : 0;
+  return (tzname[which] && tzname[which][0]) ? tzname[which] : "UTC";
+}
+
+bool soft_clock_dst_active() {
+  if (!g_zone[0]) return false;
+  struct tm local = {};
+  const time_t now = time(nullptr);
+  localtime_r(&now, &local);
+  return local.tm_isdst > 0;
+}
+
 void soft_clock_set(const struct tm &t, ClockSource source) {
   struct tm copy = t;
-  // The zone is a fixed offset with no DST rule, so this only ever resolves to
-  // "not in DST" -- but saying so explicitly keeps mktime() from guessing.
-  copy.tm_isdst = 0;
+  /*
+   * On a fixed offset there is no daylight saving to resolve, and saying so
+   * explicitly keeps mktime() from guessing. With a zone rule installed the
+   * opposite is true: the owner typed a wall-clock time, and only the rule
+   * knows which side of a transition it falls on -- so hand it the question,
+   * which is what tm_isdst = -1 means.
+   */
+  copy.tm_isdst = g_zone[0] ? -1 : 0;
   const time_t epoch = mktime(&copy);
   if (epoch == (time_t)-1) return;
 
@@ -582,6 +719,27 @@ void soft_clock_set(const struct tm &t, ClockSource source) {
 void soft_clock_tick() {
   if (g_ntp_fresh) adopt_network_time();
   const uint32_t now = millis();
+
+  /*
+   * Follow the zone across a daylight-saving transition.
+   *
+   * newlib applies the rule on its own -- localtime() is already right the
+   * instant the clocks go forward -- but g_offset_min is a cached readout of
+   * it, and half the firmware asks for the offset rather than for the time.
+   * A minute is far finer than something that happens twice a year needs, and
+   * it costs two mktime() calls, so there is no reason to be cleverer about
+   * when to look.
+   */
+  if (g_zone[0] && now - g_last_zone_check_ms >= ZONE_RECHECK_MS) {
+    g_last_zone_check_ms = now;
+    const int32_t derived = zone_offset_at(time(nullptr));
+    if (derived >= -840 && derived <= 840 && derived != g_offset_min) {
+      Serial.printf("[clock] %s: %+ld min -> %+ld min (%s)\n", g_zone,
+                    (long)g_offset_min, (long)derived, soft_clock_zone_abbrev());
+      g_offset_min = derived;
+    }
+  }
+
   if (now - g_last_persist_ms >= PERSIST_EVERY_MS) persist_now();
 }
 

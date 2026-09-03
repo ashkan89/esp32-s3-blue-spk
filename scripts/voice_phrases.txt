@@ -1,0 +1,50 @@
+# One clip per line:  id | the words to speak
+#
+# Lines starting with # are ignored. After editing, run
+#   python scripts/make_voice_clips.py
+# and rebuild. Ids used by the firmware are marked [fixed] and should keep their
+# names; everything else is free for you to change, remove or add to.
+
+# -- power and mode ---------------------------------------------------- [fixed]
+boot              | Speaker ready.
+goodbye           | Powering down. Goodbye.
+mode_bluetooth    | Bluetooth mode.
+mode_wifi         | Wi-Fi mode.
+mode_dfplayer     | Memory card mode.
+
+# -- network ----------------------------------------------------------- [fixed]
+wifi_connected    | Wi-Fi connected.
+wifi_lost         | Wi-Fi connection lost.
+wifi_setup        | Setup hotspot is open. Connect to it to configure me.
+
+# -- bluetooth --------------------------------------------------------- [fixed]
+bt_connected      | Device connected.
+bt_disconnected   | Device disconnected.
+bt_ready          | Ready to pair.
+
+# -- battery ----------------------------------------------------------- [fixed]
+battery_low       | Battery low. Please connect the charger.
+battery_critical  | Battery critically low. Shutting down soon.
+battery_charging  | Charging.
+battery_full      | Battery fully charged.
+
+# -- internet radio ---------------------------------------------------- [fixed]
+radio_connecting  | Connecting to the station.
+radio_playing     | Station connected.
+radio_failed      | Could not reach the station.
+radio_buffering   | Buffering.
+
+# -- alarm and sleep --------------------------------------------------- [fixed]
+alarm             | Good morning. Your alarm is going off.
+alarm_snooze      | Snoozing.
+alarm_set         | Alarm set.
+sleep_timer       | Sleep timer started. Good night.
+sleep_ending      | Sleep timer finished.
+
+# -- device names -------------------------------------------------------------
+# These are examples. Add one line per phone or laptop you want announced by
+# name, then map the Bluetooth address to it on the dashboard's Sound page.
+dev_phone         | Phone connected.
+dev_laptop        | Laptop connected.
+dev_tablet        | Tablet connected.
+dev_tv            | Television connected.

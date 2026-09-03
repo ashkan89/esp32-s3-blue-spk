@@ -24,10 +24,16 @@
 #include <esp_wifi.h>
 
 #include "BluetoothA2DPSink.h"
+#include "alarm_clock.h"
+#include "audio_eq.h"
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
+#include "home_assistant.h"
 #include "leds.h"
+#include "net_radio.h"
+#include "telemetry.h"
+#include "voice.h"
 #include "player_state.h"
 #include "power.h"
 #include "soft_clock.h"
@@ -87,6 +93,29 @@ struct Settings {
   uint16_t sleepAfterS;
 
   LedConfig leds;
+
+  // The five-band tone stack and its preset. Lives here rather than in
+  // audio_eq.cpp because NVS in this firmware has one owner, and because the
+  // settings backup has to be able to carry it.
+  EqConfig eq;
+
+  // Spoken announcements: the master switch, the level and which categories may
+  // interrupt. See voice.h for why the categories are separate.
+  VoiceConfig voice;
+
+  /*
+   * Which announcement to play for which phone.
+   *
+   * Stored as text -- "aabbccddeeff:dev_phone,001122334455:bt_connected" -- and
+   * not as a packed struct, deliberately. The clip is named rather than indexed
+   * because clip *indices* move whenever somebody edits the phrase file and
+   * regenerates voice_clips.h, and a mapping that silently starts announcing
+   * "battery critically low" when a phone connects is worse than one that
+   * quietly stops working. Names survive; positions do not.
+   */
+  String voiceDevices;
+
+  HaConfig ha;
 };
 
 struct UpdateState {
@@ -331,6 +360,27 @@ void loadSettings(const char *fallbackName) {
 
 /// Hands the stored pack description to the gauge. Called from
 /// management_begin() before the gauge starts, and again on every settings save.
+/*
+ * Reads a struct back out of NVS, or leaves the caller's defaults in place.
+ *
+ * Every one of these blobs is a versionless C struct, which is fine as long as
+ * a blob written by a different firmware version can never be adopted at the
+ * wrong size -- a shorter one would leave the tail uninitialised and a longer
+ * one would overrun. Comparing the length is the whole check, and it is enough:
+ * a struct that changed shape changed size in every case that has come up, and
+ * the fallback is the factory default rather than a crash.
+ */
+template <typename T>
+void loadBlob(const char *key, T *out) {
+  if (prefs.getBytesLength(key) == sizeof(T)) prefs.getBytes(key, out, sizeof(T));
+}
+
+void applyAudioSettings() {
+  audio_eq_configure(settings.eq);
+  voice_configure(settings.voice);
+  ha_configure(settings.ha);
+}
+
 void applyBatterySettings() {
   battery_configure(settings.batteryEnabled, settings.batteryDivider,
                     settings.batteryCalibration, settings.batteryFull,
@@ -383,6 +433,13 @@ void saveSettings() {
  * produces a request per frame, and each one of those must not be a flash
  * write. See handleLeds() and the flush in management_loop().
  */
+void saveAudioSettings() {
+  prefs.putBytes("eq", &settings.eq, sizeof(settings.eq));
+  prefs.putBytes("voice", &settings.voice, sizeof(settings.voice));
+  prefs.putString("voiceDev", settings.voiceDevices);
+  prefs.putBytes("haCfg", &settings.ha, sizeof(settings.ha));
+}
+
 void saveLedSettings() {
   prefs.putBool("ledOn", settings.leds.enabled);
   prefs.putUChar("ledFx", settings.leds.effect);
@@ -1122,6 +1179,11 @@ void startAccessPoint() {
                 apName.c_str(), settings.apPassword.c_str(),
                 WiFi.softAPIP().toString().c_str(), WiFi.channel(),
                 (unsigned)ESP.getFreeHeap());
+  // Said out loud because this is precisely the state in which the dashboard
+  // cannot be used to explain itself: no network, no address, and an owner who
+  // has to be told the hotspot exists before they can be told anything else.
+  voice_say(VOICE_WIFI_SETUP, VOICE_CAT_CONNECTION);
+
 }
 
 // The recovery access point has done its job once the station is back. Leaving
@@ -1383,6 +1445,90 @@ void handleStatus() {
   led["resting"] = leds_resting();
   led["idleSeconds"] = leds_idle_ms() / 1000;
 
+  /*
+   * The radio, the tone stack and the alarm all appear in the status rather
+   * than only on their own pages, because all three are things the Overview
+   * page has to be able to show at a glance: what is playing, whether the
+   * sound is being shaped, and when the next alarm is. Their editable settings
+   * stay on /api/settings.
+   */
+  JsonObject radio = doc["radio"].to<JsonObject>();
+  radio["available"] = net_radio_running();
+  radio["modeHasWifi"] = radio_mode_has_wifi(radioMode);
+  if (net_radio_running()) {
+    RadioStatus r;
+    net_radio_snapshot(&r);
+    radio["state"] = net_radio_state_name(r.state);
+    radio["station"] = r.station;
+    radio["name"] = r.name;
+    radio["title"] = r.title;
+    radio["genre"] = r.genre;
+    radio["url"] = r.url;
+    radio["bitrate"] = r.bitrate;
+    radio["sampleRate"] = r.sampleRate;
+    radio["channels"] = r.channels;
+    radio["codec"] = r.codec;
+    radio["buffer"] = r.bufferPercent;
+    radio["underruns"] = r.underruns;
+    radio["reconnects"] = r.reconnects;
+    radio["bytes"] = r.bytes;
+    radio["volume"] = net_radio_volume();
+    radio["stations"] = net_radio_station_count();
+    if (r.error[0]) radio["error"] = r.error;
+    if (r.state == RADIO_PLAYING && r.playingSince) {
+      radio["playingForSeconds"] = (millis() - r.playingSince) / 1000;
+    }
+  }
+
+  EqConfig eq;
+  audio_eq_get(&eq);
+  JsonObject sound = doc["sound"].to<JsonObject>();
+  sound["eqEnabled"] = eq.enabled;
+  sound["eqPreset"] = eq.preset;
+  sound["eqPresetName"] = audio_eq_preset_name(eq.preset);
+  sound["eqActive"] = audio_eq_active();
+  // In DFPlayer mode the module does the tone shaping, so the dashboard shows
+  // the hardware preset the chosen curve maps to rather than five sliders that
+  // are not in the sample path.
+  sound["eqInHardware"] = radio_mode_has_dfplayer(radioMode) && df_player_running();
+  sound["headroomDb"] = serialized(String(audio_eq_headroom_db(), 1));
+  VoiceConfig voice;
+  voice_get(&voice);
+  sound["voice"] = voice.enabled;
+  sound["voiceBusy"] = voice_busy();
+
+  AlarmStatus alarm;
+  alarm_status(&alarm);
+  JsonObject al = doc["alarm"].to<JsonObject>();
+  al["state"] = alarm.state == ALARM_RINGING    ? "ringing"
+                : alarm.state == ALARM_SNOOZED  ? "snoozed"
+                                                : "idle";
+  al["count"] = alarm_count();
+  al["next"] = alarm.next;
+  al["nextInSeconds"] = alarm.nextInSecs;
+  al["snoozeLeftSeconds"] = alarm.snoozeLeftSecs;
+  al["ringingForSeconds"] = alarm.ringingForSecs;
+  al["sleepRunning"] = alarm.sleepRunning;
+  al["sleepLeftSeconds"] = alarm.sleepLeftSecs;
+  al["sleepTotalSeconds"] = alarm.sleepTotalSecs;
+
+  HaStatus ha;
+  ha_status(&ha);
+  JsonObject mqtt = doc["mqtt"].to<JsonObject>();
+  mqtt["state"] = ha.state == HA_OFF           ? "off"
+                  : ha.state == HA_UNAVAILABLE ? "unavailable"
+                  : ha.state == HA_CONNECTING  ? "connecting"
+                  : ha.state == HA_CONNECTED   ? "connected"
+                                               : "failed";
+  mqtt["published"] = ha.published;
+  mqtt["received"] = ha.received;
+  mqtt["discoveryDone"] = ha.discoveryDone;
+  if (ha.error[0]) mqtt["error"] = ha.error;
+
+  doc["uptimeSeconds"] = telemetry_uptime_seconds();
+  doc["runtimeSeconds"] = telemetry_runtime_seconds();
+  doc["bootCount"] = telemetry_boot_count();
+
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
 }
@@ -1405,70 +1551,93 @@ void handleAuth() {
  * refused with a reason rather than wired to something approximate -- and the
  * difference is reported rather than faked.
  */
-void handleDfMedia(const String &action, JsonDocument &body) {
-  bool ok = true;
-  if (action == "play") ok = df_player_play();
-  else if (action == "pause") ok = df_player_pause();
-  else if (action == "toggle") ok = df_player_toggle();
-  else if (action == "stop") ok = df_player_stop();
-  else if (action == "next") ok = df_player_next();
-  else if (action == "previous") ok = df_player_previous();
-  else if (action == "volume") {
-    const int volume = constrain(body["value"] | 0, 0, 127);
-    if (volume > 0) mutedFrom = (uint8_t)volume;
-    ok = df_player_set_volume((uint8_t)volume);
-  } else if (action == "mute") {
-    ok = df_player_set_volume(df_player_volume() ? 0
-                                                : (mutedFrom ? mutedFrom : 80));
-  } else if (action == "forward" || action == "rewind") {
-    sendError(409, "The DFPlayer cannot seek within a track: it reports no "
-                   "position and takes no seek command. Use next and previous.");
-    return;
-  } else if (action == "url") {
-    sendError(409, "The DFPlayer plays from its own card or USB drive, not from "
-                   "a network address. Pick a track on the Media page.");
-    return;
-  } else {
-    sendError(400, "Unknown media action");
-    return;
+/*
+ * Which source a media action should be sent to.
+ *
+ * The radio wins when it is playing even in DFPlayer mode, because in that mode
+ * both can make a sound and the one making it now is the one the buttons should
+ * be driving. Otherwise it is whatever the radio mode's own source is.
+ */
+enum MediaTarget : uint8_t { MEDIA_NONE, MEDIA_RADIO, MEDIA_DF, MEDIA_BT };
+
+MediaTarget mediaTarget() {
+  if (net_radio_running()) {
+    RadioStatus r;
+    net_radio_snapshot(&r);
+    // Connecting and reconnecting count as well as playing, so that a stop
+    // press during a slow connect actually stops it rather than being sent to
+    // a DFPlayer that is not the thing about to make a noise.
+    if (r.state != RADIO_IDLE && r.state != RADIO_ERROR) return MEDIA_RADIO;
   }
-  if (!ok) {
-    sendError(503, "The DFPlayer command queue is full; the module is not "
-                   "keeping up. Try again in a moment.");
-    return;
-  }
-  JsonDocument reply;
-  reply["ok"] = true;
-  sendJson(reply);
+  if (df_player_running()) return MEDIA_DF;
+  if (btActive) return MEDIA_BT;
+  // Wi-Fi mode with the radio stopped: it is the only source there is, so the
+  // controls belong to it even though it is silent.
+  if (net_radio_running()) return MEDIA_RADIO;
+  return MEDIA_NONE;
 }
 
-void handleMedia() {
-  if (!requireAuth()) return;
-  if (df_player_running()) {
-    JsonDocument body;
-    if (!readBody(body)) return;
-    handleDfMedia(body["action"] | "", body);
-    return;
+bool mediaRadio(const String &action, int value) {
+  if (action == "play") {
+    // Not a toggle: "play" from an automation that has just turned the amplifier
+    // on has to mean start, whatever the speaker was doing a moment ago.
+    return net_radio_active() ? true : net_radio_toggle();
   }
-  if (radio_mode_has_dfplayer(radioMode)) {
-    sendError(409, "The DFPlayer driver did not start in this boot; check the "
-                   "serial log.");
-    return;
+  if (action == "pause" || action == "stop") {
+    net_radio_stop();
+    return true;
   }
-  if (!btActive) {
-    sendError(409, "Bluetooth is off in this mode. Switch to Bluetooth mode to "
-                   "control playback from here.");
-    return;
+  if (action == "toggle") return net_radio_toggle();
+  if (action == "next") return net_radio_step_station(true);
+  if (action == "previous") return net_radio_step_station(false);
+  if (action == "volume") {
+    if (value > 0) mutedFrom = (uint8_t)value;
+    net_radio_set_volume((uint8_t)value);
+    return true;
   }
-  JsonDocument body;
-  if (!readBody(body)) return;
-  const String action = body["action"] | "";
+  if (action == "mute") {
+    net_radio_set_volume(net_radio_volume() ? 0 : (mutedFrom ? mutedFrom : 80));
+    return true;
+  }
+  return false;  // seeking in a live stream is not a thing
+}
+
+bool mediaDfPlayer(const String &action, int value) {
+  if (action == "play") return df_player_play();
+  if (action == "pause") return df_player_pause();
+  if (action == "toggle") return df_player_toggle();
+  if (action == "stop") return df_player_stop();
+  if (action == "next") return df_player_next();
+  if (action == "previous") return df_player_previous();
+  if (action == "volume") {
+    if (value > 0) mutedFrom = (uint8_t)value;
+    return df_player_set_volume((uint8_t)value);
+  }
+  if (action == "mute") {
+    return df_player_set_volume(df_player_volume() ? 0 : (mutedFrom ? mutedFrom : 80));
+  }
+  return false;
+}
+
+bool mediaBluetooth(const String &action, int value) {
+  if (!sink) return false;
   PlayerInfo p;
   ps_snapshot(&p);
-  if (action != "volume" && action != "mute" && !p.avrc) {
-    sendError(409, "The connected device has no AVRCP control channel");
-    return;
+  if (action == "volume") {
+    if (value > 0) mutedFrom = (uint8_t)value;
+    sink->set_volume((uint8_t)value);
+    return true;
   }
+  if (action == "mute") {
+    if (p.volume) {
+      mutedFrom = p.volume;
+      sink->set_volume(0);
+    } else {
+      sink->set_volume(mutedFrom ? mutedFrom : 80);
+    }
+    return true;
+  }
+  if (!p.avrc) return false;
   if (action == "play") sink->play();
   else if (action == "pause") sink->pause();
   else if (action == "toggle") p.playback == PS_PLAYING ? sink->pause() : sink->play();
@@ -1477,22 +1646,72 @@ void handleMedia() {
   else if (action == "previous") sink->previous();
   else if (action == "forward") sink->fast_forward();
   else if (action == "rewind") sink->rewind();
-  else if (action == "volume") {
-    const int volume = constrain(body["value"] | 0, 0, 127);
-    if (volume > 0) mutedFrom = volume;
-    sink->set_volume((uint8_t)volume);
-  } else if (action == "mute") {
-    if (p.volume) {
-      mutedFrom = p.volume;
-      sink->set_volume(0);
-    } else sink->set_volume(mutedFrom ? mutedFrom : 80);
-  } else {
+  else return false;
+  return true;
+}
+
+void handleMedia() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+  const String action = body["action"] | "";
+  const int value = constrain(body["value"] | 0, 0, 127);
+
+  static const char *const ACTIONS[] = {"play",     "pause", "toggle", "stop",
+                                        "next",     "previous", "forward",
+                                        "rewind",   "volume", "mute"};
+  bool known = false;
+  for (const char *candidate : ACTIONS) {
+    if (action == candidate) known = true;
+  }
+  if (!known) {
     sendError(400, "Unknown media action");
     return;
   }
-  JsonDocument reply;
-  reply["ok"] = true;
-  sendJson(reply);
+
+  const MediaTarget target = mediaTarget();
+  if (target == MEDIA_NONE) {
+    sendError(409, radio_mode_has_dfplayer(radioMode)
+                       ? "The DFPlayer driver did not start in this boot; check "
+                         "the serial log."
+                       : "Nothing is playing and no audio source is running in "
+                         "this mode.");
+    return;
+  }
+
+  if (management_media_action(action.c_str(), value)) {
+    ha_publish_state();
+    JsonDocument reply;
+    reply["ok"] = true;
+    reply["target"] = target == MEDIA_RADIO ? "radio"
+                      : target == MEDIA_DF  ? "dfplayer"
+                                            : "bluetooth";
+    sendJson(reply);
+    return;
+  }
+
+  // A refusal here is nearly always a capability the source does not have, and
+  // saying which source refused is the difference between a useful message and
+  // "it did not work".
+  switch (target) {
+    case MEDIA_RADIO:
+      sendError(409, "A live radio stream has no track list and cannot seek. "
+                     "Use the station controls instead.");
+      break;
+    case MEDIA_DF:
+      if (action == "forward" || action == "rewind") {
+        sendError(409, "The DFPlayer cannot seek within a track: it reports no "
+                       "position and takes no seek command. Use next and "
+                       "previous.");
+      } else {
+        sendError(503, "The DFPlayer command queue is full; the module is not "
+                       "keeping up. Try again in a moment.");
+      }
+      break;
+    default:
+      sendError(409, "The connected device has no AVRCP control channel");
+      break;
+  }
 }
 
 void handleDevices() {
@@ -1883,6 +2102,14 @@ void handleLeds() {
                                           (int)LED_IDLE_AFTER_S_MAX);
   }
 
+  audio_eq_defaults(&settings.eq);
+  loadBlob("eq", &settings.eq);
+  voice_defaults(&settings.voice);
+  loadBlob("voice", &settings.voice);
+  settings.voiceDevices = prefs.getString("voiceDev", "");
+  ha_defaults(&settings.ha, settings.hostname.c_str());
+  loadBlob("haCfg", &settings.ha);
+
   settings.leds = next;
   leds_configure(next);
   ledsDirty = true;
@@ -1961,6 +2188,13 @@ void handleSettingsGet() {
   doc["clockNetworkSynced"] = soft_clock_network_synced();
   doc["clock24h"] = soft_clock_use_24h();
   doc["clockAutoSync"] = soft_clock_auto_sync();
+  // The zone rule, and what it currently works out to. Both are reported: the
+  // rule is what was chosen, the abbreviation and the flag are what it means
+  // today, and the daylight-saving question is only answerable by showing them
+  // together.
+  doc["clockZone"] = soft_clock_zone();
+  doc["clockZoneAbbrev"] = soft_clock_zone_abbrev();
+  doc["clockDst"] = soft_clock_dst_active();
 
   JsonObject oled = doc["display"].to<JsonObject>();
   oled["present"] = ui_present();
@@ -2415,6 +2649,67 @@ void handleSettingsBackup() {
   s["githubRepo"] = settings.githubRepo;
   s["githubAsset"] = settings.githubAsset;
 
+  /*
+   * The sound settings travel with the backup.
+   *
+   * They are as much a part of "this speaker, set up the way I like it" as the
+   * network is -- a restore that brings back the Wi-Fi and loses the equaliser
+   * curve and the alarms is a restore somebody has to finish by hand. The
+   * broker password is the one thing left out: it is a credential, and it goes
+   * in the encrypted envelope with the other three.
+   */
+  JsonObject eqJson = s["eq"].to<JsonObject>();
+  eqJson["enabled"] = settings.eq.enabled;
+  eqJson["preset"] = settings.eq.preset;
+  eqJson["preamp"] = settings.eq.preamp;
+  eqJson["autoPreamp"] = settings.eq.autoPreamp;
+  JsonArray eqGains = eqJson["gain"].to<JsonArray>();
+  for (uint8_t i = 0; i < EQ_BANDS; i++) eqGains.add(settings.eq.gain[i]);
+
+  JsonObject voiceJson = s["voice"].to<JsonObject>();
+  voiceJson["enabled"] = settings.voice.enabled;
+  voiceJson["volume"] = settings.voice.volume;
+  voiceJson["duck"] = settings.voice.duck;
+  voiceJson["categories"] = settings.voice.categories;
+  s["voiceDevices"] = settings.voiceDevices;
+
+  JsonObject mqttJson = s["mqtt"].to<JsonObject>();
+  mqttJson["enabled"] = settings.ha.enabled;
+  mqttJson["host"] = settings.ha.host;
+  mqttJson["port"] = settings.ha.port;
+  mqttJson["user"] = settings.ha.user;
+  mqttJson["baseTopic"] = settings.ha.baseTopic;
+  mqttJson["discoveryPrefix"] = settings.ha.discoveryPrefix;
+  mqttJson["discovery"] = settings.ha.discovery;
+  mqttJson["publishSeconds"] = settings.ha.publishSeconds;
+
+  JsonArray radioJson = s["radio"].to<JsonArray>();
+  for (uint8_t i = 0; i < net_radio_station_count(); i++) {
+    RadioStation station;
+    if (!net_radio_station(i, &station)) continue;
+    JsonObject entry = radioJson.add<JsonObject>();
+    entry["name"] = station.name;
+    entry["url"] = station.url;
+  }
+
+  JsonArray alarmJson = s["alarms"].to<JsonArray>();
+  for (uint8_t i = 0; i < alarm_count(); i++) {
+    Alarm alarm;
+    if (!alarm_get(i, &alarm)) continue;
+    JsonObject entry = alarmJson.add<JsonObject>();
+    entry["enabled"] = alarm.enabled;
+    entry["hour"] = alarm.hour;
+    entry["minute"] = alarm.minute;
+    entry["days"] = alarm.days;
+    entry["source"] = alarm.source;
+    entry["target"] = alarm.target;
+    entry["volume"] = alarm.volume;
+    entry["fadeSeconds"] = alarm.fadeSecs;
+    entry["durationSeconds"] = alarm.durationSecs;
+    entry["snoozeMinutes"] = alarm.snoozeMins;
+    entry["label"] = alarm.label;
+  }
+
   JsonObject df = s["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
   df["volume"] = settings.dfVolume;
@@ -2461,6 +2756,9 @@ void handleSettingsBackup() {
   clk["use24h"] = soft_clock_use_24h();
   clk["autoSync"] = soft_clock_auto_sync();
   clk["offsetMinutes"] = soft_clock_utc_offset_min();
+  // The POSIX zone rule, when one is installed. Empty means the speaker is on a
+  // plain offset, which restores as exactly that.
+  clk["zone"] = soft_clock_zone();
 
   // The four secrets, as their own document, so what gets encrypted is a
   // self-describing object rather than four values in a fixed order that a
@@ -2857,8 +3155,124 @@ void handleSettingsRestore() {
     if (!clk["autoSync"].isNull()) {
       soft_clock_set_auto_sync(clk["autoSync"].as<bool>());
     }
+    // The zone first: while a rule is installed it outranks a bare offset, and
+    // soft_clock_set_utc_offset_min() refuses to override one. Restoring in the
+    // other order would silently drop the offset from a backup that has both.
+    if (clk["zone"].is<const char *>()) {
+      soft_clock_set_zone(clk["zone"].as<const char *>());
+    }
     if (clk["offsetMinutes"].is<int32_t>()) {
       soft_clock_set_utc_offset_min(clk["offsetMinutes"].as<int32_t>());
+    }
+  }
+  JsonObjectConst eqIn = s["eq"].as<JsonObjectConst>();
+  if (!eqIn.isNull()) {
+    if (!eqIn["enabled"].isNull()) settings.eq.enabled = eqIn["enabled"].as<bool>();
+    if (!eqIn["preset"].isNull()) {
+      settings.eq.preset =
+          (uint8_t)constrain(eqIn["preset"].as<int>(), 0, EQ_PRESET_COUNT - 1);
+    }
+    if (!eqIn["preamp"].isNull()) {
+      settings.eq.preamp = (int8_t)constrain(eqIn["preamp"].as<int>(),
+                                             EQ_PREAMP_MIN, EQ_PREAMP_MAX);
+    }
+    if (!eqIn["autoPreamp"].isNull()) {
+      settings.eq.autoPreamp = eqIn["autoPreamp"].as<bool>();
+    }
+    if (eqIn["gain"].is<JsonArrayConst>()) {
+      uint8_t i = 0;
+      for (JsonVariantConst value : eqIn["gain"].as<JsonArrayConst>()) {
+        if (i >= EQ_BANDS) break;
+        settings.eq.gain[i++] =
+            (int8_t)constrain(value.as<int>(), EQ_GAIN_MIN, EQ_GAIN_MAX);
+      }
+    }
+  }
+
+  JsonObjectConst voiceIn = s["voice"].as<JsonObjectConst>();
+  if (!voiceIn.isNull()) {
+    if (!voiceIn["enabled"].isNull()) settings.voice.enabled = voiceIn["enabled"].as<bool>();
+    if (!voiceIn["volume"].isNull()) {
+      settings.voice.volume = (uint8_t)constrain(voiceIn["volume"].as<int>(), 0, 100);
+    }
+    if (!voiceIn["duck"].isNull()) {
+      settings.voice.duck = (uint8_t)constrain(voiceIn["duck"].as<int>(), 0, 100);
+    }
+    if (!voiceIn["categories"].isNull()) {
+      settings.voice.categories =
+          (uint8_t)(voiceIn["categories"].as<int>() & VOICE_CAT_ALL);
+    }
+  }
+  if (s["voiceDevices"].is<const char *>()) {
+    settings.voiceDevices = s["voiceDevices"].as<String>();
+  }
+
+  JsonObjectConst mqttIn = s["mqtt"].as<JsonObjectConst>();
+  if (!mqttIn.isNull()) {
+    if (!mqttIn["enabled"].isNull()) settings.ha.enabled = mqttIn["enabled"].as<bool>();
+    if (mqttIn["host"].is<const char *>()) {
+      snprintf(settings.ha.host, sizeof(settings.ha.host), "%s",
+               mqttIn["host"].as<const char *>());
+    }
+    if (!mqttIn["port"].isNull()) {
+      settings.ha.port = (uint16_t)constrain(mqttIn["port"].as<int>(), 1, 65535);
+    }
+    if (mqttIn["user"].is<const char *>()) {
+      snprintf(settings.ha.user, sizeof(settings.ha.user), "%s",
+               mqttIn["user"].as<const char *>());
+    }
+    if (mqttIn["baseTopic"].is<const char *>()) {
+      snprintf(settings.ha.baseTopic, sizeof(settings.ha.baseTopic), "%s",
+               mqttIn["baseTopic"].as<const char *>());
+    }
+    if (mqttIn["discoveryPrefix"].is<const char *>()) {
+      snprintf(settings.ha.discoveryPrefix, sizeof(settings.ha.discoveryPrefix),
+               "%s", mqttIn["discoveryPrefix"].as<const char *>());
+    }
+    if (!mqttIn["discovery"].isNull()) settings.ha.discovery = mqttIn["discovery"].as<bool>();
+    if (!mqttIn["publishSeconds"].isNull()) {
+      settings.ha.publishSeconds =
+          (uint16_t)constrain(mqttIn["publishSeconds"].as<int>(), 5, 600);
+    }
+  }
+  saveAudioSettings();
+
+  /*
+   * The station list and the alarms are replaced wholesale rather than merged.
+   *
+   * Both are lists the owner curated, and a merge would have to answer "is this
+   * the same station" from a name and a URL that may both have been edited.
+   * Replacing is what a restore means everywhere else in this file, and it is
+   * the only behaviour that produces the speaker the backup describes.
+   */
+  JsonArrayConst radioIn = s["radio"].as<JsonArrayConst>();
+  if (!radioIn.isNull() && net_radio_running()) {
+    while (net_radio_station_count()) net_radio_remove_station(0);
+    for (JsonObjectConst entry : radioIn) {
+      net_radio_set_station(RADIO_MAX_STATIONS, entry["name"] | "",
+                            entry["url"] | "");
+    }
+    net_radio_store_stations();
+  }
+
+  JsonArrayConst alarmsIn = s["alarms"].as<JsonArrayConst>();
+  if (!alarmsIn.isNull()) {
+    while (alarm_count()) alarm_remove(0);
+    for (JsonObjectConst entry : alarmsIn) {
+      Alarm alarm;
+      memset(&alarm, 0, sizeof(alarm));
+      alarm.enabled = entry["enabled"] | true;
+      alarm.hour = (uint8_t)constrain(entry["hour"] | 7, 0, 23);
+      alarm.minute = (uint8_t)constrain(entry["minute"] | 0, 0, 59);
+      alarm.days = (uint8_t)((entry["days"] | ALARM_WEEKDAYS) & ALARM_EVERY_DAY);
+      alarm.source = (uint8_t)constrain(entry["source"] | 0, 0, ALARM_SRC_COUNT - 1);
+      alarm.target = (uint8_t)constrain(entry["target"] | 0, 0, 99);
+      alarm.volume = (uint8_t)constrain(entry["volume"] | 90, 0, 127);
+      alarm.fadeSecs = (uint16_t)constrain(entry["fadeSeconds"] | 60, 0, 600);
+      alarm.durationSecs = (uint16_t)constrain(entry["durationSeconds"] | 1800, 30, 3600);
+      alarm.snoozeMins = (uint8_t)constrain(entry["snoozeMinutes"] | 9, 1, 60);
+      snprintf(alarm.label, sizeof(alarm.label), "%s", entry["label"] | "");
+      alarm_set(ALARM_MAX, alarm);
     }
   }
 
@@ -2883,6 +3297,603 @@ void handleSettingsRestore() {
   scheduleReboot(900);
 }
 
+/*
+ * The sound page: the five-band equaliser and the spoken announcements.
+ *
+ * One endpoint for both because they are one card on the dashboard and because
+ * both write to the same NVS namespace -- splitting them would mean two flash
+ * writes for one Save press.
+ */
+void handleAudioGet() {
+  if (!requireAuth()) return;
+  JsonDocument doc;
+  doc["ok"] = true;
+
+  EqConfig eq;
+  audio_eq_get(&eq);
+  JsonObject e = doc["eq"].to<JsonObject>();
+  e["enabled"] = eq.enabled;
+  e["preset"] = eq.preset;
+  e["preamp"] = eq.preamp;
+  e["autoPreamp"] = eq.autoPreamp;
+  e["active"] = audio_eq_active();
+  e["headroomDb"] = serialized(String(audio_eq_headroom_db(), 1));
+  e["gainMin"] = EQ_GAIN_MIN;
+  e["gainMax"] = EQ_GAIN_MAX;
+  e["preampMin"] = EQ_PREAMP_MIN;
+  e["preampMax"] = EQ_PREAMP_MAX;
+  JsonArray gains = e["gain"].to<JsonArray>();
+  JsonArray bands = e["bands"].to<JsonArray>();
+  for (uint8_t i = 0; i < EQ_BANDS; i++) {
+    gains.add(eq.gain[i]);
+    bands.add(EQ_BAND_HZ[i]);
+  }
+  // The preset list comes from the firmware so that adding a curve in
+  // audio_eq.cpp does not need a matching edit in the dashboard.
+  JsonArray presets = e["presets"].to<JsonArray>();
+  for (uint8_t i = 0; i < EQ_PRESET_COUNT; i++) {
+    JsonObject entry = presets.add<JsonObject>();
+    entry["name"] = audio_eq_preset_name(i);
+    entry["hwEq"] = audio_eq_hw_preset(i);
+    JsonArray curve = entry["gain"].to<JsonArray>();
+    int8_t values[EQ_BANDS] = {0};
+    audio_eq_preset_gains(i, values);
+    for (uint8_t b = 0; b < EQ_BANDS; b++) curve.add(values[b]);
+  }
+  // Which of the two equalisers is actually in the sample path this boot.
+  e["inHardware"] = radio_mode_has_dfplayer(radioMode) && df_player_running();
+
+  VoiceConfig voice;
+  voice_get(&voice);
+  JsonObject v = doc["voice"].to<JsonObject>();
+  v["enabled"] = voice.enabled;
+  v["volume"] = voice.volume;
+  v["duck"] = voice.duck;
+  v["categories"] = voice.categories;
+  v["busy"] = voice_busy();
+  v["devices"] = settings.voiceDevices;
+  JsonArray clips = v["clips"].to<JsonArray>();
+  for (uint8_t i = 0; i < voice_clip_count(); i++) {
+    JsonObject entry = clips.add<JsonObject>();
+    entry["id"] = voice_clip_id(i);
+    entry["text"] = voice_clip_text(i);
+  }
+  sendJson(doc);
+}
+
+void handleAudioSave() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+
+  const String action = body["action"] | "";
+  if (action == "say") {
+    const uint8_t clip = voice_clip_by_id(body["clip"] | "");
+    if (clip >= voice_clip_count()) {
+      sendError(400, "No announcement by that name is in this firmware");
+      return;
+    }
+    // A preview is asked for by name and should be heard whatever the category
+    // switches say, the same as the console's "say" command.
+    VoiceConfig saved;
+    voice_get(&saved);
+    VoiceConfig loud = saved;
+    loud.enabled = true;
+    loud.categories = VOICE_CAT_ALL;
+    voice_configure(loud);
+    voice_say_index(clip, VOICE_CAT_SYSTEM);
+    voice_configure(saved);
+    JsonDocument reply;
+    reply["ok"] = true;
+    sendJson(reply);
+    return;
+  }
+
+  if (body["eq"].is<JsonObjectConst>()) {
+    JsonObjectConst e = body["eq"];
+    EqConfig eq;
+    audio_eq_get(&eq);
+    if (!e["enabled"].isNull()) eq.enabled = e["enabled"].as<bool>();
+    if (!e["autoPreamp"].isNull()) eq.autoPreamp = e["autoPreamp"].as<bool>();
+    if (!e["preamp"].isNull()) eq.preamp = (int8_t)constrain(e["preamp"].as<int>(),
+                                                            EQ_PREAMP_MIN, EQ_PREAMP_MAX);
+    // A preset and a set of gains can arrive together -- that is what "pick
+    // Music, then nudge the bass" looks like -- so the preset is applied first
+    // and any explicit gains overwrite it.
+    if (!e["preset"].isNull()) {
+      const uint8_t preset = (uint8_t)constrain(e["preset"].as<int>(), 0,
+                                                EQ_PRESET_COUNT - 1);
+      eq.preset = preset;
+      audio_eq_preset_gains(preset, eq.gain);
+    }
+    if (e["gain"].is<JsonArrayConst>()) {
+      JsonArrayConst gains = e["gain"];
+      uint8_t i = 0;
+      bool differs = false;
+      for (JsonVariantConst value : gains) {
+        if (i >= EQ_BANDS) break;
+        const int8_t want = (int8_t)constrain(value.as<int>(), EQ_GAIN_MIN, EQ_GAIN_MAX);
+        if (want != eq.gain[i]) differs = true;
+        eq.gain[i++] = want;
+      }
+      // Moving a slider away from the preset's curve is what makes it custom.
+      // Sending the preset's own gains back unchanged does not.
+      if (differs && e["preset"].isNull()) eq.preset = EQ_PRESET_CUSTOM;
+    }
+    audio_eq_configure(eq);
+    audio_eq_get(&settings.eq);
+
+    // In DFPlayer mode the module has the tone control, so the chosen curve is
+    // also pushed to its hardware equaliser. Both are kept in step rather than
+    // one shadowing the other.
+    if (df_player_running()) {
+      const uint8_t hw = audio_eq_hw_preset(settings.eq.preset);
+      df_player_set_eq(hw);
+      settings.dfEq = hw;
+    }
+  }
+
+  if (body["voice"].is<JsonObjectConst>()) {
+    JsonObjectConst v = body["voice"];
+    VoiceConfig voice;
+    voice_get(&voice);
+    if (!v["enabled"].isNull()) voice.enabled = v["enabled"].as<bool>();
+    if (!v["volume"].isNull()) voice.volume = (uint8_t)constrain(v["volume"].as<int>(), 0, 100);
+    if (!v["duck"].isNull()) voice.duck = (uint8_t)constrain(v["duck"].as<int>(), 0, 100);
+    if (!v["categories"].isNull()) {
+      voice.categories = (uint8_t)(v["categories"].as<int>() & VOICE_CAT_ALL);
+    }
+    voice_configure(voice);
+    voice_get(&settings.voice);
+    if (v["devices"].is<const char *>()) {
+      String map = v["devices"].as<String>();
+      if (map.length() > 240) map.remove(240);
+      settings.voiceDevices = map;
+    }
+  }
+
+  saveAudioSettings();
+  ha_publish_state();
+  handleAudioGet();
+}
+
+/*
+ * Internet radio: the favourites and the transport.
+ *
+ * The station list is edited one entry at a time and written to flash once, at
+ * the end of whatever the request asked for -- so reordering the list from the
+ * dashboard is one erase cycle rather than one per move.
+ */
+void handleRadioGet() {
+  if (!requireAuth()) return;
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["available"] = net_radio_running();
+  doc["modeHasWifi"] = radio_mode_has_wifi(radioMode);
+  doc["maxStations"] = RADIO_MAX_STATIONS;
+  doc["autostart"] = net_radio_autostart();
+  doc["volume"] = net_radio_volume();
+
+  if (net_radio_running()) {
+    RadioStatus r;
+    net_radio_snapshot(&r);
+    JsonObject now = doc["now"].to<JsonObject>();
+    now["state"] = net_radio_state_name(r.state);
+    now["station"] = r.station;
+    now["name"] = r.name;
+    now["title"] = r.title;
+    now["genre"] = r.genre;
+    now["url"] = r.url;
+    now["bitrate"] = r.bitrate;
+    now["sampleRate"] = r.sampleRate;
+    now["channels"] = r.channels;
+    now["codec"] = r.codec;
+    now["buffer"] = r.bufferPercent;
+    now["underruns"] = r.underruns;
+    now["reconnects"] = r.reconnects;
+    now["bytes"] = r.bytes;
+    if (r.error[0]) now["error"] = r.error;
+  }
+
+  JsonArray list = doc["stations"].to<JsonArray>();
+  for (uint8_t i = 0; i < net_radio_station_count(); i++) {
+    RadioStation station;
+    if (!net_radio_station(i, &station)) continue;
+    JsonObject entry = list.add<JsonObject>();
+    entry["name"] = station.name;
+    entry["url"] = station.url;
+  }
+  sendJson(doc);
+}
+
+void handleRadioPost() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+  const String action = body["action"] | "";
+
+  if (!net_radio_running()) {
+    sendError(409, radio_mode_has_wifi(radioMode)
+                       ? "Internet radio did not start this boot; there was not "
+                         "enough memory for its buffer. Check the serial log."
+                       : "Internet radio needs Wi-Fi, and Bluetooth mode has "
+                         "none -- one antenna, one radio. Switch to Wi-Fi mode "
+                         "or Wi-Fi + DFPlayer under Radio mode on the Overview "
+                         "page.");
+    return;
+  }
+
+  bool ok = true;
+  bool listChanged = false;
+
+  if (action == "play") {
+    ok = net_radio_play_station((uint8_t)(body["index"] | 0));
+  } else if (action == "url") {
+    const String url = body["url"] | "";
+    ok = net_radio_play_url(url.c_str(), body["name"] | (const char *)nullptr);
+    if (!ok) {
+      sendError(400, "That does not look like a stream address. It has to start "
+                     "with http:// or https:// and point at the stream itself, "
+                     "not at the station's web page.");
+      return;
+    }
+  } else if (action == "stop") {
+    net_radio_stop();
+  } else if (action == "toggle") {
+    ok = net_radio_toggle();
+  } else if (action == "next" || action == "previous") {
+    ok = net_radio_step_station(action == "next");
+  } else if (action == "volume") {
+    net_radio_set_volume((uint8_t)constrain(body["value"] | 0, 0, 127));
+  } else if (action == "autostart") {
+    net_radio_set_autostart(body["value"] | false);
+  } else if (action == "save") {
+    const String name = body["name"] | "";
+    const String url = body["url"] | "";
+    const int index = body["index"] | 255;
+    ok = net_radio_set_station((uint8_t)index, name.c_str(), url.c_str());
+    if (!ok) {
+      sendError(400, net_radio_station_count() >= RADIO_MAX_STATIONS
+                         ? "The favourites list is full. Remove one first."
+                         : "That does not look like a stream address. It has to "
+                           "start with http:// or https://");
+      return;
+    }
+    listChanged = true;
+  } else if (action == "delete") {
+    ok = net_radio_remove_station((uint8_t)(body["index"] | 255));
+    listChanged = ok;
+  } else if (action == "move") {
+    ok = net_radio_move_station((uint8_t)(body["index"] | 255), body["up"] | true);
+    listChanged = ok;
+  } else {
+    sendError(400, "Unknown radio action");
+    return;
+  }
+
+  if (!ok) {
+    sendError(400, "No station at that position");
+    return;
+  }
+  if (listChanged) {
+    net_radio_store_stations();
+    // The station list is an entity's option list in Home Assistant, not a
+    // value -- so a changed list means the discovery document has to go again.
+    ha_announce();
+  }
+  ha_publish_state();
+  handleRadioGet();
+}
+
+// ------------------------------------------------------------- alarms ------
+
+void addAlarmJson(JsonObject entry, uint8_t index, const Alarm &alarm) {
+  entry["index"] = index;
+  entry["enabled"] = alarm.enabled;
+  entry["hour"] = alarm.hour;
+  entry["minute"] = alarm.minute;
+  entry["days"] = alarm.days;
+  entry["source"] = alarm.source;
+  entry["target"] = alarm.target;
+  entry["volume"] = alarm.volume;
+  entry["fadeSeconds"] = alarm.fadeSecs;
+  entry["durationSeconds"] = alarm.durationSecs;
+  entry["snoozeMinutes"] = alarm.snoozeMins;
+  entry["skipNext"] = alarm.skipNext;
+  entry["label"] = alarm.label;
+}
+
+void handleAlarmsGet() {
+  if (!requireAuth()) return;
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["max"] = ALARM_MAX;
+  doc["radioAvailable"] = net_radio_running();
+  doc["dfAvailable"] = df_player_running();
+  doc["sleepStandbyDefault"] = alarm_sleep_standby_default();
+  doc["standbyPossible"] = power_sleep_possible();
+
+  AlarmStatus st;
+  alarm_status(&st);
+  JsonObject now = doc["now"].to<JsonObject>();
+  now["state"] = st.state == ALARM_RINGING   ? "ringing"
+                 : st.state == ALARM_SNOOZED ? "snoozed"
+                                             : "idle";
+  now["active"] = st.active;
+  now["next"] = st.next;
+  now["nextInSeconds"] = st.nextInSecs;
+  now["ringingForSeconds"] = st.ringingForSecs;
+  now["snoozeLeftSeconds"] = st.snoozeLeftSecs;
+  now["rampVolume"] = st.rampVolume;
+  now["sleepRunning"] = st.sleepRunning;
+  now["sleepLeftSeconds"] = st.sleepLeftSecs;
+  now["sleepTotalSeconds"] = st.sleepTotalSecs;
+
+  JsonArray list = doc["alarms"].to<JsonArray>();
+  for (uint8_t i = 0; i < alarm_count(); i++) {
+    Alarm alarm;
+    if (!alarm_get(i, &alarm)) continue;
+    addAlarmJson(list.add<JsonObject>(), i, alarm);
+  }
+
+  // The station names, so the alarm editor's source dropdown does not have to
+  // fetch the radio page as well.
+  JsonArray stations = doc["stations"].to<JsonArray>();
+  for (uint8_t i = 0; i < net_radio_station_count(); i++) {
+    RadioStation station;
+    if (net_radio_station(i, &station)) stations.add(station.name);
+  }
+  sendJson(doc);
+}
+
+void handleAlarmsPost() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+  const String action = body["action"] | "";
+
+  if (action == "save") {
+    const int index = body["index"] | 255;
+    Alarm alarm;
+    // An edit starts from the stored alarm so a partial body changes only what
+    // it names; a new one starts from something sensible rather than zeros,
+    // because an alarm with a zero duration and no snooze is not an alarm.
+    if (!alarm_get((uint8_t)index, &alarm)) {
+      memset(&alarm, 0, sizeof(alarm));
+      alarm.enabled = true;
+      alarm.hour = 7;
+      alarm.days = ALARM_WEEKDAYS;
+      alarm.volume = 90;
+      alarm.fadeSecs = 60;
+      alarm.durationSecs = 1800;
+      alarm.snoozeMins = 9;
+    }
+    if (!body["enabled"].isNull()) alarm.enabled = body["enabled"].as<bool>();
+    if (!body["hour"].isNull()) alarm.hour = (uint8_t)constrain(body["hour"].as<int>(), 0, 23);
+    if (!body["minute"].isNull()) alarm.minute = (uint8_t)constrain(body["minute"].as<int>(), 0, 59);
+    if (!body["days"].isNull()) alarm.days = (uint8_t)(body["days"].as<int>() & ALARM_EVERY_DAY);
+    if (!body["source"].isNull()) {
+      alarm.source = (uint8_t)constrain(body["source"].as<int>(), 0, ALARM_SRC_COUNT - 1);
+    }
+    if (!body["target"].isNull()) alarm.target = (uint8_t)constrain(body["target"].as<int>(), 0, 99);
+    if (!body["volume"].isNull()) alarm.volume = (uint8_t)constrain(body["volume"].as<int>(), 0, 127);
+    if (!body["fadeSeconds"].isNull()) {
+      alarm.fadeSecs = (uint16_t)constrain(body["fadeSeconds"].as<int>(), 0, 600);
+    }
+    if (!body["durationSeconds"].isNull()) {
+      alarm.durationSecs = (uint16_t)constrain(body["durationSeconds"].as<int>(), 30, 3600);
+    }
+    if (!body["snoozeMinutes"].isNull()) {
+      alarm.snoozeMins = (uint8_t)constrain(body["snoozeMinutes"].as<int>(), 1, 60);
+    }
+    if (!body["skipNext"].isNull()) alarm.skipNext = body["skipNext"].as<bool>();
+    if (body["label"].is<const char *>()) {
+      snprintf(alarm.label, sizeof(alarm.label), "%s", body["label"].as<const char *>());
+    }
+    if (!alarm_set((uint8_t)index, alarm)) {
+      sendError(409, String("This speaker holds ") + ALARM_MAX +
+                         " alarms. Remove one before adding another.");
+      return;
+    }
+    // An alarm is a switch in Home Assistant, and its name carries the time --
+    // so both the value and the entity have changed.
+    ha_announce();
+  } else if (action == "delete") {
+    if (!alarm_remove((uint8_t)(body["index"] | 255))) {
+      sendError(400, "No alarm at that position");
+      return;
+    }
+    ha_announce();
+  } else if (action == "dismiss") {
+    alarm_dismiss();
+  } else if (action == "snooze") {
+    alarm_snooze();
+  } else if (action == "test") {
+    if (!alarm_trigger((uint8_t)(body["index"] | 255))) {
+      sendError(400, "No alarm at that position");
+      return;
+    }
+  } else if (action == "sleep") {
+    const int minutes = constrain(body["minutes"] | 0, 0, 600);
+    const bool standby = body["standby"] | alarm_sleep_standby_default();
+    alarm_sleep_start((uint16_t)minutes, standby);
+  } else if (action == "sleepExtend") {
+    alarm_sleep_extend((uint16_t)constrain(body["minutes"] | 15, 1, 600));
+  } else if (action == "sleepCancel") {
+    alarm_sleep_cancel();
+  } else if (action == "sleepStandbyDefault") {
+    alarm_set_sleep_standby_default(body["value"] | true);
+  } else {
+    sendError(400, "Unknown alarm action");
+    return;
+  }
+
+  ha_publish_state();
+  handleAlarmsGet();
+}
+
+/*
+ * The history behind the graphs.
+ *
+ * Sent as parallel arrays rather than as an array of objects: 240 samples as
+ * objects is about 14 kB of JSON with the key names repeated 240 times, and as
+ * columns it is under 4 kB. On a chip assembling this in RAM while a radio
+ * stream is running, that difference is the whole design.
+ *
+ * A null in a column means "no reading", which is not the same as zero and is
+ * what a dashboard has to be told in order not to draw a cliff at the point the
+ * battery gauge was switched on.
+ */
+void handleTelemetry() {
+  if (!requireAuth()) return;
+
+  static TelemetrySample samples[TELEMETRY_SAMPLES];
+  const uint16_t count = telemetry_history(samples, TELEMETRY_SAMPLES);
+
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["intervalSeconds"] = TELEMETRY_INTERVAL_S;
+  doc["spanSeconds"] = telemetry_span_seconds();
+  doc["count"] = count;
+  doc["uptimeSeconds"] = telemetry_uptime_seconds();
+  doc["runtimeSeconds"] = telemetry_runtime_seconds();
+  doc["bootCount"] = telemetry_boot_count();
+
+  JsonArray volts = doc["volts"].to<JsonArray>();
+  JsonArray percent = doc["percent"].to<JsonArray>();
+  JsonArray temp = doc["temperature"].to<JsonArray>();
+  JsonArray heap = doc["heap"].to<JsonArray>();
+  JsonArray rssi = doc["rssi"].to<JsonArray>();
+  JsonArray flags = doc["flags"].to<JsonArray>();
+
+  for (uint16_t i = 0; i < count; i++) {
+    const TelemetrySample &sample = samples[i];
+    if (sample.millivolts) {
+      volts.add(serialized(String(sample.millivolts / 1000.0f, 3)));
+      percent.add(sample.percent);
+    } else {
+      volts.add(nullptr);
+      percent.add(nullptr);
+    }
+    if (sample.deciCelsius != INT16_MIN) {
+      temp.add(serialized(String(sample.deciCelsius / 10.0f, 1)));
+    } else {
+      temp.add(nullptr);
+    }
+    heap.add(sample.heapKb);
+    if (sample.rssi) rssi.add(sample.rssi);
+    else rssi.add(nullptr);
+    flags.add(sample.flags);
+  }
+
+  TelemetrySample now;
+  telemetry_now(&now);
+  JsonObject live = doc["now"].to<JsonObject>();
+  if (now.millivolts) {
+    live["volts"] = serialized(String(now.millivolts / 1000.0f, 3));
+    live["percent"] = now.percent;
+  }
+  if (now.deciCelsius != INT16_MIN) {
+    live["temperature"] = serialized(String(now.deciCelsius / 10.0f, 1));
+  }
+  live["heap"] = now.heapKb;
+  live["heapLow"] = ESP.getMinFreeHeap() / 1024;
+  live["largestBlock"] = ESP.getMaxAllocHeap() / 1024;
+  if (now.rssi) live["rssi"] = now.rssi;
+  live["charging"] = (now.flags & TELEMETRY_CHARGING) != 0;
+  sendJson(doc);
+}
+
+// --------------------------------------------------------------- MQTT ------
+
+void handleMqttGet() {
+  if (!requireAuth()) return;
+  HaConfig cfg;
+  ha_get(&cfg);
+  HaStatus st;
+  ha_status(&st);
+
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["modeHasWifi"] = radio_mode_has_wifi(radioMode);
+  doc["enabled"] = cfg.enabled;
+  doc["host"] = cfg.host;
+  doc["port"] = cfg.port;
+  doc["user"] = cfg.user;
+  // The broker password is never sent back, for the same reason the Wi-Fi
+  // passphrase is not: a dashboard that can be opened can be read.
+  doc["passwordSet"] = cfg.password[0] != 0;
+  doc["baseTopic"] = cfg.baseTopic;
+  doc["discoveryPrefix"] = cfg.discoveryPrefix;
+  doc["discovery"] = cfg.discovery;
+  doc["publishSeconds"] = cfg.publishSeconds;
+
+  doc["state"] = st.state == HA_OFF           ? "off"
+                 : st.state == HA_UNAVAILABLE ? "unavailable"
+                 : st.state == HA_CONNECTING  ? "connecting"
+                 : st.state == HA_CONNECTED   ? "connected"
+                                              : "failed";
+  doc["error"] = st.error;
+  doc["connects"] = st.connects;
+  doc["published"] = st.published;
+  doc["received"] = st.received;
+  doc["discoveryDone"] = st.discoveryDone;
+  if (st.connectedAt) doc["connectedForSeconds"] = (millis() - st.connectedAt) / 1000;
+  sendJson(doc);
+}
+
+void handleMqttPost() {
+  if (!requireAuth()) return;
+  JsonDocument body;
+  if (!readBody(body)) return;
+
+  if ((body["action"] | "") == "announce") {
+    ha_announce();
+    JsonDocument reply;
+    reply["ok"] = true;
+    sendJson(reply);
+    return;
+  }
+
+  HaConfig cfg;
+  ha_get(&cfg);
+  if (!body["enabled"].isNull()) cfg.enabled = body["enabled"].as<bool>();
+  if (body["host"].is<const char *>()) {
+    snprintf(cfg.host, sizeof(cfg.host), "%s", body["host"].as<const char *>());
+  }
+  if (!body["port"].isNull()) cfg.port = (uint16_t)constrain(body["port"].as<int>(), 1, 65535);
+  if (body["user"].is<const char *>()) {
+    snprintf(cfg.user, sizeof(cfg.user), "%s", body["user"].as<const char *>());
+  }
+  // An absent password leaves the stored one alone; an empty string clears it.
+  if (body["password"].is<const char *>()) {
+    snprintf(cfg.password, sizeof(cfg.password), "%s", body["password"].as<const char *>());
+  }
+  if (body["baseTopic"].is<const char *>()) {
+    snprintf(cfg.baseTopic, sizeof(cfg.baseTopic), "%s", body["baseTopic"].as<const char *>());
+  }
+  if (body["discoveryPrefix"].is<const char *>()) {
+    snprintf(cfg.discoveryPrefix, sizeof(cfg.discoveryPrefix), "%s",
+             body["discoveryPrefix"].as<const char *>());
+  }
+  if (!body["discovery"].isNull()) cfg.discovery = body["discovery"].as<bool>();
+  if (!body["publishSeconds"].isNull()) {
+    cfg.publishSeconds = (uint16_t)constrain(body["publishSeconds"].as<int>(), 5, 600);
+  }
+
+  if (cfg.enabled && !cfg.host[0]) {
+    sendError(400, "Home Assistant needs the address of your MQTT broker -- the "
+                   "machine running Mosquitto, which is usually the one running "
+                   "Home Assistant itself.");
+    return;
+  }
+
+  ha_configure(cfg);
+  ha_get(&settings.ha);
+  saveAudioSettings();
+  handleMqttGet();
+}
+
 void handleDisplay() {
   if (!requireAuth()) return;
   JsonDocument body;
@@ -2893,7 +3904,7 @@ void handleDisplay() {
   else if (action == "auto") handled = ui_command("auto");
   else if (action == "screen") {
     char command[20];
-    snprintf(command, sizeof(command), "screen %d", constrain(body["value"] | 0, 0, 6));
+    snprintf(command, sizeof(command), "screen %d", constrain(body["value"] | 0, 0, 7));
     handled = ui_command(command);
   } else if (action == "brightness") {
     char command[20];
@@ -2922,6 +3933,22 @@ void handleClock() {
    * alongside the time and both paths land here.
    */
   if (!body["use24h"].isNull()) soft_clock_set_use_24h(body["use24h"].as<bool>());
+  /*
+   * The zone rule.
+   *
+   * Sent as a POSIX TZ string the dashboard picked out of its own list -- there
+   * is no zone database on the device, and there is not going to be one. An
+   * empty string means "go back to a plain UTC offset", which is what the
+   * dashboard's "Fixed offset" entry sends.
+   */
+  if (body["zone"].is<const char *>()) {
+    const char *zone = body["zone"].as<const char *>();
+    if (!soft_clock_set_zone(zone)) {
+      sendError(400, "That is not a POSIX time zone rule this firmware can "
+                     "use. Pick one from the list rather than typing it.");
+      return;
+    }
+  }
   if (!body["autoSync"].isNull()) {
     const bool wanted = body["autoSync"].as<bool>();
     soft_clock_set_auto_sync(wanted);
@@ -3205,6 +4232,15 @@ void configureRoutes() {
   server.on("/api/display", HTTP_POST, handleDisplay);
   server.on("/api/leds", HTTP_POST, handleLeds);
   server.on("/api/clock", HTTP_POST, handleClock);
+  server.on("/api/audio", HTTP_GET, handleAudioGet);
+  server.on("/api/audio", HTTP_POST, handleAudioSave);
+  server.on("/api/radio", HTTP_GET, handleRadioGet);
+  server.on("/api/radio", HTTP_POST, handleRadioPost);
+  server.on("/api/alarms", HTTP_GET, handleAlarmsGet);
+  server.on("/api/alarms", HTTP_POST, handleAlarmsPost);
+  server.on("/api/telemetry", HTTP_GET, handleTelemetry);
+  server.on("/api/mqtt", HTTP_GET, handleMqttGet);
+  server.on("/api/mqtt", HTTP_POST, handleMqttPost);
   server.on("/api/update/check", HTTP_POST, [] { handleUpdateAction(false); });
   server.on("/api/update/install", HTTP_POST, [] { handleUpdateAction(true); });
   server.on("/api/update/upload", HTTP_POST, handleUploadComplete, handleUploadChunk);
@@ -3268,6 +4304,68 @@ void management_factory_reset() {
 }
 
 void management_set_bt_active(bool active) { btActive = active; }
+
+bool management_media_action(const char *action, int value) {
+  if (!action || !action[0]) return false;
+  const String what(action);
+  const int level = constrain(value, 0, 127);
+  switch (mediaTarget()) {
+    case MEDIA_RADIO: return mediaRadio(what, level);
+    case MEDIA_DF: return mediaDfPlayer(what, level);
+    case MEDIA_BT: return mediaBluetooth(what, level);
+    default: return false;
+  }
+}
+
+/*
+ * Which announcement, if any, belongs to this Bluetooth address.
+ *
+ * The map is stored as text -- "aabbccddeeff:dev_phone,001122334455:bt_ready" --
+ * and parsed on each lookup rather than being kept as a table. That sounds
+ * wasteful and is not: a lookup happens once per phone that connects, the
+ * string is at most a couple of hundred bytes, and the alternative is a parsed
+ * copy that has to be kept in step with the setting. Clips are named rather
+ * than numbered so that regenerating voice_clips.h with an extra phrase does
+ * not silently repoint every mapping at the wrong words.
+ *
+ * Returns voice_clip_count() when there is no mapping, which is what the caller
+ * treats as "say the generic one".
+ */
+uint8_t management_voice_clip_for(const uint8_t *addr) {
+  if (!settings.voiceDevices.length()) return voice_clip_count();
+
+  char wanted[13];
+  snprintf(wanted, sizeof(wanted), "%02x%02x%02x%02x%02x%02x", addr[0], addr[1],
+           addr[2], addr[3], addr[4], addr[5]);
+
+  int from = 0;
+  while (from < (int)settings.voiceDevices.length()) {
+    int comma = settings.voiceDevices.indexOf(',', from);
+    if (comma < 0) comma = settings.voiceDevices.length();
+    const int colon = settings.voiceDevices.indexOf(':', from);
+    if (colon > from && colon < comma) {
+      String mac = settings.voiceDevices.substring(from, colon);
+      mac.trim();
+      mac.toLowerCase();
+      mac.replace(":", "");
+      mac.replace("-", "");
+      if (mac == wanted) {
+        String clip = settings.voiceDevices.substring(colon + 1, comma);
+        clip.trim();
+        return voice_clip_by_id(clip.c_str());
+      }
+    }
+    from = comma + 1;
+  }
+  return voice_clip_count();
+}
+
+void management_store_audio() {
+  audio_eq_get(&settings.eq);
+  voice_get(&settings.voice);
+  ha_get(&settings.ha);
+  saveAudioSettings();
+}
 
 void management_store_leds() {
   // Straight to flash rather than through the deferred path: this comes from a
@@ -3386,6 +4484,18 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   applyBatterySettings();
   battery_begin();
 
+  /*
+   * The equaliser and the announcements, also before the mode branch.
+   *
+   * Both are in the sample path in Bluetooth mode, which has no dashboard to
+   * configure them from -- so a curve dialled in over Wi-Fi has to be picked up
+   * here or it would only apply in the mode it was set in. The Home Assistant
+   * client is configured at the same time because it reads its settings from
+   * the same blob; it does nothing until ha_begin(), which only the Wi-Fi modes
+   * reach.
+   */
+  applyAudioSettings();
+
   if (radioMode == RADIO_MODE_BLUETOOTH) {
     // Not one Wi-Fi call. Leaving the driver uninitialised is the point: the
     // antenna, the coexistence scheduler and ~50 KB of heap all stay with the
@@ -3468,6 +4578,11 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   }
   configureRoutes();
   heapMark("dashboard routes");
+
+  // MQTT last, and only in the modes that have a network. It connects from
+  // management_loop() once the station is up rather than blocking here on a
+  // broker that may not exist.
+  ha_begin();
   Serial.println("[web] dashboard login: admin (change the default password)");
 }
 
@@ -3489,6 +4604,10 @@ void management_loop() {
   if (!radio_mode_has_wifi(radioMode)) return;
 
   server.handleClient();
+  // After the web server, so a request is never held up behind a broker that
+  // has stopped answering. ha_loop() returns immediately when MQTT is off or
+  // the station is down, which is most passes.
+  ha_loop();
   if (WiFi.status() == WL_CONNECTED && !announcedIp) {
     announcedIp = true;
     // parkStation() switched the core's own retry off to keep the access point
@@ -3509,6 +4628,7 @@ void management_loop() {
     status_led_blip(2);
     ui_show_system_status(UI_STATUS_NETWORK, "Dashboard ready", ip.c_str(), -1,
                           6000);
+    voice_say(VOICE_WIFI_CONNECTED, VOICE_CAT_CONNECTION);
     Serial.printf("[web] dashboard: http://%s/ or http://%s.local/\n",
                   ip.c_str(), settings.hostname.c_str());
   } else if (WiFi.status() != WL_CONNECTED && announcedIp) {

@@ -13,7 +13,7 @@ So this checks what keeps the format honest, by parsing the source rather than
 by running it -- no board, no linker, under a second:
 
   1. every key the backup writes, the restore reads, and vice versa;
-  2. every key saveSettings()/saveLedSettings() puts in NVS is in the backup,
+  2. every key the save functions put in NVS has a named home in the backup,
      except the ones this test is told to expect to be missing;
   3. the keys deliberately left out are exactly the documented two;
   4. all four credentials are in the encrypted envelope;
@@ -44,7 +44,7 @@ SOURCE = os.path.join(REPO, "src", "management.cpp")
 # finds no keys fails below rather than passing vacuously.
 CONTAINERS = ("s", "df", "bat", "oled", "pwr", "led", "clk", "sec")
 
-# The nested objects themselves -- structure, not settings.
+# The nested objects and arrays themselves -- structure, not settings.
 SECTIONS = {
     ("s", "dfplayer"),
     ("s", "battery"),
@@ -52,6 +52,11 @@ SECTIONS = {
     ("s", "power"),
     ("s", "leds"),
     ("s", "clock"),
+    ("s", "eq"),
+    ("s", "voice"),
+    ("s", "mqtt"),
+    ("s", "radio"),
+    ("s", "alarms"),
 }
 
 # NVS keys that are stored but deliberately absent from a backup, and why. See
@@ -63,10 +68,94 @@ EXCLUDED = {
     "bootFail": "the boot sentinel's strike count describes a boot, not a preference",
 }
 
-# The clock keeps its preferences in its own NVS namespace (soft_clock.cpp), so
-# they never appear in a prefs.put*() call here. They are still settings, and
-# still have to be in the file.
-CLOCK_KEYS = {("clk", "use24h"), ("clk", "autoSync"), ("clk", "offsetMinutes")}
+# Settings that live in another module's NVS namespace, so they never appear in
+# a prefs.put*() call in management.cpp. They are still settings, and still have
+# to be in the file.
+#
+#   clk.*      soft_clock.cpp's "clock" namespace
+#   s.radio    net_radio.cpp's "radio" namespace -- the station list
+#   s.alarms   alarm_clock.cpp's "alarm" namespace
+EXTERNAL_KEYS = {
+    ("clk", "use24h"),
+    ("clk", "autoSync"),
+    ("clk", "offsetMinutes"),
+    ("clk", "zone"),
+    ("s", "radio"),
+    ("s", "alarms"),
+}
+
+# Kept under its old name for the check that the clock, specifically, is carried.
+CLOCK_KEYS = {pair for pair in EXTERNAL_KEYS if pair[0] == "clk"}
+
+# The functions that put a setting into NVS. Anything writing a prefs key from
+# outside these is, by definition, storing something the backup does not know
+# about -- which is what the EXCLUDED list below is for.
+SAVE_FUNCTIONS = ("saveSettings", "saveLedSettings", "saveAudioSettings")
+
+# Every NVS key this firmware stores, and where a backup file carries it.
+#
+# The count this used to be -- "the backup has as many keys as NVS does" -- was
+# a good enough proxy while every setting was one value. It stopped being one
+# when the equaliser, the announcements and the MQTT client each arrived as a
+# struct: one NVS blob, several fields in the file. Naming the destination is
+# both stricter and clearer, and it means adding a setting fails this test with
+# the name of the setting rather than with an off-by-one.
+#
+# The three composite entries point at a SECTIONS object rather than at a leaf,
+# because that is genuinely where they live: s["eq"] is the whole EqConfig.
+NVS_HOME = {
+    "ssid": ("s", "ssid"),
+    "wifiPass": ("sec", "wifiPassword"),
+    "hostname": ("s", "hostname"),
+    "apPass": ("sec", "apPassword"),
+    "adminPass": ("sec", "adminPassword"),
+    "deviceName": ("s", "deviceName"),
+    "apAlways": ("s", "apAlways"),
+    "ghRepo": ("s", "githubRepo"),
+    "ghAsset": ("s", "githubAsset"),
+    "ghToken": ("sec", "githubToken"),
+
+    "dfSrc": ("df", "source"),
+    "dfVol": ("df", "volume"),
+    "dfEq": ("df", "eq"),
+    "dfLoop": ("df", "loop"),
+    "dfLoopF": ("df", "loopFolder"),
+    "dfAuto": ("df", "autoplay"),
+
+    "batOn": ("bat", "enabled"),
+    "batDiv": ("bat", "divider"),
+    "batCal": ("bat", "calibration"),
+    "batFull": ("bat", "full"),
+    "batEmpty": ("bat", "empty"),
+    "batCells": ("bat", "cells"),
+    "batLow": ("bat", "low"),
+    "batCrit": ("bat", "critical"),
+
+    "uiBlank": ("oled", "blankMode"),
+    "uiBlankS": ("oled", "blankAfterSeconds"),
+
+    "pwrMode": ("pwr", "mode"),
+    "pwrPct": ("pwr", "threshold"),
+    "slpMode": ("pwr", "sleepMode"),
+    "slpS": ("pwr", "sleepAfterSeconds"),
+
+    "ledOn": ("led", "enabled"),
+    "ledFx": ("led", "effect"),
+    "ledBri": ("led", "brightness"),
+    "ledSpd": ("led", "speed"),
+    "ledRct": ("led", "reactivity"),
+    "ledCol": ("led", "color"),
+    "ledCol2": ("led", "color2"),
+    "ledIdle": ("led", "idleOff"),
+    "ledIdleS": ("led", "idleAfterSeconds"),
+
+    # Composite: one NVS blob, an object of fields in the file.
+    "eq": ("s", "eq"),
+    "voice": ("s", "voice"),
+    "haCfg": ("s", "mqtt"),
+
+    "voiceDev": ("s", "voiceDevices"),
+}
 
 # The four values that travel in the AES-256-GCM envelope rather than in clear
 # text. They are settings like any other -- they must round-trip -- but they are
@@ -245,24 +334,54 @@ def main():
 
     # 2. Completeness against what actually reaches NVS.
     persisted = set()
-    for name in ("saveSettings", "saveLedSettings"):
+    for name in SAVE_FUNCTIONS:
         body = function_body(source, name)
         persisted |= set(re.findall(r"prefs\.put\w+\(\"([A-Za-z0-9]+)\"", body))
 
-    # The backup names keys for readability, NVS names them for its 15-character
-    # limit, so the two cannot be compared directly -- only counted. A count is
-    # enough for the failure this is guarding: a setting added to NVS and
-    # forgotten in the backup moves one side and not the other.
-    backed_up = len(written)
-    expected = len(persisted) + len(CLOCK_KEYS)
-    if backed_up != expected:
-        failures.append(
-            "the backup carries %d keys; NVS holds %d settings keys plus %d clock "
-            "keys = %d" % (backed_up, len(persisted), len(CLOCK_KEYS), expected))
-        print("FAIL  backup covers %d of %d stored settings" % (backed_up, expected))
+    # Every stored key has to be accounted for: either it has a home in the file
+    # or it is on the documented exclusion list. An NVS key in neither is a
+    # setting somebody added and nobody arranged to restore.
+    homeless = persisted - set(NVS_HOME) - set(EXCLUDED)
+    if homeless:
+        failures.append("stored in NVS with no home in the backup: "
+                        + ", ".join(sorted(homeless)))
+        print("FAIL  %d stored setting(s) have no place in a backup file"
+              % len(homeless))
     else:
-        print("ok    backup covers all %d stored settings (%d in NVS here, %d in "
-              "the clock namespace)" % (expected, len(persisted), len(CLOCK_KEYS)))
+        print("ok    all %d stored settings have a named home in the backup"
+              % len(persisted))
+
+    # And the table cannot go stale in the other direction either.
+    ghosts = set(NVS_HOME) - persisted
+    if ghosts:
+        failures.append("this test names a home for keys NVS no longer stores: "
+                        + ", ".join(sorted(ghosts)))
+        print("FAIL  %d stale entr(y/ies) in NVS_HOME" % len(ghosts))
+    else:
+        print("ok    the NVS_HOME table matches what is stored")
+
+    # The destinations themselves have to be in the file. A leaf shows up in
+    # `written`; a composite is a SECTIONS object, which `written` excludes by
+    # construction, so both are checked against the union.
+    backed_up = len(written)
+    in_file = written | SECTIONS
+    missing = {home for home in NVS_HOME.values() if home not in in_file}
+    if missing:
+        failures.append("named a home that the backup does not write: "
+                        + show(missing))
+        print("FAIL  %d setting(s) name a backup key that is never written"
+              % len(missing))
+    else:
+        print("ok    every home the table names is actually written")
+
+    absent = EXTERNAL_KEYS - in_file
+    if absent:
+        failures.append("settings from another module's namespace are missing "
+                        "from the backup: " + show(absent))
+        print("FAIL  %d external setting(s) are not in the file" % len(absent))
+    else:
+        print("ok    the other modules' settings are in the backup (%d)"
+              % len(EXTERNAL_KEYS))
 
     if not CLOCK_KEYS <= written:
         failures.append("clock preferences missing from the backup: "
@@ -321,8 +440,9 @@ def main():
               "src/management.cpp are meant to be edited together.")
         return 1
 
-    print("\nthe settings backup format is symmetric and complete: %d keys"
-          % backed_up)
+    print("\nthe settings backup format is symmetric and complete: %d keys, "
+          "%d stored settings, %d from other namespaces"
+          % (backed_up, len(persisted), len(EXTERNAL_KEYS)))
     return 0
 
 

@@ -1,6 +1,6 @@
 /*
  * player_state.h -- the one shared picture of "what is going on", written by
- * the Bluetooth task and read by the UI task.
+ * whichever task owns the audio this boot and read by the UI task.
  *
  * The problem this solves: AVRCP metadata, volume changes and connection events
  * all arrive on the Bluetooth task, in line with the audio path. The UI task
@@ -21,6 +21,11 @@
  *   DFPlayer                 the Arduino loop task, via df_player_loop(). The
  *                            driver task owns the serial link and keeps its own
  *                            status behind a mutex; loop() copies it in here.
+ *   Internet radio           the Arduino loop task, via net_radio_loop(). Same
+ *                            arrangement as the DFPlayer: the decoder task
+ *                            keeps its own status behind a mutex and loop()
+ *                            copies it across, so nothing on the audio path
+ *                            ever touches this seqlock.
  */
 
 #pragma once
@@ -37,9 +42,10 @@ static const size_t PS_NAME_MAX = 32;
 /// differently for each: there is no "pair your phone" in DFPlayer mode, and no
 /// "insert a card" in a Bluetooth one.
 enum PsSource : uint8_t {
-  PS_SRC_NONE = 0,   ///< no audio path is running at all (Wi-Fi only mode)
+  PS_SRC_NONE = 0,   ///< no audio path is running at all
   PS_SRC_BLUETOOTH,  ///< A2DP sink
   PS_SRC_DFPLAYER,   ///< a DFPlayer Mini playing its own card or USB stick
+  PS_SRC_RADIO,      ///< internet radio, decoded on this chip
 };
 
 /// What the phone is doing, as far as AVRCP has told us.

@@ -102,6 +102,45 @@ void management_factory_reset();
 void management_set_bt_active(bool active);
 
 /*
+ * Applies one media action to whatever source this radio mode is running.
+ *
+ * `action` is one of play, pause, toggle, stop, next, previous, forward,
+ * rewind, volume or mute; `value` is the 0..127 level and is ignored by the
+ * rest. The point of it being here rather than in the web handler is that there
+ * are now four callers -- the dashboard, MQTT, the alarm's fade ramp and the
+ * serial console -- and "which source is live this boot" is a question with one
+ * right answer that none of them should be re-deriving.
+ *
+ * Returns false when the action could not be carried out, which is a real
+ * outcome rather than an error: there is no next track on an internet radio
+ * stream and no seek on a DFPlayer, and a caller that cannot act on that is
+ * free to ignore it.
+ */
+bool management_media_action(const char *action, int value);
+
+/*
+ * Writes the sound, announcement and Home Assistant settings to NVS.
+ *
+ * The same shape as management_store_leds() and there for the same reason: the
+ * live objects are owned by audio_eq, voice and home_assistant, and the console
+ * and MQTT can both reach them directly. Without this, a preset picked over
+ * MQTT would be forgotten at the next reboot.
+ */
+void management_store_audio();
+
+/*
+ * The announcement mapped to one Bluetooth address, or voice_clip_count() when
+ * there is none.
+ *
+ * This is how "announce which phone connected" is answered on a device with no
+ * speech synthesiser: the owner adds the phrase to scripts/voice_phrases.txt,
+ * regenerates the clips, and points the phone at it from the Sound page. The
+ * address is passed as a plain six-byte array rather than as esp_bd_addr_t so
+ * this header stays free of the Bluetooth stack in the modes that release it.
+ */
+uint8_t management_voice_clip_for(const uint8_t *addr);
+
+/*
  * The DFPlayer's stored start-up values, for main.cpp to hand to the driver.
  *
  * The module keeps nothing across a power cycle -- not the volume, not the
@@ -142,6 +181,9 @@ inline void management_factory_reset() {}
 inline void management_set_bt_active(bool) {}
 inline void management_df_defaults(uint8_t *, uint8_t *, uint8_t *, uint8_t *,
                                    uint8_t *, bool *) {}
+inline bool management_media_action(const char *, int) { return false; }
+inline void management_store_audio() {}
+inline uint8_t management_voice_clip_for(const uint8_t *) { return 0xFF; }
 inline void management_store_leds() {}
 inline bool management_led_state(StatusLedState *) { return false; }
 #endif

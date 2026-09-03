@@ -116,6 +116,30 @@ static const uint8_t ICON_WIFI[8] = {
     xr(0b00011000),
 };
 
+/// A broadcast mast: internet radio.
+static const uint8_t ICON_RADIO[8] = {
+    xr(0b00011000),  // ...##...
+    xr(0b00100100),  // ..#..#..
+    xr(0b01011010),  // .#.##.#.
+    xr(0b00011000),  // ...##...
+    xr(0b00011000),  // ...##...
+    xr(0b00111100),  // ..####..
+    xr(0b01111110),  // .######.
+    xr(0b11111111),  // ########
+};
+
+/// A bell: an armed or ringing alarm.
+static const uint8_t ICON_ALARM[8] = {
+    xr(0b00011000),  // ...##...
+    xr(0b00111100),  // ..####..
+    xr(0b00111100),  // ..####..
+    xr(0b01111110),  // .######.
+    xr(0b01111110),  // .######.
+    xr(0b11111111),  // ########
+    xr(0b00000000),  // ........
+    xr(0b00011000),  // ...##...
+};
+
 /// Down arrow into a tray: firmware download / install.
 static const uint8_t ICON_UPDATE[8] = {
     xr(0b00011000),
