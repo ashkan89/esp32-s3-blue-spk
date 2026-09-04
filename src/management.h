@@ -129,6 +129,23 @@ bool management_media_action(const char *action, int value);
 void management_store_audio();
 
 /*
+ * True while the firmware updater is holding a TLS session.
+ *
+ * There is room on this chip for exactly one. A handshake against the Mozilla
+ * root bundle costs a 16 kB task stack and forty to fifty kilobytes of mbedtls
+ * context, and the internet radio's https path wants the same again -- and when
+ * the second one cannot get it, the failure is not a returned error. mbedtls
+ * allocation failures surface deep inside lwIP and the IDF's socket layer,
+ * which assert rather than unwind, and what the owner sees is a panic in the
+ * timer task with a corrupted heap behind it.
+ *
+ * So the two take turns. The radio asks this before opening a stream and waits
+ * out its backoff if the answer is yes; the updater asks the radio the same
+ * question before it starts.
+ */
+bool management_update_busy();
+
+/*
  * The announcement mapped to one Bluetooth address, or voice_clip_count() when
  * there is none.
  *
@@ -183,6 +200,7 @@ inline void management_df_defaults(uint8_t *, uint8_t *, uint8_t *, uint8_t *,
                                    uint8_t *, bool *) {}
 inline bool management_media_action(const char *, int) { return false; }
 inline void management_store_audio() {}
+inline bool management_update_busy() { return false; }
 inline uint8_t management_voice_clip_for(const uint8_t *) { return 0xFF; }
 inline void management_store_leds() {}
 inline bool management_led_state(StatusLedState *) { return false; }

@@ -1,3 +1,18 @@
+/*
+ * -O2 for this file, against the -Os the rest of the firmware is built with.
+ *
+ * Measured, not assumed: building the whole image at -O2 costs 148 kB of extra
+ * code. On a chip that executes from flash through a 32 kB instruction cache
+ * that is a bad trade -- almost all of the growth is cold code, and it evicts
+ * hot code from the cache. Applied to one file it costs a couple of kilobytes.
+ *
+ * This file earns it. The ADPCM decode, the resampler and the ducking mixer all
+ * run once per sample, on an audio task, underneath music that is already
+ * playing.
+ */
+#pragma GCC optimize("O2")
+
+#include "app_config.h"
 #include "voice.h"
 
 #include <Arduino.h>
@@ -434,38 +449,38 @@ bool voice_command(const char *line) {
   if (!configured) voice_defaults(&config);
 
   if (*rest == '\0') {
-    Serial.printf("[voice] %s, volume %u%%, duck %u%%, %u clips |",
+    LOGF("[voice] %s, volume %u%%, duck %u%%, %u clips |",
                   config.enabled ? "on" : "off", (unsigned)config.volume,
                   (unsigned)config.duck, (unsigned)VOICE_CLIP_COUNT);
-    Serial.printf(" system %s connection %s battery %s radio %s alarm %s\n",
+    LOGF(" system %s connection %s battery %s radio %s alarm %s\n",
                   config.categories & VOICE_CAT_SYSTEM ? "on" : "off",
                   config.categories & VOICE_CAT_CONNECTION ? "on" : "off",
                   config.categories & VOICE_CAT_BATTERY ? "on" : "off",
                   config.categories & VOICE_CAT_RADIO ? "on" : "off",
                   config.categories & VOICE_CAT_ALARM ? "on" : "off");
-    Serial.print("[voice] clips:");
+    LOGP("[voice] clips:");
     for (uint8_t i = 0; i < VOICE_CLIP_COUNT; i++) {
-      Serial.printf(" %s", VOICE_CLIPS[i].id);
+      LOGF(" %s", VOICE_CLIPS[i].id);
     }
-    Serial.println();
+    LOGLN();
     return true;
   }
   if (strcmp(rest, "on") == 0 || strcmp(rest, "off") == 0) {
     VoiceConfig next = config;
     next.enabled = rest[1] == 'n';
     voice_configure(next);
-    Serial.printf("[voice] announcements %s\n", next.enabled ? "on" : "off");
+    LOGF("[voice] announcements %s\n", next.enabled ? "on" : "off");
     return true;
   }
   if (strcmp(rest, "stop") == 0) {
     voice_silence();
-    Serial.println("[voice] silenced");
+    LOGLN("[voice] silenced");
     return true;
   }
 
   const uint8_t index = voice_clip_by_id(rest);
   if (index >= VOICE_CLIP_COUNT) {
-    Serial.printf("[voice] no clip called \"%s\"; type 'say' for the list\n", rest);
+    LOGF("[voice] no clip called \"%s\"; type 'say' for the list\n", rest);
     return true;
   }
   // The console asks for it by name, so it is said whatever the category mask
@@ -477,7 +492,7 @@ bool voice_command(const char *line) {
   const bool ok = voice_say_index(index, VOICE_CAT_SYSTEM);
   config.categories = saved;
   config.enabled = savedEnabled;
-  Serial.printf("[voice] %s \"%s\"\n", ok ? "queued" : "dropped",
+  LOGF("[voice] %s \"%s\"\n", ok ? "queued" : "dropped",
                 VOICE_CLIPS[index].text);
   return true;
 }

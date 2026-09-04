@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "power.h"
 
 #include <Arduino.h>
@@ -92,7 +93,7 @@ void apply(bool on) {
     WiFi.setTxPower(on ? SAVE_TX_POWER : WIFI_POWER_19_5dBm);
   }
 
-  Serial.printf("[power] saving %s\n", on ? "on" : "off");
+  LOGF("[power] saving %s\n", on ? "on" : "off");
 }
 
 /// The policy, with no side effects, so the reason and the answer are decided
@@ -257,13 +258,13 @@ bool power_woke_from_sleep() {
 
 bool power_sleep_now() {
   if (!power_sleep_possible()) {
-    Serial.println("[power] no wake button compiled in; refusing to stand by");
+    LOGLN("[power] no wake button compiled in; refusing to stand by");
     return false;
   }
   if (g_sleeping) return true;
   g_sleeping = true;
 
-  Serial.printf("[power] standby; wake on GPIO%d\n", (int)PIN_UI_BUTTON);
+  LOGF("[power] standby; wake on GPIO%d\n", (int)PIN_UI_BUTTON);
 
   /*
    * Say so first, and on the panel rather than only on a serial port nobody is
@@ -305,7 +306,7 @@ bool power_sleep_now() {
     delay(10);
   }
   if (!leds_suspended()) {
-    Serial.println("[power] the ring did not confirm its dark frame; going to "
+    LOGLN("[power] the ring did not confirm its dark frame; going to "
                    "standby anyway");
   }
   delay(150);  // the panel's own power-down, on the UI task
@@ -340,7 +341,7 @@ bool power_sleep_now() {
    */
   setCpuFrequencyMhz(10);
 
-  Serial.flush();
+  LOGFLUSH();
 
   /*
    * The wait. Deliberately a restart rather than a resume: coming back means
@@ -367,7 +368,7 @@ bool power_sleep_now() {
 
   setCpuFrequencyMhz(240);  // so the restart runs at the speed it expects
   g_wokeMagic = WOKE_MAGIC;
-  Serial.println("[power] waking");
+  LOGLN("[power] waking");
 
   /*
    * Wait for the button to come back up before resetting.
@@ -391,12 +392,12 @@ bool power_sleep_now() {
     delay(10);
   }
   if (digitalRead(PIN_UI_BUTTON) == LOW) {
-    Serial.println("[power] BOOT still held after 10 s; restarting anyway. If "
+    LOGLN("[power] BOOT still held after 10 s; restarting anyway. If "
                    "the speaker comes back silent, the chip is in download mode "
                    "-- release the button and reset it.");
   }
   delay(60);  // contact bounce on the release, well clear of the reset
-  Serial.flush();
+  LOGFLUSH();
   ESP.restart();
   return true;  // unreachable; keeps the signature honest
 }

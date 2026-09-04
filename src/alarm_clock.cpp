@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "alarm_clock.h"
 
 #include <Arduino.h>
@@ -197,7 +198,7 @@ void beginRinging(uint8_t index) {
   ui_show_system_status(UI_STATUS_NETWORK, "Alarm", detail, -1, 0);
   voice_say(VOICE_ALARM, VOICE_CAT_ALARM);
 
-  Serial.printf("[alarm] %u ringing (%s)\n", (unsigned)index + 1,
+  LOGF("[alarm] %u ringing (%s)\n", (unsigned)index + 1,
                 a.label[0] ? a.label : "no label");
 }
 
@@ -215,7 +216,7 @@ void endRinging(const char *why) {
   state = ALARM_IDLE;
   activeIndex = -1;
   ui_show_system_status(UI_STATUS_SUCCESS, "Alarm off", why, -1, 2000);
-  Serial.printf("[alarm] stopped: %s\n", why);
+  LOGF("[alarm] stopped: %s\n", why);
 }
 
 void serviceRinging() {
@@ -231,7 +232,7 @@ void serviceRinging() {
   // Nothing audible after the grace period: the station did not come up, or the
   // card would not read. Fall back to the one source that cannot fail.
   if (!chimeRunning && elapsed > SOURCE_GRACE_MS && !sourceAudible(a)) {
-    Serial.println("[alarm] the chosen source did not start; falling back to the chime");
+    LOGLN("[alarm] the chosen source did not start; falling back to the chime");
     if (chimeHook && chimeHook(true)) chimeRunning = true;
   }
 
@@ -253,7 +254,7 @@ void serviceSleep() {
   if (left <= 0) {
     sleepRunning = false;
     stopAudio();
-    Serial.println("[alarm] sleep timer finished");
+    LOGLN("[alarm] sleep timer finished");
     voice_say(VOICE_SLEEP_ENDING, VOICE_CAT_ALARM);
     if (sleepStandby && power_sleep_possible()) {
       // power_sleep_now() draws its own farewell screen and does not return.
@@ -321,7 +322,7 @@ void alarm_begin() {
   for (uint8_t i = 0; i < ALARM_MAX; i++) lastFiredStamp[i] = stamp;
 
   if (alarmCount) {
-    Serial.printf("[alarm] %u stored\n", (unsigned)alarmCount);
+    LOGF("[alarm] %u stored\n", (unsigned)alarmCount);
   }
 }
 
@@ -363,7 +364,7 @@ void alarm_loop() {
     if (a.skipNext) {
       a.skipNext = false;
       saveAlarms();
-      Serial.printf("[alarm] %u skipped as asked\n", (unsigned)i + 1);
+      LOGF("[alarm] %u skipped as asked\n", (unsigned)i + 1);
       continue;
     }
     beginRinging(i);
@@ -461,7 +462,7 @@ void alarm_snooze() {
   snprintf(detail, sizeof(detail), "%u more minutes", (unsigned)a.snoozeMins);
   ui_show_system_status(UI_STATUS_SUCCESS, "Snoozed", detail, -1, 3000);
   voice_say(VOICE_ALARM_SNOOZE, VOICE_CAT_ALARM);
-  Serial.printf("[alarm] snoozed for %u min\n", (unsigned)a.snoozeMins);
+  LOGF("[alarm] snoozed for %u min\n", (unsigned)a.snoozeMins);
 }
 
 bool alarm_trigger(uint8_t index) {
@@ -491,7 +492,7 @@ bool alarm_sleep_start(uint16_t minutes, bool standby) {
            standby ? ", then standby" : "");
   ui_show_system_status(UI_STATUS_SUCCESS, "Sleep timer", detail, -1, 3000);
   voice_say(VOICE_SLEEP_TIMER, VOICE_CAT_ALARM);
-  Serial.printf("[alarm] sleep timer %u min%s\n", (unsigned)minutes,
+  LOGF("[alarm] sleep timer %u min%s\n", (unsigned)minutes,
                 standby ? " then standby" : "");
   return true;
 }
@@ -503,7 +504,7 @@ void alarm_sleep_cancel() {
   // leaving the owner wondering why cancelling made things quieter.
   applyVolume(sleepFromVolume);
   ui_show_system_status(UI_STATUS_SUCCESS, "Sleep timer", "Cancelled", -1, 2500);
-  Serial.println("[alarm] sleep timer cancelled");
+  LOGLN("[alarm] sleep timer cancelled");
 }
 
 bool alarm_sleep_extend(uint16_t minutes) {
@@ -535,12 +536,12 @@ bool alarm_command(const char *line) {
       AlarmStatus s;
       alarm_status(&s);
       if (s.sleepRunning) {
-        Serial.printf("[alarm] sleep timer: %lu min %lu s left of %lu min\n",
+        LOGF("[alarm] sleep timer: %lu min %lu s left of %lu min\n",
                       (unsigned long)(s.sleepLeftSecs / 60),
                       (unsigned long)(s.sleepLeftSecs % 60),
                       (unsigned long)(s.sleepTotalSecs / 60));
       } else {
-        Serial.println("[alarm] no sleep timer running; 'sleep <minutes>' starts one");
+        LOGLN("[alarm] no sleep timer running; 'sleep <minutes>' starts one");
       }
       return true;
     }
@@ -553,7 +554,7 @@ bool alarm_command(const char *line) {
       alarm_sleep_start((uint16_t)minutes, sleepStandbyDefault);
       return true;
     }
-    Serial.println("[alarm] usage: sleep <minutes> | sleep off");
+    LOGLN("[alarm] usage: sleep <minutes> | sleep off");
     return true;
   }
 
@@ -572,25 +573,25 @@ bool alarm_command(const char *line) {
   if (strncmp(rest, "test", 4) == 0) {
     const int which = atoi(rest + 4);
     if (!alarm_trigger((uint8_t)(which > 0 ? which - 1 : 0))) {
-      Serial.println("[alarm] no such alarm");
+      LOGLN("[alarm] no such alarm");
     }
     return true;
   }
 
   AlarmStatus s;
   alarm_status(&s);
-  Serial.printf("[alarm] %s", s.state == ALARM_RINGING  ? "ringing"
+  LOGF("[alarm] %s", s.state == ALARM_RINGING  ? "ringing"
                               : s.state == ALARM_SNOOZED ? "snoozed"
                                                          : "idle");
-  if (s.state == ALARM_SNOOZED) Serial.printf(" (%lu s)", (unsigned long)s.snoozeLeftSecs);
+  if (s.state == ALARM_SNOOZED) LOGF(" (%lu s)", (unsigned long)s.snoozeLeftSecs);
   if (s.next >= 0) {
-    Serial.printf(" | next in %lu h %lu m", (unsigned long)(s.nextInSecs / 3600),
+    LOGF(" | next in %lu h %lu m", (unsigned long)(s.nextInSecs / 3600),
                   (unsigned long)((s.nextInSecs % 3600) / 60));
   }
   if (s.sleepRunning) {
-    Serial.printf(" | sleep %lu min left", (unsigned long)(s.sleepLeftSecs / 60));
+    LOGF(" | sleep %lu min left", (unsigned long)(s.sleepLeftSecs / 60));
   }
-  Serial.println();
+  LOGLN();
 
   static const char *const DAY_LETTER = "SMTWTFS";
   for (uint8_t i = 0; i < alarmCount; i++) {
@@ -603,12 +604,12 @@ bool alarm_command(const char *line) {
         if (a.days & (1 << d)) days[d] = DAY_LETTER[d];
       }
     }
-    Serial.printf("  %u%c %02u:%02u %-7s %-5s vol %u fade %us%s%s%s\n",
+    LOGF("  %u%c %02u:%02u %-7s %-5s vol %u fade %us%s%s%s\n",
                   (unsigned)(i + 1), a.enabled ? '*' : '.', (unsigned)a.hour,
                   (unsigned)a.minute, days, sourceName(a.source),
                   (unsigned)a.volume, (unsigned)a.fadeSecs,
                   a.skipNext ? " [skip next]" : "", a.label[0] ? " " : "", a.label);
   }
-  if (!alarmCount) Serial.println("  (no alarms set; the dashboard's Alarms page adds them)");
+  if (!alarmCount) LOGLN("  (no alarms set; the dashboard's Alarms page adds them)");
   return true;
 }

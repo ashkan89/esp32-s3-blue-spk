@@ -1,3 +1,18 @@
+/*
+ * -O2 for this file, against the -Os the rest of the firmware is built with.
+ *
+ * Measured, not assumed: building the whole image at -O2 costs 148 kB of extra
+ * code. On a chip that executes from flash through a 32 kB instruction cache
+ * that is a bad trade -- almost all of the growth is cold code, and it evicts
+ * hot code from the cache. Applied to one file it costs a couple of kilobytes.
+ *
+ * This file earns it. Every line of work in it happens once per sample: five
+ * biquad sections per channel at up to 48 kHz, which is the tightest loop in
+ * the firmware and the one whose deadline is a DMA buffer.
+ */
+#pragma GCC optimize("O2")
+
+#include "app_config.h"
 #include "audio_eq.h"
 
 #include <Arduino.h>
@@ -362,7 +377,7 @@ bool audio_eq_command(const char *line) {
         next.enabled = true;
         changed = true;
       } else {
-        Serial.println("[eq] usage: eq | eq on|off|auto | eq flat|music|voice|"
+        LOGLN("[eq] usage: eq | eq on|off|auto | eq flat|music|voice|"
                        "bass|night | eq <band 1-5> <dB -12..12>");
         return true;
       }
@@ -371,19 +386,19 @@ bool audio_eq_command(const char *line) {
 
   if (changed) audio_eq_configure(next);
 
-  Serial.printf("[eq] %s %s |", config.enabled ? "on" : "off",
+  LOGF("[eq] %s %s |", config.enabled ? "on" : "off",
                 audio_eq_preset_name(config.preset));
   for (uint8_t i = 0; i < EQ_BANDS; i++) {
     const uint16_t hz = EQ_BAND_HZ[i];
-    if (hz >= 1000) Serial.printf(" %ukHz %+d", (unsigned)(hz / 1000), config.gain[i]);
-    else Serial.printf(" %uHz %+d", (unsigned)hz, config.gain[i]);
+    if (hz >= 1000) LOGF(" %ukHz %+d", (unsigned)(hz / 1000), config.gain[i]);
+    else LOGF(" %uHz %+d", (unsigned)hz, config.gain[i]);
   }
-  Serial.printf(" | preamp %+d dB%s", config.preamp,
+  LOGF(" | preamp %+d dB%s", config.preamp,
                 config.autoPreamp ? " auto" : "");
   if (audio_eq_headroom_db() < 0.0f) {
-    Serial.printf(" (%.0f dB for headroom)", audio_eq_headroom_db());
+    LOGF(" (%.0f dB for headroom)", audio_eq_headroom_db());
   }
-  Serial.printf(" | %s at %u Hz\n", audio_eq_active() ? "active" : "bypassed",
+  LOGF(" | %s at %u Hz\n", audio_eq_active() ? "active" : "bypassed",
                 (unsigned)sampleRate);
   return true;
 }

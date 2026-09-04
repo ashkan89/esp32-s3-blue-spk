@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "soft_clock.h"
 
 #include <Arduino.h>
@@ -429,14 +430,14 @@ void soft_clock_network_begin() {
   timezone_string(tz, sizeof(tz));
   configTzTime(tz, "pool.ntp.org", "time.nist.gov", "time.google.com");
   g_ntp_running = true;
-  Serial.println("[clock] sntp started");
+  LOGLN("[clock] sntp started");
 }
 
 void soft_clock_network_end() {
   if (!g_ntp_running) return;
   esp_sntp_stop();
   g_ntp_running = false;
-  Serial.println("[clock] sntp stopped");
+  LOGLN("[clock] sntp stopped");
 }
 
 bool soft_clock_network_synced() { return g_ntp_synced; }
@@ -467,7 +468,7 @@ static void adopt_network_time() {
   if (first) {
     struct tm local;
     localtime_r(&now, &local);
-    Serial.printf("[clock] sntp %04d-%02d-%02d %02d:%02d:%02d (utc%+ld min)\n",
+    LOGF("[clock] sntp %04d-%02d-%02d %02d:%02d:%02d (utc%+ld min)\n",
                   local.tm_year + 1900, local.tm_mon + 1, local.tm_mday,
                   local.tm_hour, local.tm_min, local.tm_sec,
                   (long)g_offset_min);
@@ -493,7 +494,7 @@ void soft_clock_begin() {
     if (rule.length() && rule.length() < sizeof(stored)) {
       snprintf(stored, sizeof(stored), "%s", rule.c_str());
       if (zone_is_usable(stored)) snprintf(g_zone, sizeof(g_zone), "%s", stored);
-      else Serial.printf("[clock] stored zone \"%s\" no longer parses; keeping "
+      else LOGF("[clock] stored zone \"%s\" no longer parses; keeping "
                          "the fixed offset\n", stored);
     }
   }
@@ -541,7 +542,7 @@ void soft_clock_begin() {
        * ds3231_write().
        */
       g_rtc_state = RTC_STOPPED;
-      Serial.println("[clock] ds3231 reports its oscillator stopped -- the coin "
+      LOGLN("[clock] ds3231 reports its oscillator stopped -- the coin "
                      "cell is flat or was refitted. Ignoring its time; using "
                      "NVS/network instead. It is re-seeded and trusted again "
                      "from the next real time set.");
@@ -549,14 +550,14 @@ void soft_clock_begin() {
       g_rtc_state = RTC_OK;
       apply_epoch(mktime(&t));
       g_source = CLOCK_SRC_RTC;
-      Serial.println("[clock] ds3231");
+      LOGLN("[clock] ds3231");
     } else if (!osfKnown) {
       g_rtc_state = RTC_UNREADABLE;
-      Serial.println("[clock] ds3231 answered its address but not its registers "
+      LOGLN("[clock] ds3231 answered its address but not its registers "
                      "-- check the pull-ups and the lead length");
     } else {
       g_rtc_state = RTC_UNSET;
-      Serial.println("[clock] ds3231 present but unset -- seeding it");
+      LOGLN("[clock] ds3231 present but unset -- seeding it");
       struct tm seed;
       time_t now = time(nullptr);
       localtime_r(&now, &seed);
@@ -564,13 +565,13 @@ void soft_clock_begin() {
     }
   } else {
     g_rtc_state = RTC_ABSENT;
-    Serial.println("[clock] no ds3231 on the bus");
+    LOGLN("[clock] no ds3231 on the bus");
   }
 #endif
 
   struct tm now;
   soft_clock_now(&now);
-  Serial.printf("[clock] %04d-%02d-%02d %02d:%02d:%02d (%s)\n",
+  LOGF("[clock] %04d-%02d-%02d %02d:%02d:%02d (%s)\n",
                 now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, now.tm_hour,
                 now.tm_min, now.tm_sec, soft_clock_source_name());
   g_last_persist_ms = millis();
@@ -605,7 +606,7 @@ void soft_clock_set_use_24h(bool on) {
   if (on == g_use_24h) return;
   g_use_24h = on;
   if (g_prefs_ok) g_prefs.putBool(H24_KEY, on);
-  Serial.printf("[clock] %s clock\n", on ? "24-hour" : "12-hour");
+  LOGF("[clock] %s clock\n", on ? "24-hour" : "12-hour");
 }
 
 bool soft_clock_auto_sync() { return g_auto_sync; }
@@ -614,7 +615,7 @@ void soft_clock_set_auto_sync(bool on) {
   if (on != g_auto_sync) {
     g_auto_sync = on;
     if (g_prefs_ok) g_prefs.putBool(SYNC_KEY, on);
-    Serial.printf("[clock] network sync %s\n", on ? "on" : "off");
+    LOGF("[clock] network sync %s\n", on ? "on" : "off");
   }
   // Unconditional, so switching it off stops a client that is already polling
   // rather than waiting for the next disconnect to do it.
@@ -635,7 +636,7 @@ void soft_clock_set_utc_offset_min(int32_t minutes) {
   g_offset_min = minutes;
   apply_timezone();
   if (g_prefs_ok) g_prefs.putLong(OFFSET_KEY, (int32_t)minutes);
-  Serial.printf("[clock] utc offset %+ld min\n", (long)minutes);
+  LOGF("[clock] utc offset %+ld min\n", (long)minutes);
 
   // The SNTP client caches nothing zone-related, but re-arming it costs a
   // packet and puts the new offset on the display without waiting for the next
@@ -651,11 +652,11 @@ bool soft_clock_set_zone(const char *tz) {
     g_zone[0] = 0;
     if (g_prefs_ok) g_prefs.remove(ZONE_KEY);
     apply_timezone();
-    Serial.println("[clock] zone cleared; back to the fixed offset");
+    LOGLN("[clock] zone cleared; back to the fixed offset");
     return true;
   }
   if (!zone_is_usable(tz)) {
-    Serial.printf("[clock] \"%s\" is not a POSIX TZ rule this C library "
+    LOGF("[clock] \"%s\" is not a POSIX TZ rule this C library "
                   "understands\n", tz);
     return false;
   }
@@ -663,7 +664,7 @@ bool soft_clock_set_zone(const char *tz) {
   snprintf(g_zone, sizeof(g_zone), "%s", tz);
   apply_timezone();
   if (g_prefs_ok) g_prefs.putString(ZONE_KEY, g_zone);
-  Serial.printf("[clock] zone %s -> %s, %+ld min\n", g_zone,
+  LOGF("[clock] zone %s -> %s, %+ld min\n", g_zone,
                 soft_clock_zone_abbrev(), (long)g_offset_min);
   if (g_ntp_running) soft_clock_network_begin();
   return true;
@@ -734,7 +735,7 @@ void soft_clock_tick() {
     g_last_zone_check_ms = now;
     const int32_t derived = zone_offset_at(time(nullptr));
     if (derived >= -840 && derived <= 840 && derived != g_offset_min) {
-      Serial.printf("[clock] %s: %+ld min -> %+ld min (%s)\n", g_zone,
+      LOGF("[clock] %s: %+ld min -> %+ld min (%s)\n", g_zone,
                     (long)g_offset_min, (long)derived, soft_clock_zone_abbrev());
       g_offset_min = derived;
     }
@@ -760,7 +761,7 @@ bool soft_clock_command(const char *line) {
     now.tm_min = mi;
     now.tm_sec = s;
     soft_clock_set(now, CLOCK_SRC_SERIAL);
-    Serial.printf("[clock] set %04d-%02d-%02d %02d:%02d:%02d\n", y, mo, d, h,
+    LOGF("[clock] set %04d-%02d-%02d %02d:%02d:%02d\n", y, mo, d, h,
                   mi, s);
     return true;
   }
@@ -772,7 +773,7 @@ bool soft_clock_command(const char *line) {
     now.tm_min = mi;
     now.tm_sec = s;
     soft_clock_set(now, CLOCK_SRC_SERIAL);
-    Serial.printf("[clock] set %02d:%02d:%02d\n", h, mi, s);
+    LOGF("[clock] set %02d:%02d:%02d\n", h, mi, s);
     return true;
   }
 
@@ -782,12 +783,12 @@ bool soft_clock_command(const char *line) {
     now.tm_mon = mo - 1;
     now.tm_mday = d;
     soft_clock_set(now, CLOCK_SRC_SERIAL);
-    Serial.printf("[clock] set %04d-%02d-%02d\n", y, mo, d);
+    LOGF("[clock] set %04d-%02d-%02d\n", y, mo, d);
     return true;
   }
 
   if (strcmp(line, "time") == 0) {
-    Serial.printf("[clock] %04d-%02d-%02d %02d:%02d:%02d (%s)\n",
+    LOGF("[clock] %04d-%02d-%02d %02d:%02d:%02d (%s)\n",
                   now.tm_year + 1900, now.tm_mon + 1, now.tm_mday, now.tm_hour,
                   now.tm_min, now.tm_sec, soft_clock_source_name());
     return true;

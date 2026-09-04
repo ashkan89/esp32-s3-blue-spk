@@ -550,7 +550,7 @@ const char *playbackName(PsPlayback playback) {
  */
 void rebootTask(void *arg) {
   vTaskDelay(pdMS_TO_TICKS((uint32_t)(uintptr_t)arg));
-  Serial.flush();
+  LOGFLUSH();
   esp_restart();
 }
 
@@ -561,7 +561,7 @@ void scheduleReboot(uint32_t delayMs) {
                   configMAX_PRIORITIES - 2, nullptr) != pdPASS) {
     // Nothing left to schedule it with, so take the delay in line and go.
     delay(delayMs);
-    Serial.flush();
+    LOGFLUSH();
     esp_restart();
   }
 }
@@ -911,7 +911,7 @@ bool downloadAndFlash(const String &startUrl, const String &token, String &error
           error = "Release download redirected off HTTPS";
           return false;
         }
-        Serial.printf("[ota] redirect %d -> %.60s\n", code, next.c_str());
+        LOGF("[ota] redirect %d -> %.60s\n", code, next.c_str());
         url = next;
         break;  // next hop, with a fresh client
       }
@@ -927,7 +927,7 @@ bool downloadAndFlash(const String &startUrl, const String &token, String &error
         if (code < 0) error += heapNote();
         return false;
       }
-      Serial.printf("[ota] %s, retrying (%d/%d)\n",
+      LOGF("[ota] %s, retrying (%d/%d)\n",
                     httpErrorText(code).c_str(), attempt + 1, CONNECT_ATTEMPTS);
       delay(1000);
     }
@@ -982,12 +982,12 @@ void runGithubJob(const GithubJob &job) {
 
   updateSet("downloading", "Downloading and verifying firmware", true);
   if (sink && sink->is_connected()) sink->pause();
-  Serial.printf("[ota] installing %s (%s, %u B, heap %u)\n",
+  LOGF("[ota] installing %s (%s, %u B, heap %u)\n",
                 release.tag.c_str(), release.assetName.c_str(),
                 (unsigned)release.assetSize, (unsigned)ESP.getFreeHeap());
 
   if (!downloadAndFlash(release.assetUrl, job.token, error)) {
-    Serial.printf("[ota] %s\n", error.c_str());
+    LOGF("[ota] %s\n", error.c_str());
     updateSet("error", error.c_str(), false);
     return;
   }
@@ -1016,8 +1016,21 @@ void githubTask(void *raw) {
  * that allocation surfaces as HTTPClient's HTTP -1, which reads as a network
  * problem and sends you looking in the wrong place. Refuse in words instead.
  */
-constexpr uint32_t TLS_HEAP_FLOOR = 60000;
-constexpr uint32_t TLS_BLOCK_FLOOR = 34000;
+/*
+ * What a TLS handshake against the root bundle actually needs.
+ *
+ * These were 60000/34000, which is what the handshake costs on paper. In the
+ * field a speaker with 108 kB free and a 106 kB block sailed past that check
+ * and then failed inside mbedtls with "SSL - Memory allocation failed" --
+ * because between the check and the handshake, the internet radio opened a
+ * second TLS session for an https station and took the room.
+ *
+ * The arbitration below is the real fix for that. These went up anyway: the
+ * check has to leave enough for the network stack and the web server to keep
+ * working underneath it, not merely enough to complete if nothing else moves.
+ */
+constexpr uint32_t TLS_HEAP_FLOOR = 80000;
+constexpr uint32_t TLS_BLOCK_FLOOR = 45000;
 
 bool startGithubJob(bool install) {
   const UpdateState u = updateSnapshot();
@@ -1026,6 +1039,25 @@ bool startGithubJob(bool install) {
     updateSet("error", "Internet connection required", false);
     return false;
   }
+  /*
+   * Not while the radio has a stream open, and not while it is trying to open
+   * one either. Both hold a socket and a decoder, and an https station holds a
+   * whole second TLS context -- which is the collision that used to crash the
+   * board rather than merely fail.
+   */
+  if (net_radio_running()) {
+    RadioStatus r;
+    net_radio_snapshot(&r);
+    if (r.state != RADIO_IDLE && r.state != RADIO_ERROR) {
+      updateSet("error",
+                "The internet radio is using the network. Stop it on the Radio "
+                "page and check again -- there is room on this chip for one "
+                "secure connection at a time, not two.",
+                false);
+      return false;
+    }
+  }
+
   const uint32_t heap = ESP.getFreeHeap();
   const uint32_t block = ESP.getMaxAllocHeap();
   if (heap < TLS_HEAP_FLOOR || block < TLS_BLOCK_FLOOR) {
@@ -1076,7 +1108,7 @@ void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
       const uint8_t *m = info.wifi_ap_staconnected.mac;
       apClients = WiFi.softAPgetStationNum();
       status_led_blip(2);
-      Serial.printf("[ap] joined %s (aid %u, %u client%s)\n",
+      LOGF("[ap] joined %s (aid %u, %u client%s)\n",
                     macString(m).c_str(), info.wifi_ap_staconnected.aid,
                     apClients, apClients == 1 ? "" : "s");
       break;
@@ -1084,7 +1116,7 @@ void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
     case ARDUINO_EVENT_WIFI_AP_STADISCONNECTED: {
       const uint8_t *m = info.wifi_ap_stadisconnected.mac;
       apClients = WiFi.softAPgetStationNum();
-      Serial.printf("[ap] left %s (reason %u, %u client%s)\n",
+      LOGF("[ap] left %s (reason %u, %u client%s)\n",
                     macString(m).c_str(), info.wifi_ap_stadisconnected.reason,
                     apClients, apClients == 1 ? "" : "s");
       break;
@@ -1094,26 +1126,26 @@ void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
     // the credentials being wrong; AUTH_FAIL (202) / 4WAY_HANDSHAKE_TIMEOUT
     // (15) means they are.
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.printf("[sta] associated with %s on channel %u\n",
+      LOGF("[sta] associated with %s on channel %u\n",
                     settings.ssid.c_str(),
                     info.wifi_sta_connected.channel);
       break;
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
       const uint8_t reason = info.wifi_sta_disconnected.reason;
-      Serial.printf("[sta] disconnected: %s (%u)\n",
+      LOGF("[sta] disconnected: %s (%u)\n",
                     WiFi.disconnectReasonName((wifi_err_reason_t)reason),
                     reason);
       break;
     }
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-      Serial.printf("[sta] address %s\n",
+      LOGF("[sta] address %s\n",
                     IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
       break;
     case ARDUINO_EVENT_WIFI_STA_LOST_IP:
-      Serial.println("[sta] lost the DHCP lease");
+      LOGLN("[sta] lost the DHCP lease");
       break;
     case ARDUINO_EVENT_WIFI_AP_STAIPASSIGNED:
-      Serial.printf("[ap] lease %s\n",
+      LOGF("[ap] lease %s\n",
                     IPAddress(info.wifi_ap_staipassigned.ip.addr).toString().c_str());
       break;
     default:
@@ -1161,7 +1193,7 @@ void startAccessPoint() {
   apRunning = WiFi.softAP(apName.c_str(), settings.apPassword.c_str(), 1, 0, 4);
 
   if (!apRunning) {
-    Serial.printf("[web] setup AP failed to start (heap %u)\n",
+    LOGF("[web] setup AP failed to start (heap %u)\n",
                   (unsigned)ESP.getFreeHeap());
     return;
   }
@@ -1181,7 +1213,7 @@ void startAccessPoint() {
                       WiFi.softAPIP().toString();
   ui_show_system_status(UI_STATUS_NETWORK, "Setup Wi-Fi", oled.c_str(), -1,
                         12000);
-  Serial.printf("[web] setup AP: %s / %s -> http://%s (ch %d, heap %u)\n",
+  LOGF("[web] setup AP: %s / %s -> http://%s (ch %d, heap %u)\n",
                 apName.c_str(), settings.apPassword.c_str(),
                 WiFi.softAPIP().toString().c_str(), WiFi.channel(),
                 (unsigned)ESP.getFreeHeap());
@@ -1201,7 +1233,7 @@ void stopAccessPoint(const char *why) {
   apClients = 0;
   WiFi.softAPdisconnect(true);
   WiFi.mode(WIFI_STA);
-  Serial.printf("[web] setup AP stopped (%s)\n", why);
+  LOGF("[web] setup AP stopped (%s)\n", why);
 }
 
 // Periodic, deliberate station retry while the setup AP is serving. Auto
@@ -1265,9 +1297,24 @@ void serviceStartupUpdateCheck() {
     return;
   }
 
+  /*
+   * Wait for the radio, rather than racing it.
+   *
+   * Autostart fires twelve seconds after the station gets an address, and SNTP
+   * usually lands somewhere near the same moment -- so without this the boot
+   * update check and the first stream reach for the same forty kilobytes
+   * together. Neither is urgent; the check is retried on the next boot and by
+   * the dashboard's own button.
+   */
+  if (net_radio_running()) {
+    RadioStatus r;
+    net_radio_snapshot(&r);
+    if (r.state != RADIO_IDLE && r.state != RADIO_ERROR) return;
+  }
+
   startupCheckDone = true;
   startupCheckHadClock = synced;
-  Serial.printf("[ota] startup update check (clock %s)\n",
+  LOGF("[ota] startup update check (clock %s)\n",
                 soft_clock_source_name());
   startGithubJob(false);
 }
@@ -1458,6 +1505,16 @@ void handleStatus() {
    * sound is being shaped, and when the next alarm is. Their editable settings
    * stay on /api/settings.
    */
+  /*
+   * Only what the Overview draws.
+   *
+   * This document is fetched every two seconds for as long as anybody has the
+   * dashboard open, and every field in it is built into a JsonDocument and then
+   * serialised into a String -- so a field with no reader is not free, it is
+   * heap churn thirty times a minute. The Sound, Home Assistant and Graphs
+   * pages each fetch their own endpoint when they are open, and the full radio
+   * detail lives in /api/radio for the same reason.
+   */
   JsonObject radio = doc["radio"].to<JsonObject>();
   radio["available"] = net_radio_running();
   radio["modeHasWifi"] = radio_mode_has_wifi(radioMode);
@@ -1465,43 +1522,13 @@ void handleStatus() {
     RadioStatus r;
     net_radio_snapshot(&r);
     radio["state"] = net_radio_state_name(r.state);
-    radio["station"] = r.station;
     radio["name"] = r.name;
     radio["title"] = r.title;
-    radio["genre"] = r.genre;
-    radio["url"] = r.url;
     radio["bitrate"] = r.bitrate;
-    radio["sampleRate"] = r.sampleRate;
-    radio["channels"] = r.channels;
     radio["codec"] = r.codec;
     radio["buffer"] = r.bufferPercent;
-    radio["underruns"] = r.underruns;
-    radio["reconnects"] = r.reconnects;
-    radio["bytes"] = r.bytes;
-    radio["volume"] = net_radio_volume();
-    radio["stations"] = net_radio_station_count();
     if (r.error[0]) radio["error"] = r.error;
-    if (r.state == RADIO_PLAYING && r.playingSince) {
-      radio["playingForSeconds"] = (millis() - r.playingSince) / 1000;
-    }
   }
-
-  EqConfig eq;
-  audio_eq_get(&eq);
-  JsonObject sound = doc["sound"].to<JsonObject>();
-  sound["eqEnabled"] = eq.enabled;
-  sound["eqPreset"] = eq.preset;
-  sound["eqPresetName"] = audio_eq_preset_name(eq.preset);
-  sound["eqActive"] = audio_eq_active();
-  // In DFPlayer mode the module does the tone shaping, so the dashboard shows
-  // the hardware preset the chosen curve maps to rather than five sliders that
-  // are not in the sample path.
-  sound["eqInHardware"] = radio_mode_has_dfplayer(radioMode) && df_player_running();
-  sound["headroomDb"] = serialized(String(audio_eq_headroom_db(), 1));
-  VoiceConfig voice;
-  voice_get(&voice);
-  sound["voice"] = voice.enabled;
-  sound["voiceBusy"] = voice_busy();
 
   AlarmStatus alarm;
   alarm_status(&alarm);
@@ -1509,31 +1536,12 @@ void handleStatus() {
   al["state"] = alarm.state == ALARM_RINGING    ? "ringing"
                 : alarm.state == ALARM_SNOOZED  ? "snoozed"
                                                 : "idle";
-  al["count"] = alarm_count();
   al["next"] = alarm.next;
   al["nextInSeconds"] = alarm.nextInSecs;
   al["snoozeLeftSeconds"] = alarm.snoozeLeftSecs;
-  al["ringingForSeconds"] = alarm.ringingForSecs;
   al["sleepRunning"] = alarm.sleepRunning;
   al["sleepLeftSeconds"] = alarm.sleepLeftSecs;
   al["sleepTotalSeconds"] = alarm.sleepTotalSecs;
-
-  HaStatus ha;
-  ha_status(&ha);
-  JsonObject mqtt = doc["mqtt"].to<JsonObject>();
-  mqtt["state"] = ha.state == HA_OFF           ? "off"
-                  : ha.state == HA_UNAVAILABLE ? "unavailable"
-                  : ha.state == HA_CONNECTING  ? "connecting"
-                  : ha.state == HA_CONNECTED   ? "connected"
-                                               : "failed";
-  mqtt["published"] = ha.published;
-  mqtt["received"] = ha.received;
-  mqtt["discoveryDone"] = ha.discoveryDone;
-  if (ha.error[0]) mqtt["error"] = ha.error;
-
-  doc["uptimeSeconds"] = telemetry_uptime_seconds();
-  doc["runtimeSeconds"] = telemetry_runtime_seconds();
-  doc["bootCount"] = telemetry_boot_count();
 
   addUpdateJson(doc["update"].to<JsonObject>());
   sendJson(doc);
@@ -2976,7 +2984,7 @@ void handleSettingsRestore() {
       // MBEDTLS_ERR_GCM_AUTH_FAILED is overwhelmingly a typed-it-wrong, and
       // saying so beats a number. It is also the only answer a tampered file
       // gets, which is the point of the tag.
-      Serial.printf("[web] settings restore: secrets did not authenticate (%d)\n",
+      LOGF("[web] settings restore: secrets did not authenticate (%d)\n",
                     rc);
       sendError(400, "The passphrase does not match this backup, or the file "
                      "has been altered. Nothing was changed.");
@@ -3755,59 +3763,117 @@ void handleTelemetry() {
 
   const uint16_t count = telemetry_count();
 
-  JsonDocument doc;
-  doc["ok"] = true;
-  doc["intervalSeconds"] = TELEMETRY_INTERVAL_S;
-  doc["spanSeconds"] = telemetry_span_seconds();
-  doc["count"] = count;
-  doc["uptimeSeconds"] = telemetry_uptime_seconds();
-  doc["runtimeSeconds"] = telemetry_runtime_seconds();
-  doc["bootCount"] = telemetry_boot_count();
+  /*
+   * Written straight to the socket, a column at a time.
+   *
+   * Six arrays of 120 numbers is over seven hundred ArduinoJson slots, and
+   * serialising that into a String doubles it again while the String grows --
+   * a transient spike of tens of kilobytes on the same heap the firmware
+   * updater needs a contiguous 34 kB block from. This is the one endpoint big
+   * enough for that to matter, so it is the one endpoint that does not build a
+   * document: a fixed scratch buffer, chunked transfer encoding, and a few
+   * hundred bytes of peak.
+   */
+  char buf[96];
+  server.sendHeader("Cache-Control", "no-store");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "application/json", "");
 
-  JsonArray volts = doc["volts"].to<JsonArray>();
-  JsonArray percent = doc["percent"].to<JsonArray>();
-  JsonArray temp = doc["temperature"].to<JsonArray>();
-  JsonArray heap = doc["heap"].to<JsonArray>();
-  JsonArray rssi = doc["rssi"].to<JsonArray>();
-  JsonArray flags = doc["flags"].to<JsonArray>();
+  snprintf(buf, sizeof(buf),
+           "{\"ok\":true,\"intervalSeconds\":%u,\"spanSeconds\":%lu,\"count\":%u,",
+           (unsigned)TELEMETRY_INTERVAL_S, (unsigned long)telemetry_span_seconds(),
+           (unsigned)count);
+  server.sendContent(buf);
+  snprintf(buf, sizeof(buf),
+           "\"uptimeSeconds\":%lu,\"runtimeSeconds\":%lu,\"bootCount\":%lu,",
+           (unsigned long)telemetry_uptime_seconds(),
+           (unsigned long)telemetry_runtime_seconds(),
+           (unsigned long)telemetry_boot_count());
+  server.sendContent(buf);
 
-  for (uint16_t i = 0; i < count; i++) {
-    TelemetrySample sample;
-    if (!telemetry_at(i, &sample)) break;
-    if (sample.millivolts) {
-      volts.add(serialized(String(sample.millivolts / 1000.0f, 3)));
-      percent.add(sample.percent);
-    } else {
-      volts.add(nullptr);
-      percent.add(nullptr);
+  /*
+   * One pass per column rather than one pass building six arrays at once. The
+   * ring is read six times, which costs nothing, and in exchange only one
+   * column is ever being formatted.
+   *
+   * A null means "no reading", which is not the same as zero and is what stops
+   * the dashboard drawing a cliff at the point the battery gauge was switched
+   * on.
+   */
+  static const char *const COLUMNS[] = {"volts",       "percent", "temperature",
+                                        "heap",        "rssi",    "flags"};
+  for (uint8_t column = 0; column < 6; column++) {
+    snprintf(buf, sizeof(buf), "\"%s\":[", COLUMNS[column]);
+    server.sendContent(buf);
+    for (uint16_t i = 0; i < count; i++) {
+      TelemetrySample sample;
+      if (!telemetry_at(i, &sample)) break;
+      const char *sep = i ? "," : "";
+      switch (column) {
+        case 0:
+          if (sample.millivolts) {
+            snprintf(buf, sizeof(buf), "%s%u.%03u", sep, sample.millivolts / 1000,
+                     sample.millivolts % 1000);
+          } else {
+            snprintf(buf, sizeof(buf), "%snull", sep);
+          }
+          break;
+        case 1:
+          if (sample.millivolts) snprintf(buf, sizeof(buf), "%s%u", sep, sample.percent);
+          else snprintf(buf, sizeof(buf), "%snull", sep);
+          break;
+        case 2:
+          if (sample.deciCelsius != INT16_MIN) {
+            // The sign is carried separately: -0.5 C has an integer part of
+            // zero, and "%d.%d" would print it as 0.5.
+            const int16_t t = sample.deciCelsius;
+            snprintf(buf, sizeof(buf), "%s%s%d.%d", sep, t < 0 ? "-" : "",
+                     abs(t / 10), abs(t % 10));
+          } else {
+            snprintf(buf, sizeof(buf), "%snull", sep);
+          }
+          break;
+        case 3:
+          snprintf(buf, sizeof(buf), "%s%u", sep, sample.heapKb);
+          break;
+        case 4:
+          if (sample.rssi) snprintf(buf, sizeof(buf), "%s%d", sep, (int)sample.rssi);
+          else snprintf(buf, sizeof(buf), "%snull", sep);
+          break;
+        default:
+          snprintf(buf, sizeof(buf), "%s%u", sep, sample.flags);
+          break;
+      }
+      server.sendContent(buf);
     }
-    if (sample.deciCelsius != INT16_MIN) {
-      temp.add(serialized(String(sample.deciCelsius / 10.0f, 1)));
-    } else {
-      temp.add(nullptr);
-    }
-    heap.add(sample.heapKb);
-    if (sample.rssi) rssi.add(sample.rssi);
-    else rssi.add(nullptr);
-    flags.add(sample.flags);
+    server.sendContent("],");
   }
 
   TelemetrySample now;
   telemetry_now(&now);
-  JsonObject live = doc["now"].to<JsonObject>();
+  server.sendContent("\"now\":{");
   if (now.millivolts) {
-    live["volts"] = serialized(String(now.millivolts / 1000.0f, 3));
-    live["percent"] = now.percent;
+    snprintf(buf, sizeof(buf), "\"volts\":%u.%03u,\"percent\":%u,",
+             now.millivolts / 1000, now.millivolts % 1000, (unsigned)now.percent);
+    server.sendContent(buf);
   }
   if (now.deciCelsius != INT16_MIN) {
-    live["temperature"] = serialized(String(now.deciCelsius / 10.0f, 1));
+    snprintf(buf, sizeof(buf), "\"temperature\":%s%d.%d,",
+             now.deciCelsius < 0 ? "-" : "", abs(now.deciCelsius / 10),
+             abs(now.deciCelsius % 10));
+    server.sendContent(buf);
   }
-  live["heap"] = now.heapKb;
-  live["heapLow"] = ESP.getMinFreeHeap() / 1024;
-  live["largestBlock"] = ESP.getMaxAllocHeap() / 1024;
-  if (now.rssi) live["rssi"] = now.rssi;
-  live["charging"] = (now.flags & TELEMETRY_CHARGING) != 0;
-  sendJson(doc);
+  if (now.rssi) {
+    snprintf(buf, sizeof(buf), "\"rssi\":%d,", (int)now.rssi);
+    server.sendContent(buf);
+  }
+  snprintf(buf, sizeof(buf),
+           "\"heap\":%u,\"heapLow\":%u,\"largestBlock\":%u,\"charging\":%s}}",
+           (unsigned)now.heapKb, (unsigned)(ESP.getMinFreeHeap() / 1024),
+           (unsigned)(ESP.getMaxAllocHeap() / 1024),
+           (now.flags & TELEMETRY_CHARGING) ? "true" : "false");
+  server.sendContent(buf);
+  server.sendContent("");  // ends the chunked response
 }
 
 // --------------------------------------------------------------- MQTT ------
@@ -4115,7 +4181,7 @@ void factoryReset() {
   // on the next boot.
   prefs.end();
   const esp_err_t err = nvs_flash_erase();
-  Serial.printf("[web] factory reset: settings cleared, nvs erase %s\n",
+  LOGF("[web] factory reset: settings cleared, nvs erase %s\n",
                 esp_err_to_name(err));
 }
 
@@ -4200,7 +4266,7 @@ void handleSystem() {
 void startResponder() {
   MDNS.end();
   if (!MDNS.begin(settings.hostname.c_str())) {
-    Serial.println("[web] mDNS responder failed to start");
+    LOGLN("[web] mDNS responder failed to start");
     return;
   }
   MDNS.addService("http", "tcp", 80);
@@ -4293,7 +4359,7 @@ void management_switch_mode(RadioMode mode) {
   // Asking for a mode is a fresh start: it gets its full allowance of attempts
   // even if the last thing in that slot fell over.
   prefs.putUChar("bootFail", 0);
-  Serial.printf("[mode] switching to %s mode\n", management_mode_name(mode));
+  LOGF("[mode] switching to %s mode\n", management_mode_name(mode));
   char title[24];
   snprintf(title, sizeof(title), "%s mode", management_mode_name(mode));
   ui_show_system_status(UI_STATUS_RESTART, title, "Restarting", -1, 0);
@@ -4310,6 +4376,8 @@ void management_factory_reset() {
 }
 
 void management_set_bt_active(bool active) { btActive = active; }
+
+bool management_update_busy() { return updateSnapshot().busy; }
 
 bool management_media_action(const char *action, int value) {
   if (!action || !action[0]) return false;
@@ -4448,7 +4516,7 @@ bool management_led_state(StatusLedState *out) {
 /// the largest single thing spending from the heap every other stage is drawing
 /// on, and one figure at the end cannot say what went where.
 static void heapMark(const char *stage) {
-  Serial.printf("[heap] %-18s %6u free, %6u largest\n", stage,
+  LOGF("[heap] %-18s %6u free, %6u largest\n", stage,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
@@ -4464,7 +4532,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   if (radioMode == RADIO_MODE_MANAGEMENT) {
     if (bootStrikes) prefs.putUChar("bootFail", 0);
   } else if (bootStrikes >= BOOT_STRIKES_MAX) {
-    Serial.printf("[mode] %s mode failed to stay up %u times in a row. Falling "
+    LOGF("[mode] %s mode failed to stay up %u times in a row. Falling "
                   "back to Wi-Fi mode so the dashboard is reachable; pick a "
                   "mode again from there once you know why.\n",
                   management_mode_name(radioMode), (unsigned)bootStrikes);
@@ -4506,7 +4574,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     // Not one Wi-Fi call. Leaving the driver uninitialised is the point: the
     // antenna, the coexistence scheduler and ~50 KB of heap all stay with the
     // Bluetooth stack. main.cpp starts the sink.
-    Serial.println("[mode] Bluetooth mode: Wi-Fi is off. Hold BOOT to switch.");
+    LOGLN("[mode] Bluetooth mode: Wi-Fi is off. Hold BOOT to switch.");
     return;
   }
 
@@ -4524,10 +4592,10 @@ void management_begin(BluetoothA2DPSink &a2dp) {
      * up and because a card that takes a second to mount should not hold up the
      * network bring-up.
      */
-    Serial.println("[mode] DFPlayer mode: audio comes from the DFPlayer Mini "
+    LOGLN("[mode] DFPlayer mode: audio comes from the DFPlayer Mini "
                    "over serial. Both Bluetooth radios are off.");
   } else {
-    Serial.println("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
+    LOGLN("[mode] Wi-Fi mode: Bluetooth is off. Hold BOOT to switch.");
   }
 
   /*
@@ -4549,7 +4617,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   {
     const uint32_t heapBefore = ESP.getFreeHeap();
     const esp_err_t released = esp_bt_mem_release(ESP_BT_MODE_BTDM);
-    Serial.printf("[mode] bluetooth memory released: %s (heap %u -> %u)\n",
+    LOGF("[mode] bluetooth memory released: %s (heap %u -> %u)\n",
                   esp_err_to_name(released), (unsigned)heapBefore,
                   (unsigned)ESP.getFreeHeap());
   }
@@ -4576,7 +4644,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     wifiStartedAt = millis();
     ui_show_system_status(UI_STATUS_NETWORK, "Connecting Wi-Fi",
                           settings.ssid.c_str(), -1, 0);
-    Serial.printf("[web] connecting Wi-Fi: %s\n", settings.ssid.c_str());
+    LOGF("[web] connecting Wi-Fi: %s\n", settings.ssid.c_str());
     heapMark("wifi station");
   } else {
     startAccessPoint();
@@ -4589,7 +4657,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   // management_loop() once the station is up rather than blocking here on a
   // broker that may not exist.
   ha_begin();
-  Serial.println("[web] dashboard login: admin (change the default password)");
+  LOGLN("[web] dashboard login: admin (change the default password)");
 }
 
 void management_loop() {
@@ -4598,7 +4666,7 @@ void management_loop() {
   if (bootStrikePending && millis() > BOOT_STABLE_MS) {
     bootStrikePending = false;
     prefs.putUChar("bootFail", 0);
-    Serial.printf("[mode] %s mode is stable\n", management_mode_name(radioMode));
+    LOGF("[mode] %s mode is stable\n", management_mode_name(radioMode));
   }
 
   // Before the mode check for the same reason the strike above is: the console
@@ -4635,7 +4703,7 @@ void management_loop() {
     ui_show_system_status(UI_STATUS_NETWORK, "Dashboard ready", ip.c_str(), -1,
                           6000);
     voice_say(VOICE_WIFI_CONNECTED, VOICE_CAT_CONNECTION);
-    Serial.printf("[web] dashboard: http://%s/ or http://%s.local/\n",
+    LOGF("[web] dashboard: http://%s/ or http://%s.local/\n",
                   ip.c_str(), settings.hostname.c_str());
   } else if (WiFi.status() != WL_CONNECTED && announcedIp) {
     announcedIp = false;

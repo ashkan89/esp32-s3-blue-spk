@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "telemetry.h"
 
 #include <Arduino.h>
@@ -101,7 +102,7 @@ bool telemetry_begin() {
   lastUptimeMs = millis();
   ring = (TelemetrySample *)calloc(TELEMETRY_SAMPLES, sizeof(TelemetrySample));
   if (!ring) {
-    Serial.println("[telemetry] no room for the history ring; the dashboard "
+    LOGLN("[telemetry] no room for the history ring; the dashboard "
                    "graphs will be empty this boot");
     return false;
   }
@@ -174,22 +175,22 @@ bool telemetry_command(const char *line) {
 
   TelemetrySample now;
   telemetry_now(&now);
-  Serial.printf("[telemetry] uptime %lu h %lu m | total runtime %lu h over %lu boots\n",
+  LOGF("[telemetry] uptime %lu h %lu m | total runtime %lu h over %lu boots\n",
                 (unsigned long)(telemetry_uptime_seconds() / 3600),
                 (unsigned long)((telemetry_uptime_seconds() % 3600) / 60),
                 (unsigned long)(telemetry_runtime_seconds() / 3600),
                 (unsigned long)telemetry_boot_count());
-  Serial.printf("[telemetry] now: ");
-  if (now.millivolts) Serial.printf("%u.%03u V %u%% ", now.millivolts / 1000,
+  LOGF("[telemetry] now: ");
+  if (now.millivolts) LOGF("%u.%03u V %u%% ", now.millivolts / 1000,
                                     now.millivolts % 1000, (unsigned)now.percent);
-  else Serial.print("no battery ");
-  if (now.deciCelsius != INT16_MIN) Serial.printf("| %.1f C ", now.deciCelsius / 10.0f);
-  Serial.printf("| heap %u kB", (unsigned)now.heapKb);
-  if (now.rssi) Serial.printf(" | rssi %d dBm", (int)now.rssi);
-  Serial.println();
+  else LOGP("no battery ");
+  if (now.deciCelsius != INT16_MIN) LOGF("| %.1f C ", now.deciCelsius / 10.0f);
+  LOGF("| heap %u kB", (unsigned)now.heapKb);
+  if (now.rssi) LOGF(" | rssi %d dBm", (int)now.rssi);
+  LOGLN();
 
   if (!ring || !ringCount) {
-    Serial.println("[telemetry] no history yet");
+    LOGLN("[telemetry] no history yet");
     return true;
   }
 
@@ -237,7 +238,7 @@ bool telemetry_command(const char *line) {
 
   for (uint8_t s = 0; s < 3; s++) {
     if (!series[s].any) continue;
-    Serial.printf("  %-11s ", series[s].name);
+    LOGF("  %-11s ", series[s].name);
     const long span = series[s].hi - series[s].lo;
     for (uint16_t i = 0; i < width; i++) {
       const TelemetrySample &sample = ring[(start + i) % TELEMETRY_SAMPLES];
@@ -253,15 +254,15 @@ bool telemetry_command(const char *line) {
         value = sample.heapKb;
       }
       if (!have) {
-        Serial.print(' ');
+        LOGP(' ');
         continue;
       }
       const int level = span > 0 ? (int)((value - series[s].lo) * 9 / span) : 4;
-      Serial.print(BLOCKS[level + 1 > 9 ? 9 : level + 1]);
+      LOGP(BLOCKS[level + 1 > 9 ? 9 : level + 1]);
     }
-    Serial.printf("  %ld..%ld\n", series[s].lo, series[s].hi);
+    LOGF("  %ld..%ld\n", series[s].lo, series[s].hi);
   }
-  Serial.printf("  %u samples, %lu s apart, oldest on the left\n",
+  LOGF("  %u samples, %lu s apart, oldest on the left\n",
                 (unsigned)width, (unsigned long)TELEMETRY_INTERVAL_S);
   return true;
 }

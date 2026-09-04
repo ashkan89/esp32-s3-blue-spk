@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "home_assistant.h"
 
 #include <Arduino.h>
@@ -414,7 +415,7 @@ bool serviceDiscovery() {
   }
   if (discoveryCursor >= discoveryTotal()) {
     status.discoveryDone = true;
-    Serial.printf("[mqtt] published %u discovery documents\n",
+    LOGF("[mqtt] published %u discovery documents\n",
                   (unsigned)discoveryTotal());
     return false;
   }
@@ -550,7 +551,7 @@ bool connectBroker() {
 
   if (!ok) {
     setError(HA_FAILED, brokerError(mqtt.state()));
-    Serial.printf("[mqtt] %s (%d)\n", status.error, mqtt.state());
+    LOGF("[mqtt] %s (%d)\n", status.error, mqtt.state());
     return false;
   }
 
@@ -567,7 +568,7 @@ bool connectBroker() {
 
   discoveryCursor = 0;
   status.discoveryDone = false;
-  Serial.printf("[mqtt] connected to %s:%u as %s\n", config.host,
+  LOGF("[mqtt] connected to %s:%u as %s\n", config.host,
                 (unsigned)config.port, clientId);
   return true;
 }
@@ -695,13 +696,13 @@ bool ha_command(const char *line) {
                      : s.state == HA_CONNECTING  ? "connecting"
                      : s.state == HA_CONNECTED   ? "connected"
                                                  : "failed";
-  Serial.printf("[mqtt] %s", name);
+  LOGF("[mqtt] %s", name);
   if (config.enabled) {
-    Serial.printf(" | %s:%u | topic %s", config.host[0] ? config.host : "(no broker)",
+    LOGF(" | %s:%u | topic %s", config.host[0] ? config.host : "(no broker)",
                   (unsigned)config.port, config.baseTopic);
   }
-  if (s.error[0]) Serial.printf(" | %s", s.error);
-  Serial.printf(" | %lu published, %lu commands, %lu connects%s\n",
+  if (s.error[0]) LOGF(" | %s", s.error);
+  LOGF(" | %lu published, %lu commands, %lu connects%s\n",
                 (unsigned long)s.published, (unsigned long)s.received,
                 (unsigned long)s.connects,
                 s.discoveryDone ? ", discovery sent" : "");

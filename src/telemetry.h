@@ -11,10 +11,10 @@
  * particular is the number that turns a mysterious reboot into a diagnosis, and
  * it is only ever diagnostic as a slope.
  *
- * What it costs. One sample every thirty seconds into a fixed ring of 240,
- * which is two hours and about 2.4 kB of RAM that is allocated once at boot and
- * never grows. Taking a sample is four reads of values other modules are
- * already keeping, so there is nothing to switch off in a release build. The
+ * What it costs. One sample a minute into a fixed ring of 120, which is two
+ * hours and about 1.4 kB of RAM that is allocated once at boot and never grows.
+ * Taking a sample is four reads of values other modules are already keeping, so
+ * there is nothing to switch off in a release build. The
  * ring is in RAM and not in flash on purpose: this is for looking at a running
  * speaker, and writing a sample to NVS every thirty seconds would wear the
  * chip out inside a year for a history nobody reads after a reboot.
@@ -35,13 +35,15 @@
 #include <stdint.h>
 
 /// How many samples the ring holds.
-static const uint16_t TELEMETRY_SAMPLES = 240;
+static const uint16_t TELEMETRY_SAMPLES = 120;
 
-/// Seconds between samples. Thirty gives two hours of history, which is the
+/// Seconds between samples. A minute apart, 120 of them, is two hours -- the
 /// span over which a battery discharge curve and a heap leak both become
-/// visible; a finer interval buys detail nobody is looking for and a coarser
-/// one loses the shape of a charge cycle.
-static const uint16_t TELEMETRY_INTERVAL_S = 30;
+/// visible. It used to be 240 samples thirty seconds apart, which is the same
+/// two hours at twice the resolution, twice the RAM and twice the JSON; on a
+/// 128x64 graph the extra points were not drawable and on this chip they were
+/// not free.
+static const uint16_t TELEMETRY_INTERVAL_S = 60;
 
 /*
  * One sample.

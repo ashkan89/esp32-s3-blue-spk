@@ -62,7 +62,7 @@ static const char DASHBOARD_HTML[] PROGMEM = R"DASH(
 <div class="field" style="margin-top:16px;margin-bottom:0"><label>Volume <span id="radioVolText">&mdash;</span></label><input type="range" id="radioVolume" min="0" max="127" value="90"></div>
 <label class="switch" style="margin-top:14px"><span><b>Start playing at boot</b><small class="hint" style="display:block">The speaker resumes the last station after a power cut. Set automatically whenever you press play.</small></span><input type="checkbox" id="radioAutostart"></label>
 </article>
-<article class="card panel"><h3>Play an address</h3><p>For trying a station before you keep it. It has to be the stream itself &mdash; a <code>.mp3</code>, <code>.aac</code> or Icecast mount point &mdash; not the page you found it on.</p><div class="row"><input class="input" id="radioUrl" placeholder="http://ice1.somafm.com/groovesalad-128-mp3"><button class="btn primary" id="radioPlayUrl">Play</button></div><span class="hint">MP3 and AAC only. Ogg and Opus have no decoder that fits in the memory this chip has left once Wi-Fi has taken its share.</span></article>
+<article class="card panel"><h3>Play an address</h3><p>For trying a station before you keep it. It has to be the stream itself &mdash; a <code>.mp3</code>, <code>.aac</code> or Icecast mount point &mdash; not the page you found it on.</p><div class="row"><input class="input" id="radioUrl" placeholder="http://ice1.somafm.com/groovesalad-128-mp3"><button class="btn primary" id="radioPlayUrl">Play</button></div><span class="hint">MP3 and AAC only &mdash; Ogg and Opus have no decoder that fits in the memory this chip has left once Wi-Fi has taken its share. <b>Prefer <code>http://</code> over <code>https://</code></b>: TLS needs about 45&nbsp;kB more than this board has spare while the dashboard is up, and most stations serve both.</span></article>
 </div>
 <div class="stack"><article class="card panel"><h3>Favourites</h3><p>Up to twelve. The first one is what an alarm set to &ldquo;radio&rdquo; plays unless you pick another.</p><div class="rowlist" id="radioList"></div><span class="hint" id="radioListEmpty" style="display:none">No stations yet. Add one below.</span>
 <h3 style="margin-top:24px" id="radioEditTitle">Add a station</h3><div class="field"><label>Name</label><input class="input" id="radioName" maxlength="39" placeholder="SomaFM Groove Salad"></div><div class="field"><label>Stream address</label><input class="input" id="radioEditUrl" maxlength="159" placeholder="http://&hellip;"></div><div class="row wrap"><button class="btn primary" id="radioSave">Save station</button><button class="btn ghost" id="radioCancel" style="display:none">Cancel</button></div></article></div></div></section>
@@ -889,7 +889,7 @@ addEventListener('resize',()=>{
    every two seconds would have the speaker building 4 kB of JSON continuously
    for a picture that changes once every thirty seconds.
 */
-let graphTick=0;
+let pageTick=0;
 function refreshActivePage(s){
   if($('#page-sound').classList.contains('active')){
     /* The transport on the Sound page mirrors the Overview's, and both are
@@ -904,10 +904,16 @@ function refreshActivePage(s){
       if(typeof v==='number'){$('#soundVolume').value=v;$('#soundVolumeText').textContent=`${Math.round(v/1.27)}%`}
     }
   }
+  /* The page you are looking at, and only that page. The Radio and Alarms
+     documents are small and carry numbers that move by the second -- a buffer
+     level, a countdown -- so they keep the two-second cadence. The broker's
+     connection statistics do not move like that, and two hours of history moves
+     once a minute, so both are fetched far more slowly. */
   if($('#page-radio').classList.contains('active'))loadRadio();
   if($('#page-alarms').classList.contains('active'))loadAlarms();
-  if($('#page-hass').classList.contains('active'))loadMqtt();
-  if($('#page-graphs').classList.contains('active')&&(graphTick++%15)===0)loadGraphs();
+  if($('#page-hass').classList.contains('active')&&(pageTick%5)===0)loadMqtt();
+  if($('#page-graphs').classList.contains('active')&&(pageTick%30)===0)loadGraphs();
+  pageTick++;
 }
 
 /* --- the radio on the Overview ----------------------------------------- */

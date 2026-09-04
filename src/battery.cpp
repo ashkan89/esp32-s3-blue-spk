@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "battery.h"
 
 #if BATTERY_ENABLED
@@ -236,7 +237,7 @@ bool battery_begin() {
   status.criticalPercent = critPct;
 
   if (PIN_BATTERY_SENSE < 0) {
-    Serial.println("[bat] no sense pin configured; the gauge cannot run");
+    LOGLN("[bat] no sense pin configured; the gauge cannot run");
     return false;
   }
 
@@ -264,7 +265,7 @@ bool battery_begin() {
     */
   configured = true;
   if (!enabled) {
-    Serial.printf("[bat] gauge is off in settings; sense pin %d configured and "
+    LOGF("[bat] gauge is off in settings; sense pin %d configured and "
                   "ready. Enable it under Settings > Battery.\n",
                   PIN_BATTERY_SENSE);
     return false;
@@ -275,12 +276,12 @@ bool battery_begin() {
   BatteryStatus s;
   battery_snapshot(&s);
   if (s.present) {
-    Serial.printf("[bat] gauge on pin %d: %.2f V, %u%% (%s)%s\n",
+    LOGF("[bat] gauge on pin %d: %.2f V, %u%% (%s)%s\n",
                   PIN_BATTERY_SENSE, s.volts, (unsigned)s.percent,
                   battery_state_name(s.state),
                   s.haveChargePins ? "" : ", charger pins not wired");
   } else {
-    Serial.printf("[bat] gauge on pin %d reads %u mV -- below %.2f V at the "
+    LOGF("[bat] gauge on pin %d reads %u mV -- below %.2f V at the "
                   "cell, so no battery is assumed. Check the divider.\n",
                   PIN_BATTERY_SENSE, (unsigned)s.millivoltsAtPin,
                   BATTERY_MIN_PLAUSIBLE_V);
@@ -445,13 +446,13 @@ bool battery_command(const char *line) {
     const float want = atof(arg + 6);
     const float trim = battery_calibration_for(want);
     if (trim <= 0.0f) {
-      Serial.println("[bat] cannot calibrate: no plausible reading on the pin, "
+      LOGLN("[bat] cannot calibrate: no plausible reading on the pin, "
                      "or the target is more than 2x out");
       return true;
     }
     battery_configure(enabled, divider, trim, fullVolts, emptyVolts, cells,
                       lowPct, critPct);
-    Serial.printf("[bat] trim %.4f applied (not saved -- use the dashboard to "
+    LOGF("[bat] trim %.4f applied (not saved -- use the dashboard to "
                   "store it)\n", trim);
     return true;
   }
@@ -459,28 +460,28 @@ bool battery_command(const char *line) {
   BatteryStatus s;
   battery_snapshot(&s);
   if (!s.enabled) {
-    Serial.println("[bat] gauge is off: no sense pin, or disabled in settings");
+    LOGLN("[bat] gauge is off: no sense pin, or disabled in settings");
     return true;
   }
   if (!s.present) {
-    Serial.printf("[bat] no battery: pin reads %u mV (needs >= %.0f mV for a "
+    LOGF("[bat] no battery: pin reads %u mV (needs >= %.0f mV for a "
                   "%.1f V cell through a %.2f:1 divider)\n",
                   (unsigned)s.millivoltsAtPin,
                   BATTERY_MIN_PLAUSIBLE_V / s.divider * 1000.0f,
                   BATTERY_MIN_PLAUSIBLE_V, s.divider);
     return true;
   }
-  Serial.printf("[bat] %u%% | %.3f V", (unsigned)s.percent, s.volts);
-  if (s.cells > 1) Serial.printf(" (%.3f V/cell x%u)", s.cellVolts, s.cells);
-  Serial.printf(" | %s | pin %u mV | divider %.2f trim %.4f | full %.2f/cell "
+  LOGF("[bat] %u%% | %.3f V", (unsigned)s.percent, s.volts);
+  if (s.cells > 1) LOGF(" (%.3f V/cell x%u)", s.cellVolts, s.cells);
+  LOGF(" | %s | pin %u mV | divider %.2f trim %.4f | full %.2f/cell "
                 "empty %.2f/cell | low %u%% crit %u%%",
                 battery_state_name(s.state), (unsigned)s.millivoltsAtPin,
                 s.divider, s.calibration, s.fullVolts, s.emptyVolts,
                 (unsigned)s.lowPercent, (unsigned)s.criticalPercent);
   if (!s.haveChargePins) {
-    Serial.print(" | charger pins not wired: charging cannot be detected");
+    LOGP(" | charger pins not wired: charging cannot be detected");
   }
-  Serial.println();
+  LOGLN();
   return true;
 }
 

@@ -468,6 +468,88 @@ ok    I2S data on a flash pin
 all 21 pin-map cases behaved as specified
 ```
 
+## Development and release builds
+
+Two environments, and the difference is what the firmware is willing to say.
+
+```
+pio run -e esp32dev -t upload      # development: logs, console, diag
+pio run -e release  -t upload      # release: none of the above
+```
+
+**`esp32dev`** is what you flash while you are working on the thing. It narrates
+the boot, names every state change on the UART, offers a console that can drive
+every subsystem by hand, and prints the full `diag` report.
+
+**`release`** removes all three. Not silences — *removes*:
+
+| | Development | Release |
+|---|---|---|
+| Serial log | every event | `LOGF`/`LOGLN` expand to nothing; the format strings never reach the image |
+| Console | 30-odd commands | compiled out, and with it every `*_command()` handler, which loses its only caller |
+| `diag` report | full | `diagnostics.cpp` compiles to nothing |
+| IDF logging | `CORE_DEBUG_LEVEL=1` | `CORE_DEBUG_LEVEL=0` |
+| `assert()` | active | `NDEBUG` |
+| Flash clock | 40 MHz DIO | **80 MHz** DIO |
+| Firmware image | 2,895,728 B | **2,805,392 B** |
+
+You can check the last claim rather than believing it:
+
+```
+grep -ac "screen 0..7" .pio/build/esp32dev/firmware.bin    # 1
+grep -ac "screen 0..7" .pio/build/release/firmware.bin     # 0
+```
+
+The saving is 90 kB of flash and 152 bytes of RAM, which is the honest shape of
+it: the log was never a RAM cost. The reasons to build release are that a
+production unit should not narrate itself to anybody holding a UART adapter, and
+that **the console is an unauthenticated control channel** — mode switches, the
+factory reset, the DFPlayer's entire command set — for anybody who can reach two
+pads on the board. The dashboard behind it has a password. The console did not.
+
+The BOOT button still cycles radio modes and still runs the factory-reset
+countdown with no console at all, so a release unit is never stuck in a mode
+whose dashboard it cannot reach.
+
+**`release-verbose`** is the third environment, for the case that is genuinely
+hard otherwise: a unit that misbehaves only in the field, where you want the
+production timings and the production flash clock but you do want to know what it
+says. Everything from `release`, with the log switched back on.
+
+### The optimisation flags, and the one that is not there
+
+`-O2` is **not** applied to the image, and that was measured rather than assumed.
+Building the whole firmware at `-O2` instead of the platform's `-Os` grows it by
+148 kB — and this chip executes from flash through a 32 kB instruction cache, so
+nearly all of that growth is cold code evicting hot code. It is a plausible
+optimisation that makes things slower.
+
+What is applied:
+
+- **`#pragma GCC optimize("O2")`** at the top of [src/audio_eq.cpp](src/audio_eq.cpp)
+  and [src/voice.cpp](src/voice.cpp), the two translation units that are nothing
+  but per-sample DSP. Cost: **544 bytes**, against 148 kB for doing it globally.
+- **`-fno-math-errno`**, so the float paths emit the FPU instruction and nothing
+  else. Deliberately *not* `-ffast-math`: that implies `-ffinite-math-only`,
+  under which the `isnan()` guard on the temperature sensor folds to false and a
+  broken reading becomes a number.
+- **80 MHz flash clock.** Code runs from flash through the cache, so the SPI
+  clock is a direct multiplier on how fast a cache miss is served. 40 MHz is the
+  platform default because it is what every module is guaranteed to manage;
+  80 MHz is what a WROOM-32D actually has fitted, and it is the largest speed
+  change available here.
+
+  It stays on **DIO**, not QIO. QIO is faster again — four data lines rather than
+  two — but it needs GPIO9/GPIO10 free, and a module that has them wired for
+  something else does not boot at all: no console, no dashboard, nothing to read.
+  On a build whose whole point is that it does not talk, that is the wrong risk
+  to take by default. The line is in `platformio.ini`, commented, if your board
+  is known good.
+
+`-flto` is not used: the Arduino core and IDF arrive precompiled, and link-time
+optimisation across that boundary is a well-known source of silent breakage for
+no measurable gain here.
+
 ## 16 MB flash layout
 
 Three separate settings have to agree before a board actually gets its 16 MB,
@@ -2261,11 +2343,19 @@ the clock takes a full POSIX TZ rule as well as a plain offset; see
 
 ## Graphs
 
-Two hours of history, sampled every thirty seconds into a fixed ring of 240 —
-2.9 kB of heap, allocated once at boot and never grown. The endpoint that serves
-it walks the ring in place rather than copying it, so there is no second buffer:
-both the ring and the web handler run on the Arduino loop task, which is what
-makes that safe. The dashboard's **Graphs** page draws four of them:
+Two hours of history, sampled once a minute into a fixed ring of 120 — 1.4 kB of
+heap, allocated once at boot and never grown.
+
+Two things keep that endpoint cheap, and both were lessons. The handler walks the
+ring in place rather than copying it, so there is no second buffer: the ring and
+the web handler both run on the Arduino loop task, which is what makes that safe.
+And it writes the JSON straight to the socket in chunks instead of building a
+document — six arrays of numbers is several hundred ArduinoJson slots, and
+serialising that into a String doubles it again while the String grows, which is
+a transient spike of tens of kilobytes on the same heap the firmware updater
+needs a contiguous block from.
+
+The dashboard's **Graphs** page draws four of them:
 
 | Series | Why it is worth a line rather than a number |
 |--------|---------------------------------------------|
@@ -2286,13 +2376,62 @@ The dashboard says so next to the graph, and no decision in this firmware is mad
 from it.
 
 The ring is in RAM and not in flash on purpose: this is for looking at a running
-speaker, and writing a sample to NVS every thirty seconds would wear the chip out
+speaker, and writing a sample to NVS every minute would wear the chip out
 inside a year for a history nobody reads after a reboot. Total runtime and the
 boot count *are* persisted, once every ten minutes.
 
 ```
 graph                  the three series as sparklines, with the ranges
 ```
+
+## What all of this costs
+
+This is a chip with 320 kB of DRAM, no PSRAM, and a firmware updater that needs a
+*contiguous* 34 kB block for its TLS handshake. Every feature above was built
+against that, and two of them were built against it twice — the first versions
+took their memory at boot and the visible symptom was **Check for updates**
+failing with "not enough memory for a secure connection" on a speaker that had
+never played a station.
+
+What the whole bundle adds, measured from the linked image:
+
+| | Cost |
+|---|---|
+| Static DRAM, all six modules | ~3 kB |
+| Static DRAM, whole firmware | 84.5 kB → 89.4 kB |
+| IRAM | **zero** — nothing here, nor libhelix, nor PubSubClient, is in IRAM |
+| Heap at boot (Wi-Fi modes) | 3.8 kB — the history ring and the station list |
+| Heap at boot (Bluetooth mode) | 1.4 kB — the history ring only |
+| Flash | +620 kB, of which 355 kB is the recorded speech |
+
+Everything else is claimed when it is used and given back afterwards: the radio's
+22 kB arena and ~30 kB decoder while a stream runs, the 10 kB decoder task from
+the first station played, MQTT's 1.3 kB buffer while the broker is connected.
+
+Three rules came out of getting this wrong the first time, and they are worth
+keeping if you extend it:
+
+- **Nothing large is allocated at boot for a feature that may never be used.** A
+  24 kB buffer taken early does not merely cost 24 kB; it sits in the middle of
+  the heap and splits the largest free block, which is the number the TLS
+  handshake actually depends on.
+- **Nothing large is built in RAM to be sent over HTTP.** `/api/telemetry` is
+  streamed in chunks for exactly this reason.
+- **Nothing goes into `/api/status` that the dashboard does not read.** It is
+  fetched every two seconds for as long as anybody has the page open, so an
+  unread field is heap churn thirty times a minute.
+
+When something does go wrong, these two tell you where:
+
+```
+diag       reset reason, the heap trio (free / lowest ever / largest block),
+           every task's stack high-water mark, what hardware was detected
+station    the decoder task's remaining stack, whether the stream arena is
+           held, and free / largest-block heap
+```
+
+The heap trio's third number is the one that matters for TLS: a heap that is
+100 kB free in 8 kB pieces cannot start a handshake.
 
 ## Home Assistant, over MQTT
 
@@ -2457,6 +2596,72 @@ Other things it might be:
   the phone down.
 - **A whine that changes pitch with activity** is supply noise coupling in — give
   the DAC its own 5 V supply and join the grounds.
+
+## Troubleshooting internet radio
+
+### "Low memory: N free, M block" instead of a station
+
+The radio refuses to start a stream when free heap is below 70 kB or the largest
+contiguous block is below 26 kB, and says so on the Radio page rather than
+trying anyway. Those are not arbitrary: a stream needs the 22 kB arena, a ~30 kB
+decoder and a socket, and the layers underneath allocate too.
+
+It refuses because the alternative is worse. An allocation that fails inside the
+IDF's socket layer does not return an error — `esp_vfs_select()` creates a
+semaphore per call and **asserts** when that fails, which panics the chip. A
+speaker that runs out of heap while opening a stream does not fail to play a
+station, it reboots.
+
+### "The internet radio is using the network" when checking for updates
+
+Deliberate. There is room on this chip for **one** TLS session, not two. A
+handshake against the Mozilla root bundle costs a 16 kB task stack and forty to
+fifty kilobytes of mbedtls context, and an `https://` radio station wants the
+same again.
+
+When they collided, the second one did not get a clean error: mbedtls
+allocation failures surface deep inside lwIP and the IDF socket layer, which
+assert rather than unwind. What that looked like from outside was a panic in the
+timer task with a corrupted heap behind it, on a speaker whose heap had been
+perfectly healthy sixty seconds earlier.
+
+So they take turns. The updater refuses while the radio has a stream open or is
+opening one; the radio waits out its backoff while an update check is running;
+and the boot-time update check waits for the radio to settle rather than racing
+its autostart. Stop the radio, check for updates, start it again.
+
+If you see this, the Graphs page has the numbers behind it: free memory, the
+lowest it has ever been, and the largest free block. Things that make it worse:
+
+- **"Always keep setup hotspot on"** in Settings. Running the access point and
+  the station together costs a second network interface, a DHCP server and
+  beacon buffers — tens of kilobytes, permanently.
+- A firmware update check at the same time; TLS wants its own 34 kB block.
+- Several browser tabs on the dashboard, each polling.
+
+### It rebooted in a loop after I set a station to resume at boot
+
+Fixed, and worth knowing what it was. Three things went wrong together:
+
+1. Pressing play quietly armed "start playing at boot" — a setting with
+   consequences at boot, turned on by a control that said nothing about boot.
+2. Autostart fired from `setup()`, which is the worst moment to ask for 50 kB:
+   the station is still associating, DHCP has not finished, mDNS and the web
+   server have not started, and the setup hotspot has not been torn down yet.
+3. The allocation failed inside the HTTP client and panicked, so the next boot
+   did the same thing.
+
+All three are addressed. Play no longer arms autostart — the switch on the Radio
+page is the only thing that does. Autostart waits until the station has held an
+address for twelve seconds. And an autostart sentinel is written to flash before
+the attempt and cleared once audio is actually flowing, so a boot that finds it
+still set knows the last one did not survive and **disarms autostart instead of
+repeating it**. That is the same pattern the radio-mode sentinel uses, for the
+same reason: a setting the owner can change from a web page must never be able
+to make the web page unreachable.
+
+If you are in a loop on older firmware, flash any build over USB — the ROM
+bootloader is unaffected — and the sentinel clears it on the boot after.
 
 ## Troubleshooting the DFPlayer
 
@@ -2834,6 +3039,7 @@ group — most of the pass criteria below are one line of that report.
 | [scripts/make_voice_clips.py](scripts/make_voice_clips.py) | speaks [scripts/voice_phrases.txt](scripts/voice_phrases.txt) and embeds it as IMA ADPCM — run by hand, not by the build |
 | [src/ui_assets.h](src/ui_assets.h) | hand-drawn XBM icons |
 | [src/pin_check.h](src/pin_check.h) | the whole pin map in one place, asserted at compile time — no code, no flash |
+| [src/app_config.h](src/app_config.h) | the build-time switches — `SERIAL_LOG`, `CONSOLE_ENABLED`, `DIAGNOSTICS_ENABLED` — and the `LOGF`/`LOGLN`/`LOGP` macros every file logs through |
 | [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |
 | [scripts/test_pin_check.py](scripts/test_pin_check.py) | host-side test that the pin assertions actually assert — 21 cases, no board needed |
 | [scripts/test_settings_backup.py](scripts/test_settings_backup.py) | host-side test that the settings backup and restore agree, key by key, and cover every stored preference |

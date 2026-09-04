@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "net_radio.h"
 
 #include <Arduino.h>
@@ -14,6 +15,7 @@
 
 #include "audio_eq.h"
 #include "audio_probe.h"
+#include "management.h"
 #include "df_player.h"
 #include "player_state.h"
 #include "voice.h"
@@ -67,6 +69,66 @@ const uint32_t RECONNECT_MAX_MS = 60000;
 
 /// How long to wait for the reply headers before calling a station unreachable.
 const uint32_t CONNECT_TIMEOUT_MS = 12000;
+
+/*
+ * How much heap a stream needs before it is allowed to try.
+ *
+ * This is not a safety margin, it is a hard lesson. Opening a stream allocates
+ * a socket, a read buffer, the 22 kB arena and a ~30 kB decoder -- and the
+ * layers underneath allocate too, invisibly: esp_vfs_select() creates a
+ * semaphore per call, and when that allocation fails the IDF does not return an
+ * error, it asserts and panics. A firmware that runs out of heap inside the
+ * HTTP client does not fail to play a station, it reboots -- and if the station
+ * was set to resume at boot, it reboots again.
+ *
+ * So the check happens here, where it can be reported, rather than there, where
+ * it is fatal. The numbers are what a connect plus a decoder actually needs
+ * with room for the network stack to breathe underneath it.
+ */
+const uint32_t STREAM_HEAP_FLOOR = 70000;
+const uint32_t STREAM_BLOCK_FLOOR = 26000;
+
+/*
+ * What https costs on top, and why it usually does not fit.
+ *
+ * Measured on this board, for a 128 kbps MP3 stream:
+ *
+ *   ring + socket chunk + decode feed   23 kB   one allocation, this file
+ *   libhelix MP3 state                 ~29 kB   eight allocations, its own
+ *   helix frame + PCM buffers            7 kB
+ *   HTTP, lwIP, socket                  ~8 kB
+ *                                      ------
+ *   plain http                         ~67 kB
+ *   TLS record buffers + handshake     ~45 kB   mbedtls, 16 kB in + 16 kB out
+ *                                      ------
+ *   https                             ~112 kB
+ *
+ * A speaker with the dashboard up has about 108 kB free. The first column fits
+ * with room to spare; the second does not fit at all, and what "does not fit"
+ * looks like from inside mbedtls is an allocation failure that asserts rather
+ * than returns -- so this is checked here, in advance, where it can be a
+ * sentence instead of a panic.
+ *
+ * The 16 kB record buffers are an IDF sdkconfig option, not something the
+ * application can shrink: the Arduino core arrives precompiled.
+ */
+const uint32_t STREAM_TLS_EXTRA = 45000;
+
+/*
+ * The autostart sentinel.
+ *
+ * A station that is set to resume at boot and crashes while connecting is a
+ * speaker that never finishes booting, and the dashboard that could switch it
+ * off is on the other side of the crash. So the attempt is written to flash
+ * before it is made and cleared once the stream is playing; a boot that finds
+ * the flag still set knows the last one did not survive, and disarms autostart
+ * rather than trying again.
+ *
+ * This is the same shape as the radio-mode boot sentinel in management.cpp, and
+ * for exactly the same reason: a setting the owner can change from a web page
+ * must not be able to make the web page unreachable.
+ */
+const char *AUTOSTART_TRY_KEY = "autotry";
 
 /// A stream that has delivered nothing for this long is dead, whatever the
 /// socket believes. Icecast servers routinely leave a half-open connection
@@ -157,12 +219,6 @@ char metaTitle[RADIO_TEXT_MAX];
 char metaName[RADIO_NAME_MAX];
 char metaGenre[RADIO_TEXT_MAX];
 
-// The Mozilla root bundle the IDF links in, the same one the firmware updater
-// trusts. Declared rather than included because it is a linker symbol; see the
-// note in management.cpp for why the whole bundle rather than one pinned root.
-extern const uint8_t rootCaBundleStart[] asm("_binary_x509_crt_bundle_start");
-extern const uint8_t rootCaBundleEnd[] asm("_binary_x509_crt_bundle_end");
-
 void statusLock() {
   if (lock) xSemaphoreTake(lock, portMAX_DELAY);
 }
@@ -234,7 +290,9 @@ void loadStations() {
   autostart = prefs.getBool("auto", false);
 
   const size_t want = sizeof(RadioStation) * RADIO_MAX_STATIONS;
-  const size_t have = prefs.getBytesLength("list");
+  // isKey() first: getBytesLength() on a key that has never been written logs
+  // an error from inside Preferences, and a first boot is not an error.
+  const size_t have = prefs.isKey("list") ? prefs.getBytesLength("list") : 0;
   if (have > 0 && have <= want) {
     prefs.getBytes("list", stations, have);
     stationCount = (uint8_t)prefs.getUChar("count", 0);
@@ -516,7 +574,49 @@ bool wantsAac(const char *contentType, const char *url) {
 void runStream(const char *url, bool *stopped) {
   *stopped = false;
 
+  /*
+   * Not while the updater holds TLS. This is a wait, not a failure -- the
+   * caller's backoff brings us back in a couple of seconds, and by then the
+   * check has finished and given its forty kilobytes back.
+   */
+  if (management_update_busy()) {
+    setState(RADIO_RECONNECTING, "Waiting for the update check to finish");
+    LOGLN("[radio] deferring: the firmware update check has the network");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    return;
+  }
+
+  /*
+   * Refuse before allocating anything, rather than dying inside the HTTP
+   * client. The message carries the actual numbers because "not enough memory"
+   * on its own tells nobody what to do about it.
+   */
   const bool secure = urlIsSecure(url);
+  const uint32_t needed = STREAM_HEAP_FLOOR + (secure ? STREAM_TLS_EXTRA : 0);
+  const uint32_t heap = ESP.getFreeHeap();
+  const uint32_t block = ESP.getMaxAllocHeap();
+  if (heap < needed || block < STREAM_BLOCK_FLOOR) {
+    char why[RADIO_TEXT_MAX];
+    if (secure && heap >= STREAM_HEAP_FLOOR) {
+      // It would have fitted without the encryption, which makes the fix a
+      // one-character edit to the address rather than a lost cause.
+      snprintf(why, sizeof(why), "Not enough memory for https - try http://");
+    } else {
+      snprintf(why, sizeof(why), "Low memory: %u free, %u block", (unsigned)heap,
+               (unsigned)block);
+    }
+    setState(RADIO_ERROR, why);
+    LOGF("[radio] refusing to start a %s stream: %u B free, %u B largest block "
+         "(needs %u / %u)\n", secure ? "https" : "http", (unsigned)heap,
+         (unsigned)block, (unsigned)needed, (unsigned)STREAM_BLOCK_FLOOR);
+    if (secure && heap >= STREAM_HEAP_FLOOR) {
+      LOGLN("[radio] the same station over plain http would fit. TLS needs "
+            "another ~45 kB for its record buffers, and this chip does not "
+            "have it while the dashboard is up.");
+    }
+    return;
+  }
+
   NetworkClientSecure *tls = nullptr;
   ICYStream *stream = new (std::nothrow) ICYStream(READ_CHUNK);
   if (!stream) {
@@ -530,8 +630,21 @@ void runStream(const char *url, bool *stopped) {
       setState(RADIO_ERROR, "Out of memory for the TLS connection");
       return;
     }
-    tls->setCACertBundle(rootCaBundleStart,
-                         (size_t)(rootCaBundleEnd - rootCaBundleStart));
+    /*
+     * No certificate verification for a radio stream, deliberately.
+     *
+     * The firmware updater checks the full Mozilla root bundle and must: it
+     * writes executable code into flash, and a stream that can be substituted
+     * there owns the device. A radio station is public audio, unauthenticated,
+     * that anybody can fetch -- the worst a successful attacker achieves is
+     * that you hear the wrong music. Verifying it costs a chain walk and the
+     * allocations that go with it, at the exact moment this chip has none to
+     * spare.
+     *
+     * That is a real trade and it is worth writing down rather than leaving as
+     * a missing line: this connection is encrypted but not authenticated.
+     */
+    tls->setInsecure();
     stream->setClient(*tls);
   }
 
@@ -669,6 +782,9 @@ void runStream(const char *url, bool *stopped) {
       }
       decoding = true;
       setState(RADIO_PLAYING);
+      // Audio is reaching the DAC, so whatever this boot was going to do to
+      // itself, it did not. Safe to arm autostart again for the next one.
+      if (prefs.isKey(AUTOSTART_TRY_KEY)) prefs.remove(AUTOSTART_TRY_KEY);
       statusLock();
       status.playingSince = millis();
       statusUnlock();
@@ -693,8 +809,19 @@ void runStream(const char *url, bool *stopped) {
     decoder->write(feed, take);
   }
 
+  /*
+   * Order matters, and so does the second delete.
+   *
+   * EncodedAudioStream holds the decoder as a raw pointer and does not own it:
+   * its end() releases libhelix's frame and PCM buffers, but nothing ever frees
+   * the wrapper. Deleting the stream first and the codec second is the only
+   * arrangement in which the buffers are released before the object that owns
+   * them goes away, and it is the difference between a speaker that reconnects
+   * for a week and one that runs out of heap overnight.
+   */
   decoder->end();
-  delete decoder;  // takes the codec with it
+  delete decoder;
+  delete codec;
   stream->end();
   delete stream;
   delete tls;
@@ -785,7 +912,7 @@ bool ensureTask() {
       xTaskCreatePinnedToCore(radioTask, "radio", 10240, nullptr, 2, &task, 1);
   if (ok != pdPASS) {
     task = nullptr;
-    Serial.println("[radio] not enough memory to start the decoder task");
+    LOGLN("[radio] not enough memory to start the decoder task");
     statusLock();
     copyString(status.error, sizeof(status.error),
                "Not enough memory to start the decoder");
@@ -818,7 +945,7 @@ bool net_radio_begin(void *out) {
 
   stations = (RadioStation *)calloc(RADIO_MAX_STATIONS, sizeof(RadioStation));
   if (!stations) {
-    Serial.println("[radio] no room for the station list; internet radio is off "
+    LOGLN("[radio] no room for the station list; internet radio is off "
                    "this boot");
     vSemaphoreDelete(lock);
     lock = nullptr;
@@ -848,13 +975,27 @@ bool net_radio_begin(void *out) {
    * below the network stack, which is the order the audio actually needs.
    */
   running = true;
-  Serial.printf("[radio] ready, %u stations, %u kB buffer when playing\n",
+  LOGF("[radio] ready, %u stations, %u kB buffer when playing\n",
                 (unsigned)stationCount, (unsigned)(STREAM_ARENA / 1024));
 
-  if (autostart && stationCount > 0) {
-    Serial.println("[radio] resuming the last station");
-    net_radio_play_station(0);
+  /*
+   * Did the last boot survive its own autostart?
+   *
+   * If the flag is still set, it did not: the speaker crashed somewhere between
+   * asking for a station and hearing one. Disarm rather than repeat, because
+   * repeating is a boot loop and a boot loop has no dashboard.
+   */
+  if (autostart && prefs.getBool(AUTOSTART_TRY_KEY, false)) {
+    LOGLN("[radio] the last boot did not survive starting a station; autostart "
+          "is now off. Turn it back on from the Radio page once you know why.");
+    prefs.remove(AUTOSTART_TRY_KEY);
+    autostart = false;
+    prefs.putBool("auto", false);
   }
+
+  // Nothing is started here. Autostart is serviced from net_radio_loop() once
+  // the network has settled -- see there for why booting straight into a
+  // stream is the worst possible moment to ask for 50 kB.
   return true;
 }
 
@@ -885,6 +1026,36 @@ void net_radio_snapshot(RadioStatus *out) {
  */
 void net_radio_loop() {
   if (!running) return;
+
+  /*
+   * Autostart, once the speaker has settled.
+   *
+   * Not from net_radio_begin(): at that point the station is still associating,
+   * DHCP has not finished, mDNS and the web server have not started, and the
+   * Wi-Fi driver is at its peak allocation. Asking for a socket, a 22 kB arena
+   * and a 30 kB decoder in the middle of that is asking for the one failure
+   * this chip handles worst -- an allocation that fails inside the IDF, which
+   * asserts rather than returning an error.
+   *
+   * Twelve seconds after the station has an address, everything above has
+   * finished and given its temporary memory back.
+   */
+  static bool autostartDone;
+  static uint32_t onlineSince;
+  if (!autostartDone && autostart && stationCount > 0) {
+    if (WiFi.status() != WL_CONNECTED) {
+      onlineSince = 0;
+    } else {
+      if (!onlineSince) onlineSince = millis() | 1;
+      if ((uint32_t)(millis() - onlineSince) > 12000) {
+        autostartDone = true;
+        // Written before the attempt, cleared when a stream actually plays.
+        prefs.putBool(AUTOSTART_TRY_KEY, true);
+        LOGLN("[radio] resuming the last station");
+        net_radio_play_station(0);
+      }
+    }
+  }
 
   if (volumeDirty && (uint32_t)(millis() - volumeDirtyAt) >= VOLUME_PERSIST_QUIET_MS) {
     volumeDirty = false;
@@ -927,7 +1098,16 @@ bool net_radio_play_station(uint8_t index) {
   // sum in the passive network at the output.
   if (df_player_running()) df_player_pause();
   requestPlay(true, (int8_t)index, stations[index].url, stations[index].name);
-  if (!autostart) net_radio_set_autostart(true);
+  /*
+   * Pressing play does NOT arm autostart.
+   *
+   * It used to, on the reasoning that "what it was doing" is what it should
+   * come back doing. That reasoning is fine and the behaviour was not: one
+   * press quietly turned a setting on that makes every future boot start a
+   * stream, and when that went wrong it went wrong before the dashboard came
+   * up. Resuming at boot is a decision with consequences at boot, so it is a
+   * switch on the Radio page and nothing else sets it.
+   */
   return true;
 }
 
@@ -946,7 +1126,6 @@ bool net_radio_play_url(const char *url, const char *name) {
 void net_radio_stop() {
   if (!running) return;
   requestPlay(false, status.station, status.url, status.name);
-  net_radio_set_autostart(false);
 }
 
 bool net_radio_toggle() {
@@ -958,7 +1137,6 @@ bool net_radio_toggle() {
   }
   if (status.url[0]) {
     requestPlay(true, status.station, status.url, status.name);
-    net_radio_set_autostart(true);
     return true;
   }
   return net_radio_play_station(0);
@@ -1119,25 +1297,25 @@ bool net_radio_command(const char *line) {
   while (*rest == ' ') rest++;
 
   if (!running) {
-    Serial.println("[radio] internet radio is not running in this mode");
+    LOGLN("[radio] internet radio is not running in this mode");
     return true;
   }
 
   if (*rest == 0 || strcmp(rest, "list") == 0) {
     RadioStatus s;
     net_radio_snapshot(&s);
-    Serial.printf("[radio] %s", net_radio_state_name(s.state));
-    if (s.name[0]) Serial.printf(" | %s", s.name);
-    if (s.title[0]) Serial.printf(" | %s", s.title);
-    if (s.bitrate) Serial.printf(" | %u kbps", (unsigned)s.bitrate);
+    LOGF("[radio] %s", net_radio_state_name(s.state));
+    if (s.name[0]) LOGF(" | %s", s.name);
+    if (s.title[0]) LOGF(" | %s", s.title);
+    if (s.bitrate) LOGF(" | %u kbps", (unsigned)s.bitrate);
     if (s.sampleRate) {
-      Serial.printf(" | %s %u Hz %s", s.codec, (unsigned)s.sampleRate,
+      LOGF(" | %s %u Hz %s", s.codec, (unsigned)s.sampleRate,
                     s.channels == 1 ? "mono" : "stereo");
     }
-    Serial.printf(" | buffer %u%%", (unsigned)s.bufferPercent);
-    if (s.underruns) Serial.printf(" | %u underruns", (unsigned)s.underruns);
-    if (s.error[0]) Serial.printf(" | %s", s.error);
-    Serial.printf(" | volume %u", (unsigned)volume127);
+    LOGF(" | buffer %u%%", (unsigned)s.bufferPercent);
+    if (s.underruns) LOGF(" | %u underruns", (unsigned)s.underruns);
+    if (s.error[0]) LOGF(" | %s", s.error);
+    LOGF(" | volume %u", (unsigned)volume127);
     /*
      * The two ways this feature can go wrong on a chip this size, as numbers.
      *
@@ -1149,45 +1327,45 @@ bool net_radio_command(const char *line) {
      * TLS handshake has to work with.
      */
     if (task) {
-      Serial.printf(" | task stack %u B free",
+      LOGF(" | task stack %u B free",
                     (unsigned)(uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t)));
     } else {
-      Serial.print(" | task not started");
+      LOGP(" | task not started");
     }
-    Serial.printf(" | arena %s | heap %u free, %u largest\n",
+    LOGF(" | arena %s | heap %u free, %u largest\n",
                   arena ? "held" : "released", (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getMaxAllocHeap());
     for (uint8_t i = 0; i < stationCount; i++) {
-      Serial.printf("  %u%c %-28s %s\n", (unsigned)(i + 1),
+      LOGF("  %u%c %-28s %s\n", (unsigned)(i + 1),
                     s.station == (int8_t)i ? '*' : '.', stations[i].name,
                     stations[i].url);
     }
-    if (!stationCount) Serial.println("  (no stations stored)");
+    if (!stationCount) LOGLN("  (no stations stored)");
     return true;
   }
   if (strcmp(rest, "stop") == 0) {
     net_radio_stop();
-    Serial.println("[radio] stopped");
+    LOGLN("[radio] stopped");
     return true;
   }
   if (strcmp(rest, "next") == 0 || strcmp(rest, "prev") == 0) {
     if (!net_radio_step_station(rest[0] == 'n')) {
-      Serial.println("[radio] fewer than two stations stored");
+      LOGLN("[radio] fewer than two stations stored");
     }
     return true;
   }
   const int index = atoi(rest);
   if (index >= 1 && index <= stationCount) {
     net_radio_play_station((uint8_t)(index - 1));
-    Serial.printf("[radio] playing %s\n", stations[index - 1].name);
+    LOGF("[radio] playing %s\n", stations[index - 1].name);
     return true;
   }
   if (urlLooksPlayable(rest)) {
     net_radio_play_url(rest, nullptr);
-    Serial.printf("[radio] playing %s\n", rest);
+    LOGF("[radio] playing %s\n", rest);
     return true;
   }
-  Serial.println("[radio] usage: station | station <n> | station <url> | "
+  LOGLN("[radio] usage: station | station <n> | station <url> | "
                  "station stop|next|prev");
   return true;
 }

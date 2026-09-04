@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "df_player.h"
 
 #if DFPLAYER_ENABLED
@@ -852,7 +853,7 @@ bool df_player_begin(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
   statusLock = xSemaphoreCreateMutex();
   commands = xQueueCreate(24, sizeof(Command));
   if (statusLock == nullptr || commands == nullptr) {
-    Serial.println("[df] out of memory: driver not started");
+    LOGLN("[df] out of memory: driver not started");
     return false;
   }
 
@@ -880,14 +881,14 @@ bool df_player_begin(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
   // web server live.
   if (xTaskCreatePinnedToCore(driverTask, "dfplayer", 4096, nullptr, 1, nullptr,
                               0) != pdPASS) {
-    Serial.println("[df] could not start the driver task");
+    LOGLN("[df] could not start the driver task");
     return false;
   }
 
   running = true;
   status.running = true;
   push(Command{OP_STARTUP, 0, 0});
-  Serial.printf("[df] DFPlayer driver up: uart2 rx=%d tx=%d busy=%d, "
+  LOGF("[df] DFPlayer driver up: uart2 rx=%d tx=%d busy=%d, "
                 "source %s, volume %u/%u\n",
                 PIN_DF_RX, PIN_DF_TX, PIN_DF_BUSY, df_source_name(bootSource),
                 (unsigned)bootVolume, (unsigned)DF_VOLUME_MAX);
@@ -1365,7 +1366,7 @@ bool df_player_command(const char *line) {
   while (*arg == ' ') arg++;
 
   if (!running) {
-    Serial.println("[df] the DFPlayer driver is not running in this mode; "
+    LOGLN("[df] the DFPlayer driver is not running in this mode; "
                    "type 'sd' to switch to DFPlayer mode");
     return true;
   }
@@ -1377,31 +1378,31 @@ bool df_player_command(const char *line) {
     // a module that is answering -- exactly the wrong answer in the one place
     // somebody is looking for the truth.
     if (!df_player_snapshot(&s)) {
-      Serial.println("[df] could not read the driver's status (its lock was "
+      LOGLN("[df] could not read the driver's status (its lock was "
                      "busy); try again");
       return true;
     }
-    Serial.printf("[df] %s | %s | source %s",
+    LOGF("[df] %s | %s | source %s",
                   s.asleep    ? "standby"
                   : s.online  ? "online"
                               : "OFFLINE",
                   df_state_name(s.state), df_source_name(s.source));
     if (s.reported != s.source) {
-      Serial.printf(" (module says %s)", df_source_name(s.reported));
+      LOGF(" (module says %s)", df_source_name(s.reported));
     }
-    Serial.printf(" | track %u", (unsigned)s.track);
-    if (s.totalTracks) Serial.printf("/%u", (unsigned)s.totalTracks);
-    if (s.folder) Serial.printf(" | folder %u", (unsigned)s.folder);
-    Serial.printf(" | vol %u/%u | eq %s | loop %s | busy %s", (unsigned)s.volume,
+    LOGF(" | track %u", (unsigned)s.track);
+    if (s.totalTracks) LOGF("/%u", (unsigned)s.totalTracks);
+    if (s.folder) LOGF(" | folder %u", (unsigned)s.folder);
+    LOGF(" | vol %u/%u | eq %s | loop %s | busy %s", (unsigned)s.volume,
                   (unsigned)DF_VOLUME_MAX, df_eq_name(s.eq),
                   df_loop_name(s.loop), s.busy ? "yes" : "no");
-    Serial.printf(" | media%s%s%s%s", s.sdPresent ? " sd" : "",
+    LOGF(" | media%s%s%s%s", s.sdPresent ? " sd" : "",
                   s.usbPresent ? " usb" : "", s.flashPresent ? " flash" : "",
                   s.pcLink ? " pc" : "");
-    if (s.folders) Serial.printf(" | %u folders", (unsigned)s.folders);
-    if (s.version) Serial.printf(" | fw %u", (unsigned)s.version);
-    if (s.error[0]) Serial.printf("\n[df] last error: %s", s.error);
-    Serial.println();
+    if (s.folders) LOGF(" | %u folders", (unsigned)s.folders);
+    if (s.version) LOGF(" | fw %u", (unsigned)s.version);
+    if (s.error[0]) LOGF("\n[df] last error: %s", s.error);
+    LOGLN();
     return true;
   }
 
@@ -1410,21 +1411,21 @@ bool df_player_command(const char *line) {
     while (*n == ' ') n++;
     if (*n) df_player_play_track((uint16_t)atoi(n));
     else df_player_play();
-    Serial.println("[df] play");
+    LOGLN("[df] play");
     return true;
   }
-  if (strcmp(arg, "pause") == 0) { df_player_pause(); Serial.println("[df] pause"); return true; }
-  if (strcmp(arg, "stop") == 0) { df_player_stop(); Serial.println("[df] stop"); return true; }
-  if (strcmp(arg, "next") == 0) { df_player_next(); Serial.println("[df] next"); return true; }
+  if (strcmp(arg, "pause") == 0) { df_player_pause(); LOGLN("[df] pause"); return true; }
+  if (strcmp(arg, "stop") == 0) { df_player_stop(); LOGLN("[df] stop"); return true; }
+  if (strcmp(arg, "next") == 0) { df_player_next(); LOGLN("[df] next"); return true; }
   if (strcmp(arg, "prev") == 0 || strcmp(arg, "previous") == 0) {
     df_player_previous();
-    Serial.println("[df] previous");
+    LOGLN("[df] previous");
     return true;
   }
   if (strncmp(arg, "vol ", 4) == 0) {
     const int v = atoi(arg + 4);
     df_player_set_volume_raw((uint8_t)constrain(v, 0, (int)DF_VOLUME_MAX));
-    Serial.printf("[df] volume %d/%u\n", constrain(v, 0, (int)DF_VOLUME_MAX),
+    LOGF("[df] volume %d/%u\n", constrain(v, 0, (int)DF_VOLUME_MAX),
                   (unsigned)DF_VOLUME_MAX);
     return true;
   }
@@ -1432,9 +1433,9 @@ bool df_player_command(const char *line) {
     int folder = 0, file = 1;
     if (sscanf(arg + 7, "%d %d", &folder, &file) >= 1) {
       if (df_player_play_folder((uint8_t)folder, (uint8_t)file)) {
-        Serial.printf("[df] folder %d track %d\n", folder, file);
+        LOGF("[df] folder %d track %d\n", folder, file);
       } else {
-        Serial.println("[df] folder must be 1-99 and track 1-255");
+        LOGLN("[df] folder must be 1-99 and track 1-255");
       }
     }
     return true;
@@ -1446,13 +1447,13 @@ bool df_player_command(const char *line) {
                           : strcmp(s, "aux") == 0   ? DF_SRC_AUX
                                                     : DF_SRC_SD;
     df_player_set_source(want);
-    Serial.printf("[df] source %s\n", df_source_name(want));
+    LOGF("[df] source %s\n", df_source_name(want));
     return true;
   }
   if (strncmp(arg, "eq ", 3) == 0) {
     const int eq = atoi(arg + 3);
-    if (df_player_set_eq((uint8_t)eq)) Serial.printf("[df] eq %s\n", df_eq_name((uint8_t)eq));
-    else Serial.println("[df] eq must be 0-5 (normal pop rock jazz classic bass)");
+    if (df_player_set_eq((uint8_t)eq)) LOGF("[df] eq %s\n", df_eq_name((uint8_t)eq));
+    else LOGLN("[df] eq must be 0-5 (normal pop rock jazz classic bass)");
     return true;
   }
   if (strncmp(arg, "loop ", 5) == 0) {
@@ -1467,17 +1468,17 @@ bool df_player_command(const char *line) {
     } else if (strcmp(s, "all") == 0) mode = DF_LOOP_ALL;
     else if (strcmp(s, "random") == 0 || strcmp(s, "shuffle") == 0) mode = DF_LOOP_RANDOM;
     df_player_set_loop(mode, folder);
-    Serial.printf("[df] loop %s\n", df_loop_name(mode));
+    LOGF("[df] loop %s\n", df_loop_name(mode));
     return true;
   }
-  if (strcmp(arg, "reset") == 0) { df_player_reset(); Serial.println("[df] resetting module"); return true; }
+  if (strcmp(arg, "reset") == 0) { df_player_reset(); LOGLN("[df] resetting module"); return true; }
   if (strcmp(arg, "sleep") == 0 || strcmp(arg, "standby") == 0) {
     df_player_standby();
-    Serial.println("[df] standby");
+    LOGLN("[df] standby");
     return true;
   }
-  if (strcmp(arg, "wake") == 0) { df_player_wake(); Serial.println("[df] wake"); return true; }
-  if (strcmp(arg, "refresh") == 0) { df_player_refresh(); Serial.println("[df] re-reading the card"); return true; }
+  if (strcmp(arg, "wake") == 0) { df_player_wake(); LOGLN("[df] wake"); return true; }
+  if (strcmp(arg, "refresh") == 0) { df_player_refresh(); LOGLN("[df] re-reading the card"); return true; }
 
   for (uint8_t i = 0; i < DF_PIN_COUNT; i++) {
     static const char *names[DF_PIN_COUNT] = {"io1", "io2", "key1", "key2"};
@@ -1485,9 +1486,9 @@ bool df_player_command(const char *line) {
     if (strncmp(arg, names[i], n) != 0) continue;
     const bool long_press = strstr(arg + n, "long") != nullptr;
     if (df_player_pulse((DfPin)i, long_press)) {
-      Serial.printf("[df] %s %s press\n", names[i], long_press ? "long" : "short");
+      LOGF("[df] %s %s press\n", names[i], long_press ? "long" : "short");
     } else {
-      Serial.printf("[df] %s is not wired on this board\n", names[i]);
+      LOGF("[df] %s is not wired on this board\n", names[i]);
     }
     return true;
   }
@@ -1501,11 +1502,11 @@ bool df_player_command(const char *line) {
                                                      : DF_LED_AUTO;
     df_player_set_led(mode);
     // `s` is arg + 3 and cannot be null; only its emptiness is in question.
-    Serial.printf("[df] led %s\n", *s ? s : "auto");
+    LOGF("[df] led %s\n", *s ? s : "auto");
     return true;
   }
 
-  Serial.println("[df] try: df | df play [n] | df pause | df stop | df next | "
+  LOGLN("[df] try: df | df play [n] | df pause | df stop | df next | "
                  "df prev | df vol 0-30 | df folder F T | df source sd|usb|flash"
                  " | df eq 0-5 | df loop off|track|folderN|all|random | "
                  "df io1[long] | df io2[long] | df key1 | df key2 | "

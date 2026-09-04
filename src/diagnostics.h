@@ -36,6 +36,18 @@
 
 #pragma once
 
+#include "app_config.h"
+
+#if DIAGNOSTICS_ENABLED
 /// Handles the "diag" console command. Returns false if the line was something
 /// else, so the caller can try its own commands.
 bool diagnostics_command(const char *line);
+#else
+/*
+ * A release build has no diag report. The whole of diagnostics.cpp is compiled
+ * to nothing, which is the ~15 kB of format strings that make the report
+ * readable -- everything it prints is either already on the dashboard or is a
+ * question you cannot ask a unit in somebody's kitchen anyway.
+ */
+inline bool diagnostics_command(const char *) { return false; }
+#endif

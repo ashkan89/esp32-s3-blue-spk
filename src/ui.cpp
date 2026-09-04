@@ -1835,7 +1835,7 @@ bool ui_begin() {
   } else {
     // No panel: say so once and leave. Everything else in this file is then
     // never called, and the speaker behaves exactly as it did without a display.
-    Serial.printf("[ui] no SSD1306 at 0x%02X or 0x%02X on SDA=%d SCL=%d\n",
+    LOGF("[ui] no SSD1306 at 0x%02X or 0x%02X on SDA=%d SCL=%d\n",
                   OLED_ADDR_PRIMARY, OLED_ADDR_ALTERNATE, PIN_OLED_SDA,
                   PIN_OLED_SCL);
     return false;
@@ -1844,7 +1844,7 @@ bool ui_begin() {
   u8g2.setI2CAddress(addr << 1);  // u8g2 wants the 8-bit form
   u8g2.setBusClock(OLED_BUS_HZ);
   if (!u8g2.begin()) {
-    Serial.println("[ui] panel found but init failed");
+    LOGLN("[ui] panel found but init failed");
     return false;
   }
   g_present = true;
@@ -1866,7 +1866,7 @@ bool ui_begin() {
   bright_applied = UI_BRIGHT_MID;
   u8g2.sendBuffer();
 
-  Serial.printf("[ui] SSD1306 128x32 at 0x%02X, %u kHz, %u fps\n", addr,
+  LOGF("[ui] SSD1306 128x32 at 0x%02X, %u kHz, %u fps\n", addr,
                 (unsigned)(OLED_BUS_HZ / 1000), (unsigned)UI_FPS);
   return true;
 #endif
@@ -1961,28 +1961,28 @@ bool ui_command(const char *line) {
     carousel_paused = false;
     req_next = true;
     ui_wake();
-    Serial.println("[ui] carousel on");
+    LOGLN("[ui] carousel on");
     return true;
   }
   if (sscanf(line, "screen %d", &n) == 1) {
     if (n >= 0 && n < SCR_ROTATE_COUNT) {
       req_screen = (int8_t)n;
       ui_wake();
-      Serial.printf("[ui] screen %d, carousel paused\n", n);
+      LOGF("[ui] screen %d, carousel paused\n", n);
     } else {
-      Serial.printf("[ui] screen must be 0..%d\n", SCR_ROTATE_COUNT - 1);
+      LOGF("[ui] screen must be 0..%d\n", SCR_ROTATE_COUNT - 1);
     }
     return true;
   }
   if (sscanf(line, "bright %d", &n) == 1) {
     bright_override = (uint8_t)(n < 0 ? 0 : (n > 255 ? 255 : n));
     ui_wake();
-    Serial.printf("[ui] contrast %d%s\n", bright_override,
+    LOGF("[ui] contrast %d%s\n", bright_override,
                   bright_override == 0 ? " (auto)" : "");
     return true;
   }
   if (strcmp(line, "ui") == 0) {
-    Serial.printf("[ui] screen %d  %s  %.1f fps  style %d\n", cur_screen,
+    LOGF("[ui] screen %d  %s  %.1f fps  style %d\n", cur_screen,
                   carousel_paused ? "paused" : "auto", fps_avg, spectrum_style);
     return true;
   }

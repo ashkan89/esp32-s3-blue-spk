@@ -1,3 +1,4 @@
+#include "app_config.h"
 #include "leds.h"
 
 #if LEDS_ENABLED
@@ -662,7 +663,7 @@ static void leds_task(void *) {
 // ------------------------------------------------------------------ public ---
 bool leds_begin() {
   if (PIN_LEDS < 0) {
-    Serial.println("[leds] disabled (PIN_LEDS is -1)");
+    LOGLN("[leds] disabled (PIN_LEDS is -1)");
     return false;
   }
   build_gamma();
@@ -675,7 +676,7 @@ bool leds_begin() {
   channel.trans_queue_depth = 1;  // one frame in flight; the task waits for it
   esp_err_t err = rmt_new_tx_channel(&channel, &rmt_channel);
   if (err != ESP_OK) {
-    Serial.printf("[leds] no RMT channel for GPIO%d (%s) -- lighting is off\n",
+    LOGF("[leds] no RMT channel for GPIO%d (%s) -- lighting is off\n",
                   (int)PIN_LEDS, esp_err_to_name(err));
     return false;
   }
@@ -686,7 +687,7 @@ bool leds_begin() {
   err = rmt_new_copy_encoder(&encoder, &rmt_encoder);
   if (err == ESP_OK) err = rmt_enable(rmt_channel);
   if (err != ESP_OK) {
-    Serial.printf("[leds] RMT would not start (%s) -- lighting is off\n",
+    LOGF("[leds] RMT would not start (%s) -- lighting is off\n",
                   esp_err_to_name(err));
     rmt_del_channel(rmt_channel);
     rmt_channel = nullptr;
@@ -700,7 +701,7 @@ bool leds_begin() {
   fill(0);
   commit(off, millis());
 
-  Serial.printf("[leds] %u WS2812 on GPIO%d, %s, cap %u/255, %u fps\n",
+  LOGF("[leds] %u WS2812 on GPIO%d, %s, cap %u/255, %u fps\n",
                 (unsigned)LED_COUNT, (int)PIN_LEDS,
                 HAS_CENTRE ? "ring with centre" : "strip",
                 (unsigned)LED_BRIGHTNESS_MAX, (unsigned)LED_FPS);
@@ -719,7 +720,7 @@ void leds_start() {
     // No task means no render loop and, more to the point, nobody to run the
     // standby blanking -- so say so and let leds_suspended() answer honestly
     // rather than making a shutdown wait for a frame that will never come.
-    Serial.println("[leds] could not start the render task; the ring stays dark");
+    LOGLN("[leds] could not start the render task; the ring stays dark");
     g_present = false;
     return;
   }
@@ -809,7 +810,7 @@ void leds_set_power_save(bool on) {
 static void print_leds_status() {
   LedConfig c;
   leds_get(&c);
-  Serial.printf("[leds] %s | %s | bright %u | speed %u | react %u%% | "
+  LOGF("[leds] %s | %s | bright %u | speed %u | react %u%% | "
                 "#%06lX / #%06lX | %s\n",
                 c.enabled ? "on" : "off", leds_effect_name(c.effect),
                 (unsigned)c.brightness, (unsigned)c.speed,
@@ -833,7 +834,7 @@ bool leds_command(const char *line) {
 
   if (*arg == 0) {
     print_leds_status();
-    Serial.println(F("  leds on|off              switch the ring on or off\n"
+    LOGLN(F("  leds on|off              switch the ring on or off\n"
                      "  leds fx <0-14>           choose an effect\n"
                      "  leds list                list the effects\n"
                      "  leds color RRGGBB        primary colour, hex\n"
@@ -847,12 +848,12 @@ bool leds_command(const char *line) {
     c.enabled = arg[1] == 'n';
   } else if (strcmp(arg, "list") == 0) {
     for (uint8_t i = 0; i < LED_FX_COUNT; i++) {
-      Serial.printf("  %2u  %-13s %s\n", i, FX_NAMES[i], FX_HINTS[i]);
+      LOGF("  %2u  %-13s %s\n", i, FX_NAMES[i], FX_HINTS[i]);
     }
     return true;
   } else if (sscanf(arg, "fx %u", &value) == 1) {
     if (value >= LED_FX_COUNT) {
-      Serial.printf("[leds] effect must be 0..%u\n", LED_FX_COUNT - 1);
+      LOGF("[leds] effect must be 0..%u\n", LED_FX_COUNT - 1);
       return true;
     }
     c.effect = (uint8_t)value;
@@ -867,7 +868,7 @@ bool leds_command(const char *line) {
   } else if (sscanf(arg, "react %u", &value) == 1) {
     c.reactivity = (uint8_t)(value > 100 ? 100 : value);
   } else {
-    Serial.printf("[leds] unknown: %s (try 'leds')\n", arg);
+    LOGF("[leds] unknown: %s (try 'leds')\n", arg);
     return true;
   }
 

@@ -1,5 +1,7 @@
 #include "diagnostics.h"
 
+#if DIAGNOSTICS_ENABLED
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_chip_info.h>
@@ -51,7 +53,7 @@ const char *reset_reason(esp_reset_reason_t reason) {
 
 void print_uptime(uint32_t ms) {
   const uint32_t s = ms / 1000;
-  Serial.printf("%ud %02uh %02um %02us", (unsigned)(s / 86400),
+  LOGF("%ud %02uh %02um %02us", (unsigned)(s / 86400),
                 (unsigned)((s % 86400) / 3600), (unsigned)((s % 3600) / 60),
                 (unsigned)(s % 60));
 }
@@ -73,11 +75,11 @@ void print_uptime(uint32_t ms) {
 void print_stack(const char *name) {
   const TaskHandle_t task = xTaskGetHandle(name);
   if (task == nullptr) {
-    Serial.printf("  %-10s not running\n", name);
+    LOGF("  %-10s not running\n", name);
     return;
   }
   const unsigned bytes = uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t);
-  Serial.printf("  %-10s %5u bytes never used%s\n", name, bytes,
+  LOGF("  %-10s %5u bytes never used%s\n", name, bytes,
                 bytes < 400 ? "   <-- tight, raise this task's stack" : "");
 }
 
@@ -87,7 +89,7 @@ void print_partitions() {
       esp_partition_find(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, nullptr);
   while (it != nullptr) {
     const esp_partition_t *p = esp_partition_get(it);
-    Serial.printf("  %-9s type %u.%-2u  0x%06X  %7u KB%s\n", p->label,
+    LOGF("  %-9s type %u.%-2u  0x%06X  %7u KB%s\n", p->label,
                   (unsigned)p->type, (unsigned)p->subtype, (unsigned)p->address,
                   (unsigned)(p->size / 1024),
                   (running && p->address == running->address) ? "  <-- running"
@@ -101,15 +103,15 @@ void print_report() {
   const uint32_t now = millis();
 
   // --- identity -------------------------------------------------------------
-  Serial.println();
-  Serial.println(F("=============================== diagnostics ================"
+  LOGLN();
+  LOGLN(F("=============================== diagnostics ================"
                    "==============="));
-  Serial.printf("firmware      %s v%s, built %s %s\n", APP_NAME, FW_VERSION,
+  LOGF("firmware      %s v%s, built %s %s\n", APP_NAME, FW_VERSION,
                 __DATE__, __TIME__);
 
   esp_chip_info_t chip;
   esp_chip_info(&chip);
-  Serial.printf("chip          ESP32 rev %u, %u core%s, %u MHz\n",
+  LOGF("chip          ESP32 rev %u, %u core%s, %u MHz\n",
                 (unsigned)chip.revision, (unsigned)chip.cores,
                 chip.cores == 1 ? "" : "s", (unsigned)getCpuFrequencyMhz());
 
@@ -130,32 +132,32 @@ void print_report() {
   // helper, because the IDF has moved that API more than once and this file is
   // the last place that should stop compiling across a platform bump.
   const uint32_t chipBytes = jedec ? (1u << (jedec & 0xFF)) : 0;
-  Serial.printf("flash         %u MB configured",
+  LOGF("flash         %u MB configured",
                 (unsigned)(ESP.getFlashChipSize() / (1024 * 1024)));
   if (chipBytes >= 1024u * 1024u) {
-    Serial.printf(", %u MB on the chip%s",
+    LOGF(", %u MB on the chip%s",
                   (unsigned)(chipBytes / (1024 * 1024)),
                   chipBytes == ESP.getFlashChipSize()
                       ? ""
                       : "   <-- MISMATCH: see board_upload.flash_size");
   }
-  Serial.printf(" @ %u MHz\n", (unsigned)(ESP.getFlashChipSpeed() / 1000000));
+  LOGF(" @ %u MHz\n", (unsigned)(ESP.getFlashChipSpeed() / 1000000));
 
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  Serial.printf("mac           %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1],
+  LOGF("mac           %02X:%02X:%02X:%02X:%02X:%02X\n", mac[0], mac[1],
                 mac[2], mac[3], mac[4], mac[5]);
 
   // --- this boot ------------------------------------------------------------
-  Serial.printf("reset reason  %s%s\n", reset_reason(esp_reset_reason()),
+  LOGF("reset reason  %s%s\n", reset_reason(esp_reset_reason()),
                 power_woke_from_sleep() ? " (woke from standby)" : "");
-  Serial.print("uptime        ");
+  LOGP("uptime        ");
   print_uptime(now);
-  Serial.println();
+  LOGLN();
 
   struct tm clock_now;
   soft_clock_now(&clock_now);
-  Serial.printf("clock         %04d-%02d-%02d %02d:%02d:%02d, source %s, utc%+ld min\n",
+  LOGF("clock         %04d-%02d-%02d %02d:%02d:%02d, source %s, utc%+ld min\n",
                 clock_now.tm_year + 1900, clock_now.tm_mon + 1, clock_now.tm_mday,
                 clock_now.tm_hour, clock_now.tm_min, clock_now.tm_sec,
                 soft_clock_source_name(), (long)soft_clock_utc_offset_min());
@@ -169,33 +171,33 @@ void print_report() {
    * or a Bluedroid bring-up can be allocated at all. A heap with 60 KB free in
    * 2 KB pieces will refuse both while looking perfectly healthy.
    */
-  Serial.println(F("--- memory -----------------------------------------------"
+  LOGLN(F("--- memory -----------------------------------------------"
                    "---------------"));
   const uint32_t free_now = ESP.getFreeHeap();
   const uint32_t min_free = ESP.getMinFreeHeap();
   const uint32_t largest = ESP.getMaxAllocHeap();
-  Serial.printf("  heap free   %6u bytes\n", (unsigned)free_now);
-  Serial.printf("  heap min    %6u bytes  (lowest this boot)\n", (unsigned)min_free);
-  Serial.printf("  largest blk %6u bytes  (%u%% of free -- fragmentation)\n",
+  LOGF("  heap free   %6u bytes\n", (unsigned)free_now);
+  LOGF("  heap min    %6u bytes  (lowest this boot)\n", (unsigned)min_free);
+  LOGF("  largest blk %6u bytes  (%u%% of free -- fragmentation)\n",
                 (unsigned)largest,
                 free_now ? (unsigned)(largest * 100 / free_now) : 0);
-  Serial.printf("  internal 8b %6u bytes free, %u largest\n",
+  LOGF("  internal 8b %6u bytes free, %u largest\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
                                                            MALLOC_CAP_8BIT));
-  Serial.printf("  DMA-capable %6u bytes free  (I2S descriptors live here)\n",
+  LOGF("  DMA-capable %6u bytes free  (I2S descriptors live here)\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
   // No PSRAM on a WROOM-32D, and saying so is worth one line: every third
   // ESP32 answer on the internet assumes there is some.
-  Serial.println(F("  psram       none (WROOM-32D has no external SPI RAM)"));
+  LOGLN(F("  psram       none (WROOM-32D has no external SPI RAM)"));
 
-  Serial.println(F("--- task stacks (smallest free ever) ----------------------"
+  LOGLN(F("--- task stacks (smallest free ever) ----------------------"
                    "---------------"));
   print_stack("loopTask");
   print_stack("ui");
   print_stack("leds");
   print_stack("dfplayer");
-  Serial.printf("  tasks       %u running\n",
+  LOGF("  tasks       %u running\n",
                 (unsigned)uxTaskGetNumberOfTasks());
 
   // --- what is fitted -------------------------------------------------------
@@ -204,25 +206,25 @@ void print_report() {
    * quietly absent rather than by complaining, which is the whole design -- so
    * this is the list that answers "why is nothing happening on the ring".
    */
-  Serial.println(F("--- peripherals detected at boot -------------------------"
+  LOGLN(F("--- peripherals detected at boot -------------------------"
                    "---------------"));
-  Serial.printf("  OLED        %s (SDA %d, SCL %d, %u kHz)\n",
+  LOGF("  OLED        %s (SDA %d, SCL %d, %u kHz)\n",
                 ui_present() ? "found" : "not found", PIN_OLED_SDA, PIN_OLED_SCL,
                 (unsigned)(OLED_BUS_HZ / 1000));
-  Serial.printf("  DS3231 RTC  %s\n", soft_clock_rtc_state_name());
-  Serial.printf("  WS2812 ring %s (%u px on GPIO%d, cap %u/255)\n",
+  LOGF("  DS3231 RTC  %s\n", soft_clock_rtc_state_name());
+  LOGF("  WS2812 ring %s (%u px on GPIO%d, cap %u/255)\n",
                 leds_present() ? "driving" : "off", (unsigned)LED_COUNT,
                 (int)PIN_LEDS, (unsigned)LED_BRIGHTNESS_MAX);
-  Serial.printf("  battery     %s\n",
+  LOGF("  battery     %s\n",
                 battery_present() ? "reading" : "no cell / gauge off");
 #if BATTERY_ENABLED
   if (battery_present()) {
     BatteryStatus b;
     battery_snapshot(&b);
-    Serial.printf("              %.3f V pack, %.3f V/cell, %u%%, %s, pin %u mV\n",
+    LOGF("              %.3f V pack, %.3f V/cell, %u%%, %s, pin %u mV\n",
                   b.volts, b.cellVolts, (unsigned)b.percent,
                   battery_state_name(b.state), (unsigned)b.millivoltsAtPin);
-    Serial.printf("              divider %.2f, trim %.4f, charger pins %s\n",
+    LOGF("              divider %.2f, trim %.4f, charger pins %s\n",
                   b.divider, b.calibration,
                   b.haveChargePins ? "wired" : "not wired (charging unknown)");
   }
@@ -230,48 +232,48 @@ void print_report() {
 
   DfStatus df;
   const bool df_fresh = df_player_snapshot(&df);
-  Serial.printf("  DFPlayer    %s\n",
+  LOGF("  DFPlayer    %s\n",
                 !df_player_running() ? "driver not running in this mode"
                 : !df_fresh          ? "status locked, try again"
                 : df.asleep          ? "standby"
                 : df.online          ? "online"
                                      : "OFFLINE (check TX/RX)");
   if (df_fresh && df_player_running()) {
-    Serial.printf("              frames sent %u, good %u, bad %u, errors %u, "
+    LOGF("              frames sent %u, good %u, bad %u, errors %u, "
                   "offline %u\n",
                   (unsigned)df.framesSent, (unsigned)df.framesGood,
                   (unsigned)df.framesBad, (unsigned)df.errors,
                   (unsigned)df.offlineEvents);
-    Serial.printf("              source %s, track %u/%u, media%s%s%s%s\n",
+    LOGF("              source %s, track %u/%u, media%s%s%s%s\n",
                   df_source_name(df.source), (unsigned)df.track,
                   (unsigned)df.totalTracks, df.sdPresent ? " sd" : "",
                   df.usbPresent ? " usb" : "", df.flashPresent ? " flash" : "",
                   df.pcLink ? " pc" : "");
-    if (df.error[0]) Serial.printf("              last error: %s\n", df.error);
+    if (df.error[0]) LOGF("              last error: %s\n", df.error);
   }
-  Serial.printf("  I2C errors  %u (DS3231 transactions that did not complete)\n",
+  LOGF("  I2C errors  %u (DS3231 transactions that did not complete)\n",
                 (unsigned)soft_clock_i2c_errors());
 
   // --- radio and audio ------------------------------------------------------
-  Serial.println(F("--- radio and audio --------------------------------------"
+  LOGLN(F("--- radio and audio --------------------------------------"
                    "---------------"));
   const RadioMode mode = management_radio_mode();
-  Serial.printf("  mode        %s\n", management_mode_name(mode));
+  LOGF("  mode        %s\n", management_mode_name(mode));
   if (radio_mode_has_wifi(mode)) {
     const bool up = WiFi.status() == WL_CONNECTED;
-    Serial.printf("  wifi        %s", up ? WiFi.SSID().c_str() : "not connected");
+    LOGF("  wifi        %s", up ? WiFi.SSID().c_str() : "not connected");
     if (up) {
-      Serial.printf(", %s, rssi %d dBm, ch %d", WiFi.localIP().toString().c_str(),
+      LOGF(", %s, rssi %d dBm, ch %d", WiFi.localIP().toString().c_str(),
                     (int)WiFi.RSSI(), WiFi.channel());
     }
-    Serial.printf("\n  setup ap    %s\n",
+    LOGF("\n  setup ap    %s\n",
                   management_ap_running() ? "up" : "down");
   }
 
   PlayerInfo info;
 
   ps_snapshot(&info);
-  Serial.printf("  connected   %s%s%s\n", yes_no(info.connected),
+  LOGF("  connected   %s%s%s\n", yes_no(info.connected),
                 info.peer[0] ? " -- " : "", info.peer);
 
   /*
@@ -282,42 +284,42 @@ void print_report() {
    * asking this question, and the number here settles it.
    */
   const uint32_t heard = audio_probe_last_active();
-  Serial.printf("  audio peak  %.1f dBFS (silence floor is -78; above -70 counts "
+  LOGF("  audio peak  %.1f dBFS (silence floor is -78; above -70 counts "
                 "as playing)\n", audio_probe_peak_db());
   if (heard) {
-    Serial.printf("  last heard  %u ms ago\n", (unsigned)(now - heard));
+    LOGF("  last heard  %u ms ago\n", (unsigned)(now - heard));
   } else {
-    Serial.println(F("  last heard  never, this boot"));
+    LOGLN(F("  last heard  never, this boot"));
   }
-  Serial.printf("  i2s         %d Hz, 16-bit stereo on BCLK %d / LRCK %d / DOUT %d\n",
+  LOGF("  i2s         %d Hz, 16-bit stereo on BCLK %d / LRCK %d / DOUT %d\n",
                 (int)info.sample_rate, PIN_MAP_I2S_BCLK, PIN_MAP_I2S_LRCK,
                 PIN_MAP_I2S_DOUT);
 
   // --- power ----------------------------------------------------------------
-  Serial.println(F("--- power ------------------------------------------------"
+  LOGLN(F("--- power ------------------------------------------------"
                    "---------------"));
-  Serial.printf("  saving      %s -- %s\n", yes_no(power_saving()),
+  LOGF("  saving      %s -- %s\n", yes_no(power_saving()),
                 power_reason());
-  Serial.printf("  standby     %s", power_sleep_possible()
+  LOGF("  standby     %s", power_sleep_possible()
                                         ? "available on BOOT"
                                         : "unavailable (no wake button)");
-  Serial.printf(", idle for %u s\n", (unsigned)(power_idle_ms() / 1000));
-  Serial.printf("  status led  %s, muted %s\n",
+  LOGF(", idle for %u s\n", (unsigned)(power_idle_ms() / 1000));
+  LOGF("  status led  %s, muted %s\n",
                 ui_present() ? "GPIO2 pattern" : "GPIO2 pattern (only indicator)",
                 yes_no(status_led_muted()));
 
   // --- flash layout ---------------------------------------------------------
-  Serial.println(F("--- partitions -------------------------------------------"
+  LOGLN(F("--- partitions -------------------------------------------"
                    "---------------"));
   print_partitions();
   const esp_partition_t *running = esp_ota_get_running_partition();
   if (running) {
-    Serial.printf("  app image   %u KB of %u KB in %s (%u%% used)\n",
+    LOGF("  app image   %u KB of %u KB in %s (%u%% used)\n",
                   (unsigned)(ESP.getSketchSize() / 1024),
                   (unsigned)(running->size / 1024), running->label,
                   (unsigned)(ESP.getSketchSize() * 100 / running->size));
   }
-  Serial.println(F("==========================================================="
+  LOGLN(F("==========================================================="
                    "==============="));
 }
 
@@ -330,3 +332,5 @@ bool diagnostics_command(const char *line) {
   print_report();
   return true;
 }
+
+#endif  // DIAGNOSTICS_ENABLED

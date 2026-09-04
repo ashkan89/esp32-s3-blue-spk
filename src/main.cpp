@@ -185,8 +185,18 @@ static I2SConfig make_i2s_config() {
  * from Serial in loop() is safe; printing from a Bluetooth callback is not, and
  * that rule is what the rest of this file is organised around.
  */
+/*
+ * The interactive console.
+ *
+ * Compiled out of a release build, and with it every *_command() handler in the
+ * firmware: each loses its only caller here, and an unused static function is
+ * dropped by the compiler before the linker is even asked. ui_command() is the
+ * one exception -- the dashboard's display controls call it -- and it stays
+ * either way.
+ */
+#if CONSOLE_ENABLED
 static void print_help() {
-  Serial.println(F(
+  LOGLN(F(
       "commands:\n"
       "  time                      show the clock and where it came from\n"
       "  time 14:30[:00]           set the time (today)\n"
@@ -229,10 +239,12 @@ static void print_help() {
       "                            what was detected, link counters, partitions\n"
       "  help"));
 }
+#endif  // CONSOLE_ENABLED
 
 // Defined below, once the Bluetooth sink exists.
 static bool radio_command(const char *line);
 
+#if CONSOLE_ENABLED
 static void poll_console() {
   static char buf[64];
   static uint8_t len;
@@ -284,9 +296,12 @@ static void poll_console() {
       print_help();
       continue;
     }
-    Serial.printf("[console] unknown: %s (try 'help')\n", buf);
+    LOGF("[console] unknown: %s (try 'help')\n", buf);
   }
 }
+#else
+static void poll_console() {}
+#endif  // CONSOLE_ENABLED
 
 #include "BluetoothA2DPSink.h"
 
@@ -544,12 +559,12 @@ static void service_melody() {
 
   switch (id) {
     case MELODY_ID_CONNECT:
-      Serial.println("[bt] connected");
+      LOGLN("[bt] connected");
       play_melody(MELODY_CONNECT,
                   sizeof(MELODY_CONNECT) / sizeof(MELODY_CONNECT[0]));
       break;
     case MELODY_ID_DISCONNECT:
-      Serial.println("[bt] disconnected");
+      LOGLN("[bt] disconnected");
       play_melody(MELODY_DISCONNECT,
                   sizeof(MELODY_DISCONNECT) / sizeof(MELODY_DISCONNECT[0]));
       break;
@@ -747,24 +762,24 @@ static void alarm_stop_audio() {
 static bool radio_command(const char *line) {
   if (strcmp(line, "radio") == 0) {
     const RadioMode mode = management_radio_mode();
-    Serial.printf("[radio] mode %s", management_mode_name(mode));
+    LOGF("[radio] mode %s", management_mode_name(mode));
     // Both halves are reported when both are running, so "wifi is up but no
     // phone can find me" is one line rather than a guess.
     if (radio_mode_has_wifi(mode)) {
       const bool sta = WiFi.status() == WL_CONNECTED;
-      Serial.printf(" | wifi %s", sta ? WiFi.SSID().c_str() : "disconnected");
+      LOGF(" | wifi %s", sta ? WiFi.SSID().c_str() : "disconnected");
       if (sta) {
-        Serial.printf(" %s rssi %d", WiFi.localIP().toString().c_str(),
+        LOGF(" %s rssi %d", WiFi.localIP().toString().c_str(),
                       (int)WiFi.RSSI());
       }
-      Serial.printf(" | ap %s", management_ap_running() ? "up" : "down");
+      LOGF(" | ap %s", management_ap_running() ? "up" : "down");
       if (management_ap_running()) {
-        Serial.printf(" %s ch %d clients %u", WiFi.softAPIP().toString().c_str(),
+        LOGF(" %s ch %d clients %u", WiFi.softAPIP().toString().c_str(),
                       WiFi.channel(), WiFi.softAPgetStationNum());
       }
     }
     if (radio_mode_has_a2dp(mode)) {
-      Serial.printf(" | bt %s", !bt_started                ? "starting"
+      LOGF(" | bt %s", !bt_started                ? "starting"
                                 : a2dp_sink.is_connected() ? "connected"
                                 : bt_identity_applied      ? "discoverable"
                                                            : "starting");
@@ -775,7 +790,7 @@ static bool radio_command(const char *line) {
       // TX/RX)" about a module that is answering, in the command somebody types
       // precisely to find out whether it is.
       const bool fresh = df_player_snapshot(&d);
-      Serial.printf(" | df %s", !fresh             ? "status unreadable"
+      LOGF(" | df %s", !fresh             ? "status unreadable"
                                 : !df_started      ? "starting"
                                 : d.asleep         ? "standby"
                                 : !d.online        ? "OFFLINE (check TX/RX)"
@@ -783,19 +798,19 @@ static bool radio_command(const char *line) {
                                 : d.state == DF_PAUSED ? "paused"
                                                    : "idle");
       if (fresh) {
-        Serial.printf(" %s", df_source_name(d.source));
+        LOGF(" %s", df_source_name(d.source));
         if (d.totalTracks) {
-          Serial.printf(" %u/%u", (unsigned)d.track, (unsigned)d.totalTracks);
+          LOGF(" %u/%u", (unsigned)d.track, (unsigned)d.totalTracks);
         }
       }
-      if (fresh && d.pcLink) Serial.print(" | card on a computer");
-      if (fresh && d.error[0]) Serial.printf(" | %s", d.error);
+      if (fresh && d.pcLink) LOGP(" | card on a computer");
+      if (fresh && d.error[0]) LOGF(" | %s", d.error);
     }
     if (battery_present()) {
-      Serial.printf(" | bat %u%% %s", (unsigned)battery_percent(),
+      LOGF(" | bat %u%% %s", (unsigned)battery_percent(),
                     battery_state_name(battery_state()));
     }
-    Serial.printf(" | heap %u\n", (unsigned)ESP.getFreeHeap());
+    LOGF(" | heap %u\n", (unsigned)ESP.getFreeHeap());
     return true;
   }
   if (strcmp(line, "mode") == 0) {
@@ -816,18 +831,18 @@ static bool radio_command(const char *line) {
   }
   if (strcmp(line, "pair") == 0) {
     if (radio_mode_has_dfplayer(management_radio_mode())) {
-      Serial.println("[bt] DFPlayer mode has no Bluetooth at all -- the whole "
+      LOGLN("[bt] DFPlayer mode has no Bluetooth at all -- the whole "
                      "controller is released at boot. Type 'bt' for Bluetooth "
                      "mode.");
     } else if (!radio_mode_has_a2dp(management_radio_mode())) {
-      Serial.println("[bt] Wi-Fi mode; type 'bt' to start Bluetooth");
+      LOGLN("[bt] Wi-Fi mode; type 'bt' to start Bluetooth");
     } else if (!bt_started) {
-      Serial.println("[bt] still starting");
+      LOGLN("[bt] still starting");
     } else if (a2dp_sink.is_connected()) {
-      Serial.println("[bt] a phone is already connected; disconnect it first");
+      LOGLN("[bt] a phone is already connected; disconnect it first");
     } else {
       a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
-      Serial.println("[bt] discoverable now");
+      LOGLN("[bt] discoverable now");
     }
     return true;
   }
@@ -858,7 +873,11 @@ static void log_state_changes() {
   if (s.connected && s.peer[0] && strcmp(s.peer, seen_peer) != 0) {
     strncpy(seen_peer, s.peer, sizeof(seen_peer) - 1);
     seen_peer[sizeof(seen_peer) - 1] = 0;
-    Serial.printf("[bt] peer: %s\n", seen_peer);
+    // The tag says where this came from. In Wi-Fi mode "peer" is the radio
+    // station's own name, and calling that a Bluetooth peer sent at least one
+    // person hunting for a phone that was not there.
+    LOGF("[%s] %s: %s\n", s.source == PS_SRC_RADIO ? "radio" : "bt",
+         s.source == PS_SRC_RADIO ? "station" : "peer", seen_peer);
 
     /*
      * "Connected", or the clip somebody recorded for this particular phone.
@@ -896,7 +915,7 @@ static void log_state_changes() {
       if (battery_present()) {
         BatteryStatus b;
         battery_snapshot(&b);
-        Serial.printf("[bat] %s: %u%% (%.2f V)\n", battery_state_name(now_state),
+        LOGF("[bat] %s: %u%% (%.2f V)\n", battery_state_name(now_state),
                       (unsigned)b.percent, b.volts);
         /*
          * The one announcement that earns interrupting music for.
@@ -937,9 +956,9 @@ static void log_state_changes() {
 
     if (s.title[0]) {
       if (s.artist[0]) {
-        Serial.printf("[%s] %s - %s\n", tag, s.artist, s.title);
+        LOGF("[%s] %s - %s\n", tag, s.artist, s.title);
       } else {
-        Serial.printf("[%s] title: %s\n", tag, s.title);
+        LOGF("[%s] title: %s\n", tag, s.title);
       }
     }
   }
@@ -981,7 +1000,7 @@ static bool poll_reset_button_headless() {
   const uint32_t held = millis() - since;
   if (held >= UI_BTN_MODE_MS && !mode_armed) {
     mode_armed = true;
-    Serial.printf("[mode] release BOOT to switch to %s mode, or keep holding "
+    LOGF("[mode] release BOOT to switch to %s mode, or keep holding "
                   "to factory reset\n",
                   management_mode_name(management_next_mode()));
     status_led_blip(2);
@@ -990,7 +1009,7 @@ static bool poll_reset_button_headless() {
   mode_armed = false;  // past the mode tier now; releasing must not switch
   if (!announced) {
     announced = true;
-    Serial.println("[reset] keep holding BOOT to wipe settings and pairings");
+    LOGLN("[reset] keep holding BOOT to wipe settings and pairings");
   }
   status_led_state(LED_FAULT);
   if (held < (uint32_t)UI_BTN_RESET_ARM_MS + UI_BTN_RESET_COUNT_MS) return false;
@@ -1001,7 +1020,7 @@ static bool poll_reset_button_headless() {
 static void service_factory_reset() {
   if (!ui_take_factory_reset_request() && !poll_reset_button_headless()) return;
 
-  Serial.println("[reset] BOOT held through the countdown; clearing everything");
+  LOGLN("[reset] BOOT held through the countdown; clearing everything");
   management_factory_reset();
 
   while (PIN_UI_BUTTON >= 0 && digitalRead(PIN_UI_BUTTON) == LOW) {
@@ -1035,14 +1054,14 @@ static void service_bluetooth_identity() {
   cod.minor = BT_COD_MINOR_LOUDSPEAKER;
   cod.service = ESP_BT_COD_SRVC_RENDERING | ESP_BT_COD_SRVC_AUDIO;
   const esp_err_t err = esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
-  Serial.printf("[bt] class of device: %s\n", esp_err_to_name(err));
+  LOGF("[bt] class of device: %s\n", esp_err_to_name(err));
 
   // And belt-and-braces: say out loud that we want to be findable. Nothing
   // above should have left us hidden, but "the speaker is invisible" is an
   // expensive failure to debug from the other end of a phone.
   if (!a2dp_sink.is_connected()) {
     a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
-    Serial.println("[bt] discoverable");
+    LOGLN("[bt] discoverable");
   }
 }
 
@@ -1065,7 +1084,7 @@ static void service_bluetooth_start() {
   // The heap either side of the bring-up, because this is the number that
   // decides whether the OTA TLS handshake later has room. Cheap to print once,
   // tedious to guess at.
-  Serial.printf("Discoverable as \"%s\" - pair from your phone. (heap %u -> %u)\n",
+  LOGF("Discoverable as \"%s\" - pair from your phone. (heap %u -> %u)\n",
                 DEVICE_NAME, (unsigned)heap_before,
                 (unsigned)ESP.getFreeHeap());
   // Chime once the radio is up: the speaker is ready to be paired.
@@ -1103,7 +1122,7 @@ static void service_dfplayer() {
     management_df_defaults(&source, &volume, &eq, &loop, &loop_folder, &autoplay);
 
     if (!df_player_begin((DfSource)source, volume, eq, (DfLoop)loop)) {
-      Serial.println("[df] driver did not start; DFPlayer mode has no audio "
+      LOGLN("[df] driver did not start; DFPlayer mode has no audio "
                      "source this boot. The dashboard still works -- switch to "
                      "another mode from there.");
       return;
@@ -1128,11 +1147,11 @@ static void service_dfplayer() {
   if (d.online && d.totalTracks > 0) {
     df_autoplay_pending = false;
     df_player_play_track(1);
-    Serial.printf("[df] autoplay: starting track 1 of %u on the %s\n",
+    LOGF("[df] autoplay: starting track 1 of %u on the %s\n",
                   (unsigned)d.totalTracks, df_source_name(d.source));
   } else if ((int32_t)(millis() - give_up_at) >= 0) {
     df_autoplay_pending = false;
-    Serial.printf("[df] autoplay gave up: %s\n",
+    LOGF("[df] autoplay gave up: %s\n",
                   !d.online ? "the module never answered"
                   : d.pcLink ? "the card is mounted on a computer"
                              : "no files were found on the selected source");
@@ -1167,7 +1186,7 @@ static void service_mode_switch() {
  * will refuse an 8 KB allocation while looking perfectly healthy.
  */
 static void heap_mark(const char *stage) {
-  Serial.printf("[heap] %-18s %6u free, %6u largest\n", stage,
+  LOGF("[heap] %-18s %6u free, %6u largest\n", stage,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 }
 
@@ -1187,10 +1206,18 @@ static const char *reset_reason_text(esp_reset_reason_t reason) {
 }
 
 void setup() {
+  /*
+   * The UART is opened only if something is going to use it. A release build
+   * with the log and the console compiled out has nothing to say and nothing to
+   * listen for, and an unopened port is one driver, two ring buffers and two
+   * pins that stay available for something else.
+   */
+#if SERIAL_PORT_USED
   Serial.begin(115200);
   delay(200);
-  Serial.printf("\n=== %s v%s ===\n", APP_NAME, FW_VERSION);
-  Serial.printf("[boot] reset reason: %s | heap %u free, %u largest block\n",
+#endif
+  LOGF("\n=== %s v%s ===\n", APP_NAME, FW_VERSION);
+  LOGF("[boot] reset reason: %s | heap %u free, %u largest block\n",
                 reset_reason_text(esp_reset_reason()),
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
@@ -1241,7 +1268,7 @@ void setup() {
    */
   auto cfg = make_i2s_config();
   if (!i2s.begin(cfg)) {
-    Serial.println("[i2s] the output channel would not open; there will be no "
+    LOGLN("[i2s] the output channel would not open; there will be no "
                    "sound. This is almost always a DMA allocation that failed.");
   }
   heap_mark("i2s");
@@ -1253,7 +1280,7 @@ void setup() {
   // The number that decides whether the rest of this boot can succeed: what is
   // left once Wi-Fi has taken its share. In Bluetooth mode the sink has not
   // taken its share yet.
-  Serial.printf("[boot] after network start: heap %u free, %u largest block\n",
+  LOGF("[boot] after network start: heap %u free, %u largest block\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
   // Must be installed before set_volume() below, which is what first enables it.
@@ -1346,7 +1373,7 @@ void setup() {
    * of log at boot that nobody wrote. This is that line, and it is also what
    * `diag` prints in more detail later.
    */
-  Serial.printf("[boot] self-test: oled %s | rtc %s | ring %s | dfplayer %s | "
+  LOGF("[boot] self-test: oled %s | rtc %s | ring %s | dfplayer %s | "
                 "battery %s\n",
                 ui_present() ? "yes" : "no", soft_clock_rtc_state_name(),
                 have_leds ? "yes" : "no",
@@ -1366,7 +1393,7 @@ void setup() {
    * thing the task draws.
    */
   if (power_woke_from_sleep()) {
-    Serial.println("[boot] woke from standby");
+    LOGLN("[boot] woke from standby");
     ui_show_system_status(UI_STATUS_WELCOME, "Good morning", DEVICE_NAME, -1,
                           2600);
   }
@@ -1377,7 +1404,7 @@ void setup() {
   // the first frame this task draws is already the one the owner chose.
   if (have_leds) leds_start();
 
-  Serial.println("Type 'help' for the serial commands (clock, screens, radio).");
+  LOGLN("Type 'help' for the serial commands (clock, screens, radio).");
 }
 
 void loop() {
