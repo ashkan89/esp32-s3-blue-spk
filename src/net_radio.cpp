@@ -8,6 +8,9 @@
 #include <WiFi.h>
 #include <string.h>
 
+#include "esp_heap_caps.h"
+#include "esp_system.h"
+
 #include "AudioTools.h"
 #include "AudioTools/AudioCodecs/CodecAACHelix.h"
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
@@ -16,8 +19,10 @@
 #include "audio_eq.h"
 #include "audio_probe.h"
 #include "management.h"
+#include "stability_policy.h"
 #include "df_player.h"
 #include "player_state.h"
+#include "runtime_events.h"
 #include "voice.h"
 
 using namespace audio_tools;
@@ -35,7 +40,7 @@ namespace {
  * a detail. This buffer, the socket chunk and the decoder feed together are
  * over 20 kB, and holding them from boot on a speaker that may never play a
  * station costs the firmware updater its TLS handshake: the check in
- * management.cpp wants 60 kB free and a 34 kB contiguous block, and a 24 kB
+ * management.cpp wants 80 kB free and a 45 kB contiguous block, and a 24 kB
  * allocation made early sits in the middle of the heap splitting exactly the
  * block the handshake needs. Idle radio now costs nothing at all.
  */
@@ -74,7 +79,7 @@ const uint32_t CONNECT_TIMEOUT_MS = 12000;
  * How much heap a stream needs before it is allowed to try.
  *
  * This is not a safety margin, it is a hard lesson. Opening a stream allocates
- * a socket, a read buffer, the 22 kB arena and a ~30 kB decoder -- and the
+ * a socket, a read buffer, the 24 kB arena and a ~30 kB decoder -- and the
  * layers underneath allocate too, invisibly: esp_vfs_select() creates a
  * semaphore per call, and when that allocation fails the IDF does not return an
  * error, it asserts and panics. A firmware that runs out of heap inside the
@@ -144,17 +149,19 @@ RadioStatus status;
 /// are separate so that a request can be made from any task without waiting for
 /// the current connection to notice.
 struct Request {
-  volatile bool changed;
-  volatile bool play;
+  bool play;
   int8_t station;
   char url[RADIO_URL_MAX];
   char name[RADIO_NAME_MAX];
 };
 Request request;
+uint32_t requestSeq;
+portMUX_TYPE requestMux = portMUX_INITIALIZER_UNLOCKED;
 
 TaskHandle_t task;
 bool running;
-uint8_t volume127 = 90;
+uint32_t volumeWord = 90;
+uint32_t liveState = RADIO_IDLE;
 bool autostart;
 
 /*
@@ -186,6 +193,7 @@ uint8_t *arena;
 uint8_t *ring;    // arena
 uint8_t *chunk;   // arena + RING_BYTES
 uint8_t *feed;    // arena + RING_BYTES + READ_CHUNK
+uint32_t arenaHeldWord;
 size_t ringHead, ringTail, ringUsed;
 
 /// The favourites. On the heap and not in .bss because 2.4 kB of DRAM that only
@@ -196,11 +204,16 @@ uint8_t stationCount;
 
 bool arenaAcquire() {
   if (arena) return true;
-  arena = (uint8_t *)malloc(STREAM_ARENA);
+  // The decoder and DMA both need real internal DRAM. Being explicit prevents
+  // a future PSRAM-capable board variant from placing this hot buffer where
+  // either peripheral access or cache stalls would make it unsafe.
+  arena = (uint8_t *)heap_caps_malloc(STREAM_ARENA,
+                                      MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   if (!arena) return false;
   ring = arena;
   chunk = arena + RING_BYTES;
   feed = chunk + READ_CHUNK;
+  __atomic_store_n(&arenaHeldWord, 1U, __ATOMIC_RELEASE);
   return true;
 }
 
@@ -208,13 +221,14 @@ void arenaRelease() {
   free(arena);
   arena = nullptr;
   ring = chunk = feed = nullptr;
+  __atomic_store_n(&arenaHeldWord, 0U, __ATOMIC_RELEASE);
 }
 
 /// Set by the metadata callback, which the HTTP reader calls from inside
 /// readBytes() -- so on the radio task, but at a point where taking the status
 /// mutex would nest a lock inside the read path. Copied across at the top of
 /// the next loop instead.
-volatile bool metaDirty;
+bool metaDirty;
 char metaTitle[RADIO_TEXT_MAX];
 char metaName[RADIO_NAME_MAX];
 char metaGenre[RADIO_TEXT_MAX];
@@ -233,6 +247,40 @@ void copyString(char *dest, size_t size, const char *src) {
     return;
   }
   snprintf(dest, size, "%s", src);
+}
+
+uint8_t currentVolume() {
+  return (uint8_t)__atomic_load_n(&volumeWord, __ATOMIC_ACQUIRE);
+}
+
+void publishVolume(uint8_t value) {
+  __atomic_store_n(&volumeWord, (uint32_t)value, __ATOMIC_RELEASE);
+}
+
+uint32_t currentRequestVersion() {
+  return __atomic_load_n(&requestSeq, __ATOMIC_ACQUIRE);
+}
+
+bool requestChanged(uint32_t adoptedVersion) {
+  return currentRequestVersion() != adoptedVersion;
+}
+
+/* A bounded, non-blocking read of the latest complete command. The radio task
+ * simply tries again on its next pass if a publisher happens to be active. */
+bool snapshotRequest(Request *out, uint32_t *version) {
+  if (!out || !version) return false;
+  for (uint8_t attempt = 0; attempt < 4; ++attempt) {
+    const uint32_t before = currentRequestVersion();
+    if (before & 1U) continue;
+    *out = request;
+    __sync_synchronize();
+    const uint32_t after = currentRequestVersion();
+    if (before == after && !(after & 1U)) {
+      *version = after;
+      return true;
+    }
+  }
+  return false;
 }
 
 /*
@@ -256,12 +304,11 @@ void sanitize(char *text) {
 }
 
 bool urlLooksPlayable(const char *url) {
-  if (!url) return false;
-  return strncasecmp(url, "http://", 7) == 0 || strncasecmp(url, "https://", 8) == 0;
+  return stability_url_http(url);
 }
 
 bool urlIsSecure(const char *url) {
-  return url && strncasecmp(url, "https://", 8) == 0;
+  return stability_url_https(url);
 }
 
 /// The host part of a URL, for when a station sends no name of its own.
@@ -285,8 +332,9 @@ void loadStations() {
   stationCount = 0;
   if (!prefs.begin("radio", false)) return;
 
-  volume127 = (uint8_t)prefs.getUChar("vol", 90);
-  if (volume127 > 127) volume127 = 127;
+  uint8_t storedVolume = (uint8_t)prefs.getUChar("vol", 90);
+  if (storedVolume > 127) storedVolume = 127;
+  publishVolume(storedVolume);
   autostart = prefs.getBool("auto", false);
 
   const size_t want = sizeof(RadioStation) * RADIO_MAX_STATIONS;
@@ -432,10 +480,11 @@ class RadioOutput : public AudioOutput {
     // Volume first, so the equaliser's soft knee is the last thing in the chain
     // and a boosted band cannot clip above a level the owner has already turned
     // down.
-    if (volume127 < 127) {
-      const int32_t gain = volume127;
+    const uint8_t volume = currentVolume();
+    if (volume < 127) {
+      const int32_t gain = volume;
       for (size_t i = 0; i < count * 2; i++) {
-        frames[i] = (int16_t)(((int32_t)frames[i] * gain) >> 7);
+        frames[i] = stability_pcm_volume(frames[i], (uint8_t)gain);
       }
     }
     audio_eq_process(frames, count);
@@ -460,7 +509,7 @@ size_t ringWrite(const uint8_t *data, size_t len) {
     size_t run = min(len - written, space);
     run = min(run, RING_BYTES - ringHead);
     memcpy(ring + ringHead, data + written, run);
-    ringHead = (ringHead + run) % RING_BYTES;
+    ringHead = stability_ring_advance(ringHead, run, RING_BYTES);
     ringUsed += run;
     written += run;
   }
@@ -473,7 +522,7 @@ size_t ringRead(uint8_t *out, size_t len) {
     size_t run = min(len - taken, ringUsed);
     run = min(run, RING_BYTES - ringTail);
     memcpy(out + taken, ring + ringTail, run);
-    ringTail = (ringTail + run) % RING_BYTES;
+    ringTail = stability_ring_advance(ringTail, run, RING_BYTES);
     ringUsed -= run;
     taken += run;
   }
@@ -509,7 +558,7 @@ void onMetadata(MetaDataType type, const char *str, int len) {
     default:
       return;
   }
-  const size_t n = min((size_t)len, size - 1);
+  const size_t n = stability_bounded_copy_length((size_t)len, size);
   memcpy(dest, str, n);
   dest[n] = 0;
   sanitize(dest);
@@ -529,12 +578,32 @@ void adoptMetadata() {
 // ------------------------------------------------------------------- task --
 
 void setState(RadioState state, const char *error = nullptr) {
+  bool changed;
   statusLock();
-  if (status.state != state) status.stateSince = millis();
+  changed = status.state != state;
+  if (changed) status.stateSince = millis();
   status.state = state;
   if (error) copyString(status.error, sizeof(status.error), error);
   else if (state != RADIO_ERROR) status.error[0] = 0;
   statusUnlock();
+  __atomic_store_n(&liveState, (uint32_t)state, __ATOMIC_RELEASE);
+  if (!changed) return;
+  switch (state) {
+    case RADIO_CONNECTING:
+      runtime_event_note(RUNTIME_EVENT_RADIO_CONNECTING);
+      break;
+    case RADIO_PLAYING:
+      runtime_event_note(RUNTIME_EVENT_RADIO_PLAYING);
+      break;
+    case RADIO_RECONNECTING:
+      runtime_event_note(RUNTIME_EVENT_RADIO_RETRY);
+      break;
+    case RADIO_IDLE:
+      runtime_event_note(RUNTIME_EVENT_RADIO_STOPPED);
+      break;
+    default:
+      break;
+  }
 }
 
 /// Picks a decoder from what the server said it was sending, falling back to
@@ -567,12 +636,11 @@ bool wantsAac(const char *contentType, const char *url) {
 /*
  * One connection, from the socket opening to the stream ending.
  *
- * Returns when the stream stops for any reason. `stopped` distinguishes "the
- * owner pressed stop", which must not reconnect, from every other ending, which
- * must.
+ * Returns when the stream stops for any reason. A sequence change distinguishes
+ * an owner command from a network failure without reading a multi-field request
+ * while another core is publishing it.
  */
-void runStream(const char *url, bool *stopped) {
-  *stopped = false;
+void runStream(const char *url, uint32_t adoptedRequest) {
 
   /*
    * Not while the updater holds TLS. This is a wait, not a failure -- the
@@ -688,7 +756,7 @@ void runStream(const char *url, bool *stopped) {
    * The working buffers, claimed only now.
    *
    * After the handshake rather than before it: an https connection's peak heap
-   * use is during the certificate walk, and holding 22 kB across that is the
+   * use is during the certificate walk, and holding 24 kB across that is the
    * difference between a station that plays and one that reports being out of
    * memory. The socket has not been read from yet, so nothing is lost by
    * waiting.
@@ -731,7 +799,7 @@ void runStream(const char *url, bool *stopped) {
 
   while (true) {
     // A new request, or a stop, outranks everything.
-    if (request.changed) break;
+    if (requestChanged(adoptedRequest)) break;
     if (WiFi.status() != WL_CONNECTED) {
       setState(RADIO_ERROR, "Wi-Fi went away");
       break;
@@ -826,35 +894,44 @@ void runStream(const char *url, bool *stopped) {
   delete stream;
   delete tls;
   // Everything this stream held goes back before the next attempt, so a station
-  // that is retrying on a backoff is not sitting on 22 kB while it waits.
+  // that is retrying on a backoff is not sitting on 24 kB while it waits.
   arenaRelease();
 
-  *stopped = request.changed && !request.play;
 }
 
 void radioTask(void *) {
   uint32_t backoff = RECONNECT_MIN_MS;
   char url[RADIO_URL_MAX] = {0};
+  Request wanted{};
+  uint32_t adoptedRequest = UINT32_MAX;
 
   for (;;) {
     // Pick up whatever was last asked for.
-    if (request.changed) {
-      request.changed = false;
+    const uint32_t available = currentRequestVersion();
+    Request next;
+    uint32_t nextVersion;
+    if (available != adoptedRequest) {
+      if (!snapshotRequest(&next, &nextVersion)) {
+        taskYIELD();
+        continue;
+      }
+      wanted = next;
+      adoptedRequest = nextVersion;
       statusLock();
-      status.station = request.station;
-      copyString(status.url, sizeof(status.url), request.url);
-      copyString(status.name, sizeof(status.name), request.name);
+      status.station = wanted.station;
+      copyString(status.url, sizeof(status.url), wanted.url);
+      copyString(status.name, sizeof(status.name), wanted.name);
       status.title[0] = 0;
       status.genre[0] = 0;
       status.reconnects = 0;
       status.bufferPercent = 0;
       statusUnlock();
-      copyString(url, sizeof(url), request.url);
+      copyString(url, sizeof(url), wanted.url);
       backoff = RECONNECT_MIN_MS;
-      if (!request.play) setState(RADIO_IDLE);
+      if (!wanted.play) setState(RADIO_IDLE);
     }
 
-    if (!request.play || !url[0]) {
+    if (!wanted.play || !url[0]) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
@@ -866,27 +943,30 @@ void radioTask(void *) {
     }
 
     voice_say(VOICE_RADIO_CONNECTING, VOICE_CAT_RADIO);
-    bool stopped = false;
-    runStream(url, &stopped);
+    runStream(url, adoptedRequest);
 
-    if (stopped || !request.play || request.changed) {
-      if (!request.changed) setState(RADIO_IDLE);
+    if (requestChanged(adoptedRequest)) {
       continue;
     }
 
     // The stream ended by itself. Announce the first failure only: a station
     // that has been down for an hour should not be saying so every minute.
-    if (status.reconnects == 0) voice_say(VOICE_RADIO_FAILED, VOICE_CAT_RADIO);
     statusLock();
+    const bool firstFailure = status.reconnects == 0;
     status.reconnects++;
     statusUnlock();
+    if (firstFailure) voice_say(VOICE_RADIO_FAILED, VOICE_CAT_RADIO);
     setState(RADIO_RECONNECTING);
 
-    const uint32_t waitUntil = millis() + backoff;
-    while ((int32_t)(waitUntil - millis()) > 0 && !request.changed) {
+    // A little symmetric jitter prevents a group of speakers that lost the
+    // same access point from reconnecting in lockstep when it returns.
+    const uint32_t waitMs = stability_reconnect_jitter(backoff, esp_random());
+    const uint32_t waitStarted = millis();
+    while ((uint32_t)(millis() - waitStarted) < waitMs &&
+           !requestChanged(adoptedRequest)) {
       vTaskDelay(pdMS_TO_TICKS(100));
     }
-    backoff = min(backoff * 2, RECONNECT_MAX_MS);
+    backoff = stability_reconnect_next(backoff, RECONNECT_MAX_MS);
   }
 }
 
@@ -918,6 +998,7 @@ bool ensureTask() {
                "Not enough memory to start the decoder");
     status.state = RADIO_ERROR;
     statusUnlock();
+    __atomic_store_n(&liveState, (uint32_t)RADIO_ERROR, __ATOMIC_RELEASE);
     return false;
   }
   return true;
@@ -926,11 +1007,18 @@ bool ensureTask() {
 /// Hands the task a new destination. Safe from any task.
 void requestPlay(bool play, int8_t station, const char *url, const char *name) {
   if (play && !ensureTask()) return;
-  request.play = play;
-  request.station = station;
-  copyString(request.url, sizeof(request.url), url);
-  copyString(request.name, sizeof(request.name), name);
-  request.changed = true;
+  Request next{};
+  next.play = play;
+  next.station = station;
+  copyString(next.url, sizeof(next.url), url);
+  copyString(next.name, sizeof(next.name), name);
+  portENTER_CRITICAL(&requestMux);
+  __atomic_add_fetch(&requestSeq, 1U, __ATOMIC_RELEASE);  // odd: being written
+  __sync_synchronize();
+  request = next;
+  __sync_synchronize();
+  __atomic_add_fetch(&requestSeq, 1U, __ATOMIC_RELEASE);  // even: complete
+  portEXIT_CRITICAL(&requestMux);
 }
 
 }  // namespace
@@ -956,12 +1044,13 @@ bool net_radio_begin(void *out) {
   memset(&status, 0, sizeof(status));
   status.state = RADIO_IDLE;
   status.station = -1;
+  __atomic_store_n(&liveState, (uint32_t)RADIO_IDLE, __ATOMIC_RELEASE);
   loadStations();
 
   /*
    * No task and no buffers yet.
    *
-   * Everything the radio needs to run -- a 10 kB task stack and a 22 kB arena --
+   * Everything the radio needs to run -- a 10 kB task stack and a 24 kB arena --
    * is claimed on the first station and given back when the stream ends. A
    * speaker that is never asked to play one pays for the station list and
    * nothing else, which is what keeps the firmware updater's TLS handshake
@@ -1003,7 +1092,8 @@ bool net_radio_running() { return running; }
 
 bool net_radio_active() {
   if (!running) return false;
-  const RadioState state = status.state;
+  const RadioState state =
+      (RadioState)__atomic_load_n(&liveState, __ATOMIC_ACQUIRE);
   return state == RADIO_PLAYING || state == RADIO_BUFFERING;
 }
 
@@ -1032,7 +1122,7 @@ void net_radio_loop() {
    *
    * Not from net_radio_begin(): at that point the station is still associating,
    * DHCP has not finished, mDNS and the web server have not started, and the
-   * Wi-Fi driver is at its peak allocation. Asking for a socket, a 22 kB arena
+   * Wi-Fi driver is at its peak allocation. Asking for a socket, a 24 kB arena
    * and a 30 kB decoder in the middle of that is asking for the one failure
    * this chip handles worst -- an allocation that fails inside the IDF, which
    * asserts rather than returning an error.
@@ -1059,7 +1149,7 @@ void net_radio_loop() {
 
   if (volumeDirty && (uint32_t)(millis() - volumeDirtyAt) >= VOLUME_PERSIST_QUIET_MS) {
     volumeDirty = false;
-    prefs.putUChar("vol", volume127);
+    prefs.putUChar("vol", currentVolume());
   }
 
   RadioStatus s;
@@ -1089,7 +1179,7 @@ void net_radio_loop() {
     }
     if (s.sampleRate) ps_set_sample_rate((uint16_t)s.sampleRate);
   }
-  ps_set_volume(volume127);
+  ps_set_volume(currentVolume());
 }
 
 bool net_radio_play_station(uint8_t index) {
@@ -1125,18 +1215,22 @@ bool net_radio_play_url(const char *url, const char *name) {
 
 void net_radio_stop() {
   if (!running) return;
-  requestPlay(false, status.station, status.url, status.name);
+  RadioStatus s;
+  net_radio_snapshot(&s);
+  requestPlay(false, s.station, s.url, s.name);
 }
 
 bool net_radio_toggle() {
   if (!running) return false;
-  if (net_radio_active() || status.state == RADIO_CONNECTING ||
-      status.state == RADIO_RECONNECTING) {
+  RadioStatus s;
+  net_radio_snapshot(&s);
+  if (s.state == RADIO_PLAYING || s.state == RADIO_BUFFERING ||
+      s.state == RADIO_CONNECTING || s.state == RADIO_RECONNECTING) {
     net_radio_stop();
     return true;
   }
-  if (status.url[0]) {
-    requestPlay(true, status.station, status.url, status.name);
+  if (s.url[0]) {
+    requestPlay(true, s.station, s.url, s.name);
     return true;
   }
   return net_radio_play_station(0);
@@ -1144,7 +1238,9 @@ bool net_radio_toggle() {
 
 bool net_radio_step_station(bool forward) {
   if (!running || stationCount < 2) return false;
-  int8_t current = status.station;
+  RadioStatus s;
+  net_radio_snapshot(&s);
+  int8_t current = s.station;
   if (current < 0) current = 0;
   const int8_t next = (int8_t)((current + (forward ? 1 : stationCount - 1)) % stationCount);
   return net_radio_play_station((uint8_t)next);
@@ -1152,13 +1248,13 @@ bool net_radio_step_station(bool forward) {
 
 void net_radio_set_volume(uint8_t volume) {
   const uint8_t want = volume > 127 ? 127 : volume;
-  if (want == volume127) return;
-  volume127 = want;
+  if (want == currentVolume()) return;
+  publishVolume(want);
   volumeDirty = true;
   volumeDirtyAt = millis();
 }
 
-uint8_t net_radio_volume() { return volume127; }
+uint8_t net_radio_volume() { return currentVolume(); }
 
 bool net_radio_autostart() { return autostart; }
 
@@ -1194,7 +1290,9 @@ bool net_radio_set_station(uint8_t index, const char *name, const char *url) {
 
 bool net_radio_remove_station(uint8_t index) {
   if (index >= stationCount) return false;
-  if (running && status.station == (int8_t)index && net_radio_active()) {
+  RadioStatus s;
+  net_radio_snapshot(&s);
+  if (running && s.station == (int8_t)index && net_radio_active()) {
     net_radio_stop();
   }
   for (uint8_t i = index; i + 1 < stationCount; i++) stations[i] = stations[i + 1];
@@ -1315,25 +1413,26 @@ bool net_radio_command(const char *line) {
     LOGF(" | buffer %u%%", (unsigned)s.bufferPercent);
     if (s.underruns) LOGF(" | %u underruns", (unsigned)s.underruns);
     if (s.error[0]) LOGF(" | %s", s.error);
-    LOGF(" | volume %u", (unsigned)volume127);
+    LOGF(" | volume %u", (unsigned)currentVolume());
     /*
      * The two ways this feature can go wrong on a chip this size, as numbers.
      *
      * An https handshake is by a wide margin the deepest thing that runs on the
      * decoder task, so a stack margin down to a few hundred bytes is a crash
-     * waiting for a longer certificate chain. And "arena" is the 22 kB a stream
+     * waiting for a longer certificate chain. And "arena" is the 24 kB a stream
      * holds while it plays -- if that says "held" with nothing playing, it has
      * leaked, and the heap figures next to it are what the firmware updater's
      * TLS handshake has to work with.
      */
     if (task) {
       LOGF(" | task stack %u B free",
-                    (unsigned)(uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t)));
+                    (unsigned)uxTaskGetStackHighWaterMark(task));
     } else {
       LOGP(" | task not started");
     }
     LOGF(" | arena %s | heap %u free, %u largest\n",
-                  arena ? "held" : "released", (unsigned)ESP.getFreeHeap(),
+                  __atomic_load_n(&arenaHeldWord, __ATOMIC_ACQUIRE)
+                      ? "held" : "released", (unsigned)ESP.getFreeHeap(),
                   (unsigned)ESP.getMaxAllocHeap());
     for (uint8_t i = 0; i < stationCount; i++) {
       LOGF("  %u%c %-28s %s\n", (unsigned)(i + 1),

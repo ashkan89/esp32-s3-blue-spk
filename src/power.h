@@ -83,7 +83,7 @@ bool power_auto_blind();
  * Because it does not fit. Deep sleep would be ~10 uA against the ~15 mA this
  * manages, and it was the first thing tried -- but esp_sleep's entry path has
  * to run with the flash cache off, so it lives in IRAM, and it wants about
- * 1.8 KB of it. This firmware has 821 bytes of IRAM left: the Bluetooth
+ * 1.8 KB of it. This firmware has 653 bytes of IRAM left: the Bluetooth
  * controller blob alone holds 33 KB there, and the same ceiling is why the
  * WS2812 driver is forty lines of RMT rather than a library and why the PSRAM
  * cache workaround is switched off in platformio.ini. Linking deep sleep in

@@ -3,7 +3,7 @@
  * doing", over the serial console.
  *
  * The dashboard already reports most of this, in more detail and more
- * legibly -- but the dashboard exists in three of the five radio modes, needs a
+ * legibly -- but the dashboard exists in two of the three radio modes, needs a
  * network the speaker may be failing to join, and is precisely what is missing
  * when something has gone wrong enough to be worth diagnosing. Bluetooth mode
  * has no web server at all. The serial port is there in every mode, from the

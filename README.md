@@ -421,10 +421,12 @@ python scripts/test_pin_check.py        # the pin map, checked on the host
 python scripts/test_settings_backup.py  # the settings backup format, ditto
 python scripts/test_arabic_shaping.py   # Persian shaping and bidi
 python scripts/gen_arabic_tables.py     # ...and its tables, vs Unicode
+python scripts/test_stability_policy.py # rollover, bounds and memory policy
+python scripts/test_audio_eq.py         # 1,000 stable EQ designs/rates/gains
 ```
 
-There is one environment, `esp32dev`, so `pio run` and `pio run -e esp32dev` are
-the same thing.
+There are three declared environments. Plain `pio run` builds all three;
+`pio run -e esp32dev` builds only the development image.
 
 Then on your phone: Bluetooth settings → pair with **"esp32-blue-spk"** → play.
 
@@ -470,7 +472,7 @@ all 21 pin-map cases behaved as specified
 
 ## Development and release builds
 
-Two environments, and the difference is what the firmware is willing to say.
+Three environments, and the difference is what the firmware is willing to say.
 
 ```
 pio run -e esp32dev -t upload      # development: logs, console, diag
@@ -1876,7 +1878,7 @@ written black and then have its task parked, in that order.
 would be tens of microamps against the ~15 mA this manages — five days on a
 2000 mAh pack rather than effectively forever. It was the first thing tried. The
 sleep entry path has to run with the flash cache disabled, so it lives in IRAM,
-and it wants about 1.8 KB of it; this firmware has **821 bytes** of IRAM left.
+and it wants about 1.8 KB of it; this firmware has **653 bytes** of IRAM left.
 The Bluetooth controller blob alone holds 33 KB there, which is the same ceiling
 that makes the WS2812 driver forty lines of RMT rather than a library and that
 switched off the PSRAM cache workaround in [platformio.ini](platformio.ini).
@@ -2189,7 +2191,7 @@ and that is the whole of the arbitration.
 ### What it costs when it is not playing
 
 Nothing. This matters more than it sounds on a chip with 320 kB of DRAM and no
-PSRAM, because the firmware updater needs a *contiguous* 34 kB block for its TLS
+PSRAM, because the firmware updater needs a *contiguous* 45 kB block for its TLS
 handshake against the Mozilla root bundle — and an early 24 kB allocation sits in
 the middle of the heap splitting exactly the block the handshake wants. The first
 version of this feature took its buffers and its task at boot in both Wi-Fi
@@ -2202,7 +2204,7 @@ So the radio is allocated on demand:
 |---|---|---|
 | Station list | boot, in Wi-Fi modes only | 2.4 kB |
 | Decoder task stack | the first station you play | 10 kB |
-| Ring + socket chunk + decoder feed | one block, while a stream runs | 22 kB |
+| Ring + socket chunk + decoder feed | one block, while a stream runs | 24 kB |
 | MP3 or AAC decoder | while a stream runs | ~30 kB |
 
 The arena is claimed *after* the TLS handshake for an https station, not before,
@@ -2387,7 +2389,7 @@ graph                  the three series as sparklines, with the ranges
 ## What all of this costs
 
 This is a chip with 320 kB of DRAM, no PSRAM, and a firmware updater that needs a
-*contiguous* 34 kB block for its TLS handshake. Every feature above was built
+*contiguous* 45 kB block for its TLS handshake. Every feature above was built
 against that, and two of them were built against it twice — the first versions
 took their memory at boot and the visible symptom was **Check for updates**
 failing with "not enough memory for a secure connection" on a speaker that had
@@ -2398,14 +2400,14 @@ What the whole bundle adds, measured from the linked image:
 | | Cost |
 |---|---|
 | Static DRAM, all six modules | ~3 kB |
-| Static DRAM, whole firmware | 84.5 kB → 89.4 kB |
-| IRAM | **zero** — nothing here, nor libhelix, nor PubSubClient, is in IRAM |
+| Static DRAM, whole development firmware | 89,684 B |
+| IRAM, whole development firmware | 130,419 / 131,072 B — **653 B spare** |
 | Heap at boot (Wi-Fi modes) | 3.8 kB — the history ring and the station list |
 | Heap at boot (Bluetooth mode) | 1.4 kB — the history ring only |
 | Flash | +620 kB, of which 355 kB is the recorded speech |
 
 Everything else is claimed when it is used and given back afterwards: the radio's
-22 kB arena and ~30 kB decoder while a stream runs, the 10 kB decoder task from
+24 kB arena and ~30 kB decoder while a stream runs, the 10 kB decoder task from
 the first station played, MQTT's 1.3 kB buffer while the broker is connected.
 
 Three rules came out of getting this wrong the first time, and they are worth
@@ -2578,8 +2580,9 @@ If the hardware path is sound but Bluetooth playback is noisy, check:
 - `buffer_count` / `buffer_size` in `make_i2s_config()` in
   [src/main.cpp](src/main.cpp). On IDF 5 these do not reach the driver as-is —
   AudioTools folds them into `dma_frame_num = buffer_size * buffer_count /
-  frame_size`, with `dma_desc_num` left at 6. The 6 × 512 here gives ~104 ms of
-  DMA slack, which is already generous for A2DP jitter. **Do not raise the
+  frame_size`, with `dma_desc_num` left at 6. The 6 × 512 here produces six
+  3,072-byte descriptors: 18,432 bytes and ~104 ms of DMA slack, which is
+  already generous for A2DP jitter. **Do not raise the
   product past 4092**: IDF caps a DMA descriptor at 4092 bytes and rejects the
   channel outright, so you get silence rather than more headroom.
 - `auto_clear = true`. Without it, an underrun re-plays the stale DMA buffer and
@@ -2603,7 +2606,7 @@ Other things it might be:
 
 The radio refuses to start a stream when free heap is below 70 kB or the largest
 contiguous block is below 26 kB, and says so on the Radio page rather than
-trying anyway. Those are not arbitrary: a stream needs the 22 kB arena, a ~30 kB
+trying anyway. Those are not arbitrary: a stream needs the 24 kB arena, a ~30 kB
 decoder and a socket, and the layers underneath allocate too.
 
 It refuses because the alternative is worse. An allocation that fails inside the
@@ -2636,7 +2639,7 @@ lowest it has ever been, and the largest free block. Things that make it worse:
 - **"Always keep setup hotspot on"** in Settings. Running the access point and
   the station together costs a second network interface, a DHCP server and
   beacon buffers — tens of kilobytes, permanently.
-- A firmware update check at the same time; TLS wants its own 34 kB block.
+- A firmware update check at the same time; TLS wants its own 45 kB block.
 - Several browser tabs on the dashboard, each polling.
 
 ### It rebooted in a loop after I set a station to resume at boot
@@ -3041,13 +3044,22 @@ group — most of the pass criteria below are one line of that report.
 | [src/pin_check.h](src/pin_check.h) | the whole pin map in one place, asserted at compile time — no code, no flash |
 | [src/app_config.h](src/app_config.h) | the build-time switches — `SERIAL_LOG`, `CONSOLE_ENABLED`, `DIAGNOSTICS_ENABLED` — and the `LOGF`/`LOGLN`/`LOGP` macros every file logs through |
 | [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |
+| [src/memory_pressure.h](src/memory_pressure.h) / [.cpp](src/memory_pressure.cpp) | hysteretic heap/fragmentation pressure tracking and bounded optional-work policy |
+| [src/runtime_events.h](src/runtime_events.h) / [.cpp](src/runtime_events.cpp) | checked RTC no-init lifecycle breadcrumb retained across resets |
+| [src/stability_policy.h](src/stability_policy.h) | dependency-free production bounds for memory, timers, rings, URLs, UTF-8, EQ, backoff and PCM math |
 | [scripts/test_pin_check.py](scripts/test_pin_check.py) | host-side test that the pin assertions actually assert — 21 cases, no board needed |
 | [scripts/test_settings_backup.py](scripts/test_settings_backup.py) | host-side test that the settings backup and restore agree, key by key, and cover every stored preference |
+| [scripts/test_stability_policy.py](scripts/test_stability_policy.py) | compiles and tests the actual production policy header with the Xtensa compiler |
+| [scripts/test_audio_eq.py](scripts/test_audio_eq.py) | sweeps 1,000 production EQ designs across sample rates, bands and gain limits |
 | [src/text_arabic.h](src/text_arabic.h) / [.cpp](src/text_arabic.cpp) | Arabic-script shaping and right-to-left ordering: four contextual shapes per letter, lam-alef ligatures, mixed Latin runs |
 | [scripts/gen_arabic_tables.py](scripts/gen_arabic_tables.py) | derives the shaping tables from Unicode and checks the committed ones still match |
 | [scripts/test_arabic_shaping.py](scripts/test_arabic_shaping.py) | host-side test of the shaping and ordering, plus every emitted glyph against the font's real glyph table |
 | [scripts/font_bitmap.py](scripts/font_bitmap.py) | decodes u8g2 glyph bitmaps to draw text as ASCII art — the only way to see whether Persian came out looking like Persian |
 | [scripts/font_coverage.py](scripts/font_coverage.py) | parses u8g2_fonts.c to report which codepoints a font actually contains |
+
+The measured build, memory and concurrency review is recorded in
+[docs/stability-memory-audit.md](docs/stability-memory-audit.md), including the
+remaining hardware-only soak tests and their pass/fail criteria.
 
 ## Notes on the toolchain
 
@@ -3087,7 +3099,7 @@ group — most of the pass criteria below are one line of that report.
   the WS2812 driver overflowed the segment by 216 bytes and would not link.
   Dropping the barriers shrinks libc, and going straight to `rmt_tx` instead of
   the Arduino wrapper avoids dragging `rmt_rx.c` in for a direction the speaker
-  never uses — another 523 bytes. Together that leaves about 780 bytes of IRAM
+  never uses — another 523 bytes. Together that leaves about 760 bytes of IRAM
   free, where the alternative was a build that did not link at all.
 
   If you ever build this for a WROVER **and enable PSRAM**, delete the

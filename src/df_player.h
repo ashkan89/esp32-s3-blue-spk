@@ -197,6 +197,10 @@ bool df_player_snapshot(DfStatus *out);
 /// Just the state, read without locking, for the status LED.
 DfState df_player_state();
 
+/// Command queue observability; high-water is since this boot.
+uint8_t df_player_queue_depth();
+uint8_t df_player_queue_high_water();
+
 // --- commands. All safe from any task; all return immediately. --------------
 //
 // Nothing here blocks on the module. A command is queued, the driver task puts

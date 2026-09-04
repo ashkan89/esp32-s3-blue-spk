@@ -6,6 +6,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "app_config.h"
+
 // ------------------------------------------------------------------- ring ----
 // 1024 decimated samples is 46 ms at 22.05 kHz: enough for the FFT window plus
 // slack for the oscilloscope trigger to hunt for a zero crossing.
@@ -13,7 +15,7 @@ static const uint16_t RING_SIZE = 1024;  // power of two, masked not divided
 static const uint16_t RING_MASK = RING_SIZE - 1;
 
 static int16_t ring[RING_SIZE];
-static volatile uint32_t ring_written;  // monotonic count, never wraps in practice
+static uint32_t ring_written;  // monotonic count, wraps harmlessly after days
 
 /*
  * Whether the feed is still running.
@@ -94,7 +96,13 @@ static const float ACTIVE_ABOVE_FLOOR_DB = 8.0f;
 /// The last untilted peak, in dBFS, purely so the dashboard can show what the
 /// analyser is actually hearing. "It says nothing is playing and it is" is not
 /// a thing anybody should have to guess at twice.
-static float last_peak_db = FLOOR_DB;
+static uint32_t last_peak_word;
+
+static void publish_peak_db(float value) {
+  uint32_t bits;
+  memcpy(&bits, &value, sizeof(bits));
+  __atomic_store_n(&last_peak_word, bits, __ATOMIC_RELEASE);
+}
 /// The auto-gain ceiling is clamped here so that near-silence does not get
 /// amplified into a full-height display of dither noise.
 static const float AGC_MIN_DB = -42.0f;
@@ -105,6 +113,10 @@ static const float TILT_TOP_DB = 11.0f;
 
 void audio_probe_init() {
   analyse_gate = xSemaphoreCreateMutex();
+  if (!analyse_gate) {
+    LOGLN("[audio] no memory for analyser lock; spectrum is disabled");
+  }
+  publish_peak_db(FLOOR_DB);
 
   // Hann window: the cheapest window that keeps a single tone from smearing
   // across half the display.
@@ -163,7 +175,7 @@ void audio_probe_feed(const Frame *frames, uint16_t count) {
 
   uint32_t sq_l = 0, sq_r = 0;
   uint16_t pk_l = 0, pk_r = 0;
-  uint32_t head = ring_written;
+  uint32_t head = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
 
   for (uint16_t i = 0; i < count; i++) {
     const int32_t l = frames[i].channel1;
@@ -196,8 +208,7 @@ void audio_probe_feed(const Frame *frames, uint16_t count) {
 
   // Publish the new samples only after they are all stored, so a reader can
   // never be pointed at a slot that has not been written yet.
-  __sync_synchronize();
-  ring_written = head;
+  __atomic_store_n(&ring_written, head, __ATOMIC_RELEASE);
 
   portENTER_CRITICAL(&meter_mux);
   meter_sq_l += sq_l;
@@ -296,7 +307,7 @@ static void analyse_locked(uint32_t dt_ms) {
 
   // --- copy the newest FFT_SIZE samples out of the ring -------------------
   // Stale samples are silence: see the note on ring_head_seen above.
-  const uint32_t head = ring_written;
+  const uint32_t head = __atomic_load_n(&ring_written, __ATOMIC_ACQUIRE);
   if (head != ring_head_seen) {
     ring_head_seen = head;
     ring_head_at = now;
@@ -364,9 +375,11 @@ static void analyse_locked(uint32_t dt_ms) {
     if (b < 4) bass_energy += sqrtf(best) * bin_scale;
   }
 
-  last_peak_db = frame_peak_db;
+  publish_peak_db(frame_peak_db);
   vis.active = frame_peak_db > FLOOR_DB + ACTIVE_ABOVE_FLOOR_DB;
-  if (vis.active) last_active_ms = now;
+  if (vis.active) {
+    __atomic_store_n(&last_active_ms, now, __ATOMIC_RELEASE);
+  }
 
   /*
    * Auto-gain.
@@ -494,30 +507,22 @@ static void analyse_locked(uint32_t dt_ms) {
 /*
  * One analysis, any number of watchers. See the note at the top of the header.
  *
- * The published copy is written under a seqlock (odd while writing, even when
- * settled) so a reader either gets a whole frame or notices the collision and
- * retries. `analyse_gate` serialises the FFT itself and is only ever *tried*,
- * never waited on -- a caller that finds it held is by definition about to be
- * handed a frame that is at most one window old, which is not worth blocking a
- * render task for.
+ * `analyse_gate` serialises the FFT itself and is only ever *tried*, never
+ * waited on. A short cross-core critical section protects the published frame;
+ * it is used only by the two low-priority visual tasks, never by PCM input.
  */
 static uint32_t analysed_at;      // millis() of the last real analysis
 static AudioVis published;
-static volatile uint32_t publish_seq;
+static portMUX_TYPE publish_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void publish() {
-  // Read-modify-write spelled out rather than ++: the increment's ordering is
-  // the whole mechanism here, and ++ on a volatile leaves that unspecified (and
-  // is deprecated in C++20 for exactly that reason). player_state.cpp writes
-  // its seqlock the same way.
-  publish_seq = publish_seq + 1;  // odd: a write is in progress
-  __sync_synchronize();
+  portENTER_CRITICAL(&publish_mux);
   memcpy(&published, &vis, sizeof(published));
-  __sync_synchronize();
-  publish_seq = publish_seq + 1;  // even: settled
+  portEXIT_CRITICAL(&publish_mux);
 }
 
 void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
+  if (!out) return;
   if (analyse_gate && xSemaphoreTake(analyse_gate, 0) == pdTRUE) {
     const uint32_t now = millis();
     const uint32_t age = now - analysed_at;
@@ -529,26 +534,18 @@ void audio_probe_frame(AudioVis *out, uint16_t min_interval_ms) {
     xSemaphoreGive(analyse_gate);
   }
 
-  /*
-   * Bounded, like ps_snapshot(). The window a writer holds the sequence open
-   * for is one memcpy of an AudioVis, so a reader that has lost eight times
-   * running is not racing a publisher any more -- it is spinning against
-   * something that stopped mid-write, and at that point spinning forever on a
-   * render task pinned to core 0 would starve the idle task and trip the task
-   * watchdog. A frame with a seam in it is invisible at 30 fps; a watchdog
-   * reset is not.
-   */
-  for (int attempt = 0; attempt < 8; attempt++) {
-    const uint32_t before = publish_seq;
-    if (before & 1u) continue;    // a write is in flight; look again
-    __sync_synchronize();
-    memcpy(out, &published, sizeof(*out));
-    __sync_synchronize();
-    if (publish_seq == before) return;
-  }
+  portENTER_CRITICAL(&publish_mux);
   memcpy(out, &published, sizeof(*out));
+  portEXIT_CRITICAL(&publish_mux);
 }
 
-uint32_t audio_probe_last_active() { return last_active_ms; }
+uint32_t audio_probe_last_active() {
+  return __atomic_load_n(&last_active_ms, __ATOMIC_ACQUIRE);
+}
 
-float audio_probe_peak_db() { return last_peak_db; }
+float audio_probe_peak_db() {
+  const uint32_t bits = __atomic_load_n(&last_peak_word, __ATOMIC_ACQUIRE);
+  float value;
+  memcpy(&value, &bits, sizeof(value));
+  return value;
+}

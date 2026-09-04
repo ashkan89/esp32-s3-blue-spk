@@ -10,6 +10,7 @@
 #include <esp_mac.h>
 #include <esp_ota_ops.h>
 #include <esp_partition.h>
+#include <esp32-hal-psram.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -22,19 +23,32 @@
 #include "hw_config.h"
 #include "leds.h"
 #include "management.h"
+#include "memory_pressure.h"
+#include "net_radio.h"
 // For PIN_MAP_I2S_*: pin_check.h is where the whole pin map is visible at once,
 // which is exactly what a report of the pin map wants.
 #include "pin_check.h"
 #include "player_state.h"
 #include "power.h"
+#include "runtime_events.h"
 #include "soft_clock.h"
 #include "status_led.h"
 #include "ui.h"
 #include "ui_config.h"
+#include "voice.h"
 
 namespace {
 
 const char *yes_no(bool value) { return value ? "yes" : "no"; }
+
+const char *source_name(PsSource source) {
+  switch (source) {
+    case PS_SRC_BLUETOOTH: return "Bluetooth A2DP";
+    case PS_SRC_DFPLAYER: return "DFPlayer";
+    case PS_SRC_RADIO: return "internet radio";
+    default: return "none";
+  }
+}
 
 const char *reset_reason(esp_reset_reason_t reason) {
   switch (reason) {
@@ -61,8 +75,9 @@ void print_uptime(uint32_t ms) {
 /*
  * Stack headroom for one task, by name.
  *
- * uxTaskGetStackHighWaterMark() reports the *smallest* the free part of the
- * stack has ever been, in words -- so it is a watermark that only ever falls,
+ * ESP-IDF's uxTaskGetStackHighWaterMark() reports the *smallest* the free part
+ * of the stack has ever been, in bytes (unlike upstream FreeRTOS) -- so it is a
+ * watermark that only ever falls,
  * and it is the only warning available before an overflow, which on this chip
  * is a panic with a backtrace pointing at whatever unlucky function was running
  * when the guard was crossed. Under about 400 bytes is worth acting on.
@@ -78,7 +93,7 @@ void print_stack(const char *name) {
     LOGF("  %-10s not running\n", name);
     return;
   }
-  const unsigned bytes = uxTaskGetStackHighWaterMark(task) * sizeof(StackType_t);
+  const unsigned bytes = uxTaskGetStackHighWaterMark(task);
   LOGF("  %-10s %5u bytes never used%s\n", name, bytes,
                 bytes < 400 ? "   <-- tight, raise this task's stack" : "");
 }
@@ -154,6 +169,13 @@ void print_report() {
   LOGP("uptime        ");
   print_uptime(now);
   LOGLN();
+  RuntimeEventStatus events;
+  runtime_event_snapshot(&events);
+  LOGF("lifecycle     %s at %u ms\n", runtime_event_name(events.current),
+                (unsigned)events.currentAtMs);
+  LOGF("prior boot    %s at %u ms before reset\n",
+                runtime_event_name(events.previousBoot),
+                (unsigned)events.previousBootAtMs);
 
   struct tm clock_now;
   soft_clock_now(&clock_now);
@@ -185,11 +207,25 @@ void print_report() {
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
                                                            MALLOC_CAP_8BIT));
-  LOGF("  DMA-capable %6u bytes free  (I2S descriptors live here)\n",
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
-  // No PSRAM on a WROOM-32D, and saying so is worth one line: every third
-  // ESP32 answer on the internet assumes there is some.
-  LOGLN(F("  psram       none (WROOM-32D has no external SPI RAM)"));
+  LOGF("  DMA-capable %6u bytes free, %u largest (I2S lives here)\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA));
+  LOGF("  executable  %6u bytes free, %u largest\n",
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_EXEC),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_EXEC));
+  if (psramFound()) {
+    LOGF("  psram       %6u bytes total, %u free, %u largest\n",
+                  (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+  } else {
+    LOGLN(F("  psram       not detected (all working buffers are internal)"));
+  }
+  MemoryPressureStatus pressure;
+  memory_pressure_snapshot(&pressure);
+  LOGF("  pressure    %s since %u ms, %u transition%s\n",
+                memory_pressure_name(pressure.level),
+                (unsigned)pressure.sinceMs, (unsigned)pressure.transitions,
+                pressure.transitions == 1 ? "" : "s");
 
   LOGLN(F("--- task stacks (smallest free ever) ----------------------"
                    "---------------"));
@@ -197,8 +233,18 @@ void print_report() {
   print_stack("ui");
   print_stack("leds");
   print_stack("dfplayer");
+  print_stack("radio");
+  print_stack("github_ota");
+  print_stack("BTU_TASK");
+  print_stack("BTC_TASK");
+  print_stack("audio_task");
   LOGF("  tasks       %u running\n",
                 (unsigned)uxTaskGetNumberOfTasks());
+  LOGF("  queues      voice %u (peak %u) | dfplayer %u (peak %u)\n",
+                (unsigned)voice_queue_depth(),
+                (unsigned)voice_queue_high_water(),
+                (unsigned)df_player_queue_depth(),
+                (unsigned)df_player_queue_high_water());
 
   // --- what is fitted -------------------------------------------------------
   /*
@@ -273,8 +319,20 @@ void print_report() {
   PlayerInfo info;
 
   ps_snapshot(&info);
+  LOGF("  source      %s\n", source_name(info.source));
   LOGF("  connected   %s%s%s\n", yes_no(info.connected),
                 info.peer[0] ? " -- " : "", info.peer);
+  if (net_radio_running()) {
+    RadioStatus radio;
+    net_radio_snapshot(&radio);
+    LOGF("  stream      %s, buffer %u%%, %u underruns, %u reconnects, "
+                  "%u bytes\n",
+                  net_radio_state_name(radio.state),
+                  (unsigned)radio.bufferPercent, (unsigned)radio.underruns,
+                  (unsigned)radio.reconnects, (unsigned)radio.bytes);
+  } else {
+    LOGLN(F("  stream      not running in this mode"));
+  }
 
   /*
    * What the analyser is hearing, which is the honest answer to "is anything

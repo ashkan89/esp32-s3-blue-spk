@@ -22,18 +22,16 @@ constexpr uint32_t BLIP_MS = 55;
 
 uint8_t ledPin = 0xFF;
 bool ledActiveHigh = true;
-volatile uint8_t baseState = LED_BOOT;
-volatile bool muted;
+uint8_t baseState = LED_BOOT;
+bool muted;
 
 /*
  * The blip counter, and the one thing here that needs a lock.
  *
- * Everything else in this file is a single-byte store from one side and a load
- * from the other, which on this chip is atomic in the only sense that matters:
- * a reader sees the old value or the new one. `blipSlots` is different because
- * both sides read-modify-write it -- status_led_blip() raises it from the
- * Bluetooth and Wi-Fi callback tasks, status_led_tick() decrements it from the
- * Arduino loop -- and a decrement that lands between the other side's load and
+ * The base state, mute flag and GPIO are owned by the Arduino loop. `blipSlots`
+ * is shared and both sides read-modify-write it: status_led_blip() raises it
+ * from the Bluetooth and Wi-Fi callback tasks, status_led_tick() decrements it
+ * from the Arduino loop -- and a decrement that lands between the other side's load and
  * store is simply lost. The visible cost is small (a blip one flash short, or
  * one that never ends because the decrement to zero was the one dropped) but
  * the second of those leaves the indicator stuck, and the fix is four

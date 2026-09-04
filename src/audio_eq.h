@@ -23,10 +23,10 @@
  * network audio. Both are audio paths where blocking is not allowed, so:
  *
  *   - it never allocates, never locks, and never calls into anything that does;
- *   - coefficients are recomputed on the *caller's* task -- the web handler --
- *     into a shadow set, and the audio task adopts them at a block boundary by
- *     flipping one index. A torn read is impossible because nothing is ever
- *     written to the set the audio task is reading;
+ *   - coefficients are recomputed on the *caller's* task and published through
+ *     a sequence-checked snapshot. The audio task adopts an immutable copy at
+ *     a block boundary; rapid consecutive updates cannot wrap a two-buffer
+ *     index and overwrite coefficients still in use;
  *   - with every gain at zero and no preamp it returns immediately, so an owner
  *     who never opens the Sound page pays one comparison per buffer.
  *
@@ -127,9 +127,8 @@ const char *audio_eq_preset_name(uint8_t preset);
 /// has its own tone control and this one is not in the sample path at all.
 uint8_t audio_eq_hw_preset(uint8_t preset);
 
-/// Installs a configuration. Safe from any task: the coefficients are computed
-/// here, on the caller, into the set the audio task is *not* reading, and the
-/// swap is a single store. Clamps everything it is given.
+/// Installs a configuration. Safe from any task: expensive coefficient work is
+/// done on the caller and publication is sequence checked. Clamps every input.
 void audio_eq_configure(const EqConfig &cfg);
 
 /// The live configuration, as stored.
@@ -140,7 +139,8 @@ void audio_eq_get(EqConfig *out);
 /// returns immediately when the rate has not changed -- so the A2DP and radio
 /// paths can both call it whenever their source tells them the rate, which for
 /// a stream that switches from 44.1 to 48 kHz mid-session is the only warning
-/// there is. Safe from the audio task.
+/// there is. Filter state is reset by the consumer at the next block boundary,
+/// so this is safe from any task.
 void audio_eq_set_sample_rate(uint32_t hz);
 
 /*

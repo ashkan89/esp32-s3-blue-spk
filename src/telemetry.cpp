@@ -9,6 +9,7 @@
 #include "audio_probe.h"
 #include "battery.h"
 #include "power.h"
+#include "stability_policy.h"
 
 namespace {
 
@@ -135,7 +136,7 @@ void telemetry_loop() {
   lastSampleMs = now;
 
   fill(&ring[ringHead]);
-  ringHead = (uint16_t)((ringHead + 1) % TELEMETRY_SAMPLES);
+  ringHead = (uint16_t)stability_ring_advance(ringHead, 1, TELEMETRY_SAMPLES);
   if (ringCount < TELEMETRY_SAMPLES) ringCount++;
 }
 
@@ -144,8 +145,8 @@ uint16_t telemetry_count() { return ring ? ringCount : 0; }
 bool telemetry_at(uint16_t index, TelemetrySample *out) {
   if (!out || !ring || index >= ringCount) return false;
   // The oldest sample sits `ringCount` places behind the head, wrapping.
-  const uint16_t start =
-      (uint16_t)((ringHead + TELEMETRY_SAMPLES - ringCount) % TELEMETRY_SAMPLES);
+  const uint16_t start = (uint16_t)stability_ring_oldest(
+      ringHead, ringCount, TELEMETRY_SAMPLES);
   *out = ring[(start + index) % TELEMETRY_SAMPLES];
   return true;
 }

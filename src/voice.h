@@ -103,13 +103,17 @@ bool voice_say(VoiceClipId clip, VoiceCategory category);
 /// not known at compile time. Out-of-range indices are dropped.
 bool voice_say_index(uint8_t clip, VoiceCategory category);
 
-/// Drops anything queued and stops what is being said. For the moment the owner
-/// switches announcements off, and for standby.
+/// Drops anything queued and asks the decoder's current owner to stop at its
+/// next buffer boundary. A control task never resets live decoder state.
 void voice_silence();
 
 /// True when there is something queued or in progress -- the flag loop() and
 /// the melody code both consult before taking the DAC.
 bool voice_busy();
+
+/// Announcement queue observability; high-water is since this boot.
+uint8_t voice_queue_depth();
+uint8_t voice_queue_high_water();
 
 /// Tells the decoder what rate the buffers it is asked to fill are at. Cheap
 /// and idempotent. Safe from the audio task.

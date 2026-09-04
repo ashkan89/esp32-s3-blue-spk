@@ -76,11 +76,13 @@
 #include "leds.h"
 #include "home_assistant.h"
 #include "management.h"
+#include "memory_pressure.h"
 #include "net_radio.h"
 #include "telemetry.h"
 #include "voice.h"
 #include "player_state.h"
 #include "power.h"
+#include "runtime_events.h"
 #include "soft_clock.h"
 #include "status_led.h"
 #include "ui.h"
@@ -152,8 +154,9 @@ I2SStream i2s;
  * IDF caps one DMA descriptor at 4092 bytes, so buffer_size * buffer_count
  * must stay <= 4092 or i2s_new_channel() rejects the config and you get no
  * sound at all. The defaults below (6 x 512 = 3072 B -> 768 frames/descriptor,
- * 6 descriptors, ~104 ms total) already carry plenty of slack for A2DP jitter;
- * they are spelled out here so the ceiling is visible if you want to tune.
+ * 6 descriptors = 18,432 bytes, ~104 ms total) already carry plenty of slack
+ * for A2DP jitter; they are spelled out here so the ceiling is visible if you
+ * want to tune.
  *
  * use_apll derives the bit clock from the audio PLL so 44.1 kHz is exact
  * rather than a fractional approximation. Set false if an unusual sample rate
@@ -409,7 +412,8 @@ BluetoothA2DPSink a2dp_sink(i2s);
  *
  *   1. Nothing is played from a Bluetooth callback. Those run in line with the
  *      audio path, and half a second of blocking I2S writes there would stall
- *      the decoder. A callback only sets `pending_melody`; loop() plays it.
+ *      the decoder. A callback only publishes `pending_melody_word`; loop()
+ *      consumes it.
  *   2. Nothing is played while a stream is actually running, or the Bluetooth
  *      task and the Arduino task would interleave samples into one I2S channel.
  *      On connect the phone has not pressed play yet, and after a disconnect
@@ -444,8 +448,12 @@ enum MelodyId : uint8_t {
   MELODY_ID_NOTIFY,
 };
 
-// Written from the Bluetooth task, read from loop().
-static volatile uint8_t pending_melody = MELODY_NONE;
+// Written from the Bluetooth task, consumed atomically by loop().
+static uint32_t pending_melody_word = MELODY_NONE;
+
+static void queue_melody(MelodyId melody) {
+  __atomic_store_n(&pending_melody_word, (uint32_t)melody, __ATOMIC_RELEASE);
+}
 
 // The sink is started from loop(), not setup(): see service_bluetooth_start().
 static bool bt_started;
@@ -550,9 +558,9 @@ static void service_voice() {
 /// Plays whatever a callback queued. Called from loop(), never from the
 /// Bluetooth task.
 static void service_melody() {
-  const uint8_t id = pending_melody;
+  const uint8_t id = (uint8_t)__atomic_exchange_n(
+      &pending_melody_word, (uint32_t)MELODY_NONE, __ATOMIC_ACQ_REL);
   if (id == MELODY_NONE) return;
-  pending_melody = MELODY_NONE;
 
   // Music already flowing? Then another task owns the I2S channel.
   if (dac_busy()) return;
@@ -587,14 +595,16 @@ static void service_melody() {
 void on_connection_state_changed(esp_a2d_connection_state_t state, void *) {
   switch (state) {
     case ESP_A2D_CONNECTION_STATE_CONNECTED:
+      runtime_event_note(RUNTIME_EVENT_BT_CONNECTED);
       status_led_blip(2);
       ps_set_connection(true, *a2dp_sink.get_current_peer_address());
-      pending_melody = MELODY_ID_CONNECT;
+      queue_melody(MELODY_ID_CONNECT);
       break;
     case ESP_A2D_CONNECTION_STATE_DISCONNECTED:
+      runtime_event_note(RUNTIME_EVENT_BT_DISCONNECTED);
       status_led_blip(3);
       ps_set_connection(false, nullptr);
-      pending_melody = MELODY_ID_DISCONNECT;
+      queue_melody(MELODY_ID_DISCONNECT);
       break;
     default:  // CONNECTING / DISCONNECTING: nothing to announce yet
       break;
@@ -736,6 +746,7 @@ static bool alarm_chime_active;
 
 static bool alarm_chime(bool start) {
   alarm_chime_active = start;
+  if (start) runtime_event_note(RUNTIME_EVENT_ALARM);
   return true;
 }
 
@@ -855,9 +866,20 @@ static void log_state_changes() {
   static uint32_t seen_track_seq;
   static bool seen_connected;
   static char seen_peer[PS_NAME_MAX];
+  static uint16_t seen_sample_rate = SAMPLE_RATE;
 
   PlayerInfo s;
   ps_snapshot(&s);
+
+  // The callback only publishes the number; trigonometry and decoder mutation
+  // do not belong on Bluedroid's callback task. Both consumers adopt the new
+  // rate safely at their next buffer boundary.
+  if (s.sample_rate >= 8000 && s.sample_rate <= 96000 &&
+      s.sample_rate != seen_sample_rate) {
+    seen_sample_rate = s.sample_rate;
+    audio_eq_set_sample_rate(s.sample_rate);
+    voice_set_sample_rate(s.sample_rate);
+  }
 
   if (s.connected != seen_connected) {
     seen_connected = s.connected;
@@ -1088,7 +1110,7 @@ static void service_bluetooth_start() {
                 DEVICE_NAME, (unsigned)heap_before,
                 (unsigned)ESP.getFreeHeap());
   // Chime once the radio is up: the speaker is ready to be paired.
-  pending_melody = MELODY_ID_NOTIFY;
+  queue_melody(MELODY_ID_NOTIFY);
 }
 
 /*
@@ -1130,7 +1152,7 @@ static void service_dfplayer() {
     if (loop == DF_LOOP_FOLDER) df_player_set_loop(DF_LOOP_FOLDER, loop_folder);
     df_autoplay_pending = autoplay;
     // Same chime the other modes play once their source is up.
-    pending_melody = MELODY_ID_NOTIFY;
+    queue_melody(MELODY_ID_NOTIFY);
     return;
   }
 
@@ -1216,6 +1238,10 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 #endif
+  // These are operational state, not diagnostics: release builds keep no UART
+  // open but still need pressure guardrails and a previous-boot breadcrumb.
+  memory_pressure_begin();
+  runtime_events_begin();
   LOGF("\n=== %s v%s ===\n", APP_NAME, FW_VERSION);
   LOGF("[boot] reset reason: %s | heap %u free, %u largest block\n",
                 reset_reason_text(esp_reset_reason()),
@@ -1259,9 +1285,9 @@ void setup() {
    * Started after the radio there can be eleven kilobytes left and a largest
    * block of ten, and i2s_alloc_dma_desc() simply fails -- silently as far as
    * the speaker is concerned, because every write after that goes to a channel
-   * that never opened. Started here it is asking for three kilobytes out of a
-   * hundred and forty, which cannot fail. The radio then fits around it rather
-   * than the other way about.
+   * that never opened. Started here it is asking for about eighteen kilobytes
+   * out of a hundred and forty, which cannot fail. The radio then fits around
+   * it rather than the other way about.
    *
    * Nothing between here and management_begin() touched I2S, so this is a move,
    * not a duplication.
@@ -1404,6 +1430,7 @@ void setup() {
   // the first frame this task draws is already the one the owner chose.
   if (have_leds) leds_start();
 
+  runtime_event_note(RUNTIME_EVENT_MODE_READY);
   LOGLN("Type 'help' for the serial commands (clock, screens, radio).");
 }
 
@@ -1429,6 +1456,7 @@ void loop() {
   // sample battery_loop() just took, and muting the LED is one of the things it
   // may decide to do.
   power_tick();
+  memory_pressure_tick();
   update_status_led();
   log_state_changes();
   soft_clock_tick();

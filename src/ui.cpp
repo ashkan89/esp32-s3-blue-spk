@@ -10,6 +10,7 @@
 
 #include "app_config.h"
 #include "management.h"
+#include "memory_pressure.h"
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
@@ -48,6 +49,7 @@ static U8G2_SSD1306_128X32_UNIVISION_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE,
 #endif
 
 static bool g_present;
+static bool task_running;
 
 /*
  * The battery glyph.
@@ -138,15 +140,15 @@ enum UiScreen : uint8_t {
 
 static UiScreen cur_screen = SCR_CLOCK;
 static uint32_t screen_since;
-static bool carousel_paused;
+static uint32_t carouselPausedWord;
 static uint8_t spectrum_style;  // 0 bars, 1 mirrored, 2 matrix
 
 // Requests from the serial console, which arrives on the Arduino task. They are
 // applied by the UI task at the top of a frame rather than acted on directly:
 // two tasks drawing into one frame buffer would tear, and the transition needs
 // the previous frame intact.
-static volatile int8_t req_screen = -1;
-static volatile bool req_next;
+static uint32_t reqScreenWord = UINT32_MAX;
+static uint32_t reqNextWord;
 
 // --------------------------------------------------------------- overlays ----
 enum ToastKind : uint8_t {
@@ -178,32 +180,54 @@ static portMUX_TYPE system_overlay_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // ------------------------------------------------------------------ timers ---
 static uint32_t last_frame_ms;
-static uint32_t last_activity_ms;
+static uint32_t lastActivityWord;
 
 /*
  * Two idle clocks, not one.
  *
- * last_activity_ms is the old one and audio keeps it warm, which is what the
+ * lastActivityWord is the old one and audio keeps it warm, which is what the
  * dim and the screensaver want: a speaker that is playing is not idle. It is
  * therefore useless for a blanking mode whose whole point is to go dark during
  * playback, so the moments the *owner* did something get their own timestamp.
  */
-static uint32_t last_input_ms;
+static uint32_t lastInputWord;
 
-static volatile bool power_save;
-static volatile bool suspended;
-static volatile uint8_t blank_mode = UI_BLANK_MODE_DEFAULT;
-static volatile uint32_t blank_after_ms = UI_BLANK_AFTER_S_DEFAULT * 1000UL;
-static bool panel_off;
+static uint32_t powerSaveWord;
+static uint32_t suspendedWord;
+static uint32_t blankModeWord = UI_BLANK_MODE_DEFAULT;
+static uint32_t blankAfterWord = UI_BLANK_AFTER_S_DEFAULT * 1000UL;
+static uint32_t panelOffWord;
+
+static inline uint32_t ui_load_word(const uint32_t *word) {
+  return __atomic_load_n(word, __ATOMIC_ACQUIRE);
+}
+
+static inline void ui_store_word(uint32_t *word, uint32_t value) {
+  __atomic_store_n(word, value, __ATOMIC_RELEASE);
+}
 
 /// One touch resets both clocks. Every caller wants both -- the owner pressing
 /// a button is activity by any definition.
 static void note_input(uint32_t now) {
-  last_activity_ms = now;
-  last_input_ms = now;
+  ui_store_word(&lastActivityWord, now);
+  ui_store_word(&lastInputWord, now);
 }
 static uint32_t frame_counter;
 static float fps_avg = UI_FPS;
+// Console diagnostics run on Arduino's task. Publish scalar copies instead of
+// letting it read the UI task's live enum/float state concurrently.
+static uint32_t statusScreenWord = SCR_CLOCK;
+static uint32_t statusStyleWord;
+static uint32_t statusFpsWord;
+
+static void publish_ui_status() {
+  uint32_t fps_bits = 0;
+  static_assert(sizeof(fps_bits) == sizeof(fps_avg), "float must be 32-bit");
+  memcpy(&fps_bits, &fps_avg, sizeof(fps_bits));
+  ui_store_word(&statusScreenWord, (uint32_t)cur_screen);
+  ui_store_word(&statusStyleWord, spectrum_style);
+  ui_store_word(&statusFpsWord, fps_bits);
+}
 
 // Edge detection against the previous snapshot.
 static bool have_prev_state;
@@ -213,7 +237,7 @@ static uint32_t prev_volume_seq;
 
 // --------------------------------------------------------------- brightness --
 static uint8_t bright_level = 1;  // 0 low, 1 mid, 2 high
-static uint8_t bright_override;   // 0 = none, else the exact contrast value
+static uint32_t brightOverrideWord;  // 0 = none, else exact contrast
 static uint8_t bright_applied = 0xFF;
 
 // ------------------------------------------------------------- transitions ---
@@ -234,10 +258,10 @@ static bool btn_consumed;
 static uint8_t btn_reset_shown = 0xFF;
 static bool btn_reset_fired;
 static bool btn_mode_offered;
-static volatile bool btn_reset_request;
+static uint32_t btnResetRequestWord;
 /// The radio-mode offer: non-zero while "press again to confirm" is on screen.
 static uint32_t btn_mode_until;
-static volatile bool btn_mode_request;
+static uint32_t btnModeRequestWord;
 
 // ---------------------------------------------------------------- waterfall --
 static uint8_t wf_fb[FB_BYTES];
@@ -1453,10 +1477,10 @@ static UiScreen pick_screen(const PlayerInfo &info, uint32_t now,
                             bool deep_idle) {
   // An explicit "screen N" from the console wins over everything, including the
   // eligibility rules: if it was asked for by hand, show it.
-  const int8_t req = req_screen;
+  const int8_t req = (int8_t)__atomic_exchange_n(
+      &reqScreenWord, UINT32_MAX, __ATOMIC_ACQ_REL);
   if (req >= 0) {
-    req_screen = -1;
-    carousel_paused = true;
+    ui_store_word(&carouselPausedWord, 1U);
     screen_since = now;
     return (UiScreen)req;
   }
@@ -1470,9 +1494,8 @@ static UiScreen pick_screen(const PlayerInfo &info, uint32_t now,
                                                        : SCR_CLOCK;
   }
 
-  if (req_next) {
-    req_next = false;
-    carousel_paused = false;
+  if (__atomic_exchange_n(&reqNextWord, 0U, __ATOMIC_ACQ_REL)) {
+    ui_store_word(&carouselPausedWord, 0U);
     screen_since = now;
     return next_eligible(cur_screen, info, now);
   }
@@ -1480,7 +1503,7 @@ static UiScreen pick_screen(const PlayerInfo &info, uint32_t now,
   // A pinned screen stays pinned even when it has nothing to show -- otherwise
   // "hold the spectrum" would spring back to the clock the moment the music
   // paused, which is not what pinning means.
-  if (carousel_paused) return cur_screen;
+  if (ui_load_word(&carouselPausedWord)) return cur_screen;
 
   if (!screen_eligible(cur_screen, info, now) ||
       now - screen_since >= UI_SCREEN_DWELL_MS) {
@@ -1504,7 +1527,7 @@ static void detect_events(const PlayerInfo &info, uint32_t now) {
     prev_connected = info.connected;
     toast_kind = info.connected ? TOAST_CONNECTED : TOAST_DISCONNECTED;
     toast_until = now + UI_TOAST_MS;
-    last_activity_ms = now;
+    ui_store_word(&lastActivityWord, now);
   }
 
   if (info.track_seq != prev_track_seq) {
@@ -1513,13 +1536,13 @@ static void detect_events(const PlayerInfo &info, uint32_t now) {
       toast_kind = TOAST_TRACK;
       toast_until = now + UI_TOAST_MS;
     }
-    last_activity_ms = now;
+    ui_store_word(&lastActivityWord, now);
   }
 
   if (info.volume_seq != prev_volume_seq) {
     prev_volume_seq = info.volume_seq;
     popup_until = now + UI_VOLUME_POPUP_MS;
-    last_activity_ms = now;
+    ui_store_word(&lastActivityWord, now);
   }
 }
 
@@ -1552,7 +1575,7 @@ static void poll_button(uint32_t now) {
     // Held: brightness, and stop there so releasing does not also switch screen.
     btn_consumed = true;
     bright_level = (uint8_t)((bright_level + 1) % 3);
-    bright_override = 0;
+    ui_store_word(&brightOverrideWord, 0U);
     note_input(now);
     return;
   }
@@ -1578,7 +1601,7 @@ static void poll_button(uint32_t now) {
     if (into >= UI_BTN_RESET_COUNT_MS) {
       if (!btn_reset_fired) {
         btn_reset_fired = true;
-        btn_reset_request = true;
+        ui_store_word(&btnResetRequestWord, 1U);
         ui_show_system_status(UI_STATUS_RESTART, "Factory reset",
                               "Release the button", 100, 0);
       }
@@ -1603,7 +1626,7 @@ static void poll_button(uint32_t now) {
   if (!down && btn_down) {
     btn_down = false;
     const uint32_t held = now - btn_since;
-    const bool was_dark = panel_off;
+    const bool was_dark = ui_load_word(&panelOffWord) != 0;
     note_input(now);
     // With the panel blanked the first press only brings it back. Anything else
     // means the screen you asked to see is one you never got to look at.
@@ -1624,7 +1647,7 @@ static void poll_button(uint32_t now) {
     if (held < UI_BTN_LONG_MS && held > 25 && btn_mode_until &&
         (int32_t)(now - btn_mode_until) < 0) {
       btn_mode_until = 0;
-      btn_mode_request = true;
+      ui_store_word(&btnModeRequestWord, 1U);
       ui_show_system_status(UI_STATUS_RESTART, "Switching mode", "Restarting",
                             -1, 0);
       return;
@@ -1632,17 +1655,18 @@ static void poll_button(uint32_t now) {
     btn_mode_until = 0;
 
     if (held >= UI_BTN_LONG_MS) {
-      carousel_paused = !carousel_paused;
+      __atomic_fetch_xor(&carouselPausedWord, 1U, __ATOMIC_ACQ_REL);
     } else if (held > 25) {  // anything shorter is contact bounce
-      req_next = true;
+      ui_store_word(&reqNextWord, 1U);
     }
   }
 }
 
 static void apply_brightness(bool dim) {
   uint8_t want;
-  if (bright_override != 0) {
-    want = bright_override;
+  const uint8_t override = (uint8_t)ui_load_word(&brightOverrideWord);
+  if (override != 0) {
+    want = override;
   } else if (dim) {
     want = UI_BRIGHT_DIM;
   } else {
@@ -1670,7 +1694,7 @@ static void ui_frame() {
   // A copy rather than a reference into the analyser: the lighting task reads
   // the same analysis, and a reference would be live under its feet.
   AudioVis vis;
-  audio_probe_frame(&vis, 1000 / UI_FPS);
+  audio_probe_frame(&vis, memory_pressure_optional_interval(1000 / UI_FPS));
 
   /*
    * What counts as the speaker being in use.
@@ -1691,11 +1715,11 @@ static void ui_frame() {
    */
   const uint32_t heard = audio_probe_last_active();
   const bool audible = heard != 0 && (now - heard) < UI_AUDIO_GRACE_MS;
-  if (audible || df_player_active()) last_activity_ms = now;
+  if (audible || df_player_active()) ui_store_word(&lastActivityWord, now);
   detect_events(info, now);
   poll_button(now);
 
-  const uint32_t idle = now - last_activity_ms;
+  const uint32_t idle = now - ui_load_word(&lastActivityWord);
   const bool dim = idle > UI_DIM_AFTER_MS;
   const bool deep_idle = idle > UI_SLEEP_AFTER_MS;
 
@@ -1707,24 +1731,27 @@ static void ui_frame() {
    * audio keeps warm, so playback holds the display open; ALWAYS reads the one
    * only the owner touches, so it does not.
    */
-  bool blank = power_save;  // saving takes the panel outright, with no timeout
-  const uint8_t mode = blank_mode;
-  const uint32_t after = blank_after_ms;
+  bool blank = ui_load_word(&powerSaveWord) != 0;
+  const uint8_t mode = (uint8_t)ui_load_word(&blankModeWord);
+  const uint32_t after = ui_load_word(&blankAfterWord);
   if (mode == UI_BLANK_IDLE) blank = blank || idle > after;
-  else if (mode == UI_BLANK_ALWAYS) blank = blank || (now - last_input_ms) > after;
+  else if (mode == UI_BLANK_ALWAYS) {
+    blank = blank || (now - ui_load_word(&lastInputWord)) > after;
+  }
   // An update, a restart or the reset countdown suspends it: those are exactly
   // the moments somebody is watching the panel, and going dark through one is
   // indistinguishable from a crash.
   if (blank && system_overlay_visible(now)) blank = false;
 
-  if (blank != panel_off) {
-    panel_off = blank;
+  const bool was_off = ui_load_word(&panelOffWord) != 0;
+  if (blank != was_off) {
+    ui_store_word(&panelOffWord, blank ? 1U : 0U);
     u8g2.setPowerSave(blank ? 1 : 0);
     // Coming back, the contrast register is re-applied on the next frame
     // anyway; going away, forget what was applied so it cannot be skipped.
     if (!blank) bright_applied = 0;
   }
-  if (panel_off) return;
+  if (blank) return;
 
   const UiScreen want = pick_screen(info, now, deep_idle);
   if (want != cur_screen) {
@@ -1737,6 +1764,7 @@ static void ui_frame() {
     cur_screen = want;
     on_enter(want);
   }
+  publish_ui_status();
 
   u8g2.clearBuffer();
   u8g2.setFontMode(1);  // transparent: glyphs never erase what is behind them
@@ -1783,9 +1811,9 @@ static void ui_task(void *) {
   last_frame_ms = millis();
 
   for (;;) {
-    if (suspended) {
-      if (!panel_off) {
-        panel_off = true;
+    if (ui_load_word(&suspendedWord)) {
+      if (!ui_load_word(&panelOffWord)) {
+        ui_store_word(&panelOffWord, 1U);
         u8g2.setPowerSave(1);
       }
       vTaskDelay(pdMS_TO_TICKS(500));
@@ -1873,12 +1901,19 @@ bool ui_begin() {
 }
 
 void ui_start() {
-  if (!g_present) return;
+  if (!g_present || task_running) return;
   note_input(millis());
   screen_since = millis();
   // Core 0, priority 1: the Bluetooth controller and the audio path both
   // outrank it, so a slow I2C frame can never delay a sample.
-  xTaskCreatePinnedToCore(ui_task, "ui", 5120, nullptr, 1, nullptr, 0);
+  if (xTaskCreatePinnedToCore(ui_task, "ui", 5120, nullptr, 1, nullptr, 0) !=
+      pdPASS) {
+    LOGLN("[ui] out of memory: render task not started");
+    u8g2.setPowerSave(1);
+    g_present = false;
+    return;
+  }
+  task_running = true;
 }
 
 bool ui_present() { return g_present; }
@@ -1894,32 +1929,32 @@ void ui_set_blank(UiBlankMode mode, uint16_t after_seconds) {
   if (mode > UI_BLANK_ALWAYS) mode = UI_BLANK_NEVER;
   if (after_seconds < UI_BLANK_AFTER_S_MIN) after_seconds = UI_BLANK_AFTER_S_MIN;
   if (after_seconds > UI_BLANK_AFTER_S_MAX) after_seconds = UI_BLANK_AFTER_S_MAX;
-  blank_mode = (uint8_t)mode;
-  blank_after_ms = (uint32_t)after_seconds * 1000UL;
+  ui_store_word(&blankModeWord, (uint32_t)mode);
+  ui_store_word(&blankAfterWord, (uint32_t)after_seconds * 1000UL);
   // Waking is the point: whatever the owner just chose, they should see the
   // panel come back rather than wonder whether the setting took.
   ui_wake();
 }
 
-bool ui_blanked() { return panel_off; }
+bool ui_blanked() { return ui_load_word(&panelOffWord) != 0; }
 
 void ui_suspend() {
   if (!g_present) return;
   // The task does the powering down, on the task that owns the I2C bus. Setting
   // the flag and waiting is what keeps two writers off one bus.
-  suspended = true;
+  ui_store_word(&suspendedWord, 1U);
 }
 
 void ui_set_power_save(bool on) {
-  if (on == power_save) return;
-  power_save = on;
+  if (on == (ui_load_word(&powerSaveWord) != 0)) return;
+  ui_store_word(&powerSaveWord, on ? 1U : 0U);
   // Leaving saving is an event worth seeing, and the panel coming back to a
   // stale screen a timeout away from blanking again is not.
   if (!on) ui_wake();
 }
 
-uint32_t ui_idle_ms() { return millis() - last_activity_ms; }
-uint32_t ui_untouched_ms() { return millis() - last_input_ms; }
+uint32_t ui_idle_ms() { return millis() - ui_load_word(&lastActivityWord); }
+uint32_t ui_untouched_ms() { return millis() - ui_load_word(&lastInputWord); }
 
 void ui_show_system_status(UiSystemStatus kind, const char *title,
                            const char *detail, int16_t progress,
@@ -1937,15 +1972,11 @@ void ui_show_system_status(UiSystemStatus kind, const char *title,
 }
 
 bool ui_take_mode_switch_request() {
-  if (!btn_mode_request) return false;
-  btn_mode_request = false;
-  return true;
+  return __atomic_exchange_n(&btnModeRequestWord, 0U, __ATOMIC_ACQ_REL) != 0;
 }
 
 bool ui_take_factory_reset_request() {
-  if (!btn_reset_request) return false;
-  btn_reset_request = false;
-  return true;
+  return __atomic_exchange_n(&btnResetRequestWord, 0U, __ATOMIC_ACQ_REL) != 0;
 }
 
 bool ui_command(const char *line) {
@@ -1953,20 +1984,20 @@ bool ui_command(const char *line) {
   int n = 0;
 
   if (strcmp(line, "next") == 0) {
-    req_next = true;
+    ui_store_word(&reqNextWord, 1U);
     ui_wake();
     return true;
   }
   if (strcmp(line, "auto") == 0) {
-    carousel_paused = false;
-    req_next = true;
+    ui_store_word(&carouselPausedWord, 0U);
+    ui_store_word(&reqNextWord, 1U);
     ui_wake();
     LOGLN("[ui] carousel on");
     return true;
   }
   if (sscanf(line, "screen %d", &n) == 1) {
     if (n >= 0 && n < SCR_ROTATE_COUNT) {
-      req_screen = (int8_t)n;
+      ui_store_word(&reqScreenWord, (uint32_t)n);
       ui_wake();
       LOGF("[ui] screen %d, carousel paused\n", n);
     } else {
@@ -1975,15 +2006,21 @@ bool ui_command(const char *line) {
     return true;
   }
   if (sscanf(line, "bright %d", &n) == 1) {
-    bright_override = (uint8_t)(n < 0 ? 0 : (n > 255 ? 255 : n));
+    const uint8_t override = (uint8_t)(n < 0 ? 0 : (n > 255 ? 255 : n));
+    ui_store_word(&brightOverrideWord, override);
     ui_wake();
-    LOGF("[ui] contrast %d%s\n", bright_override,
-                  bright_override == 0 ? " (auto)" : "");
+    LOGF("[ui] contrast %d%s\n", override,
+         override == 0 ? " (auto)" : "");
     return true;
   }
   if (strcmp(line, "ui") == 0) {
-    LOGF("[ui] screen %d  %s  %.1f fps  style %d\n", cur_screen,
-                  carousel_paused ? "paused" : "auto", fps_avg, spectrum_style);
+    const uint32_t fps_bits = ui_load_word(&statusFpsWord);
+    float fps = 0.0f;
+    memcpy(&fps, &fps_bits, sizeof(fps));
+    LOGF("[ui] screen %u  %s  %.1f fps  style %u\n",
+         (unsigned)ui_load_word(&statusScreenWord),
+         ui_load_word(&carouselPausedWord) ? "paused" : "auto", fps,
+         (unsigned)ui_load_word(&statusStyleWord));
     return true;
   }
   return false;

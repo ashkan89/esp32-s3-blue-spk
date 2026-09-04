@@ -22,6 +22,7 @@
 #include <nvs_flash.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <new>
 
 #include "BluetoothA2DPSink.h"
 #include "alarm_clock.h"
@@ -31,11 +32,13 @@
 #include "df_player.h"
 #include "home_assistant.h"
 #include "leds.h"
+#include "memory_pressure.h"
 #include "net_radio.h"
 #include "telemetry.h"
 #include "voice.h"
 #include "player_state.h"
 #include "power.h"
+#include "runtime_events.h"
 #include "soft_clock.h"
 #include "status_led.h"
 #include "ui.h"
@@ -487,10 +490,18 @@ bool authenticated() {
 
 template <typename T>
 void sendJson(const T &doc, int code = 200) {
-  String body;
-  serializeJson(doc, body);
+  if (doc.overflowed()) {
+    server.send(500, "application/json",
+                "{\"error\":\"Not enough memory to build the response\"}");
+    return;
+  }
   server.sendHeader("Cache-Control", "no-store");
-  server.send(code, "application/json", body);
+  server.setContentLength(measureJson(doc));
+  server.send(code, "application/json", "");
+  // Write once into the socket instead of materialising a second full copy of
+  // the JSON document in a temporary String. WebServer handles one request at
+  // a time, so the document remains alive until this write completes.
+  serializeJson(doc, server.client());
 }
 
 void sendError(int code, const String &message) {
@@ -515,6 +526,12 @@ bool requireAuth() {
 bool readBody(JsonDocument &doc) {
   if (!server.hasArg("plain")) {
     sendError(400, "Missing JSON request body");
+    return false;
+  }
+  const size_t bytes = server.arg("plain").length();
+  if (!memory_pressure_accept_json(bytes)) {
+    sendError(413, String("JSON body exceeds ") +
+                       (unsigned)memory_pressure_json_limit() + " bytes");
     return false;
   }
   const DeserializationError error = deserializeJson(doc, server.arg("plain"));
@@ -1077,8 +1094,13 @@ bool startGithubJob(bool install) {
     updateSet("error", "Configure owner/repository and an asset pattern first", false);
     return false;
   }
-  GithubJob *job = new GithubJob{install, settings.githubRepo, settings.githubAsset,
-                                 settings.githubToken};
+  GithubJob *job = new (std::nothrow)
+      GithubJob{install, settings.githubRepo, settings.githubAsset,
+                settings.githubToken};
+  if (!job) {
+    updateSet("error", "Not enough memory to prepare update task", false);
+    return false;
+  }
   // 16 KB. A TLS handshake that walks a certificate chain against the Mozilla
   // root bundle is the deepest thing this firmware does and the OTA writer runs
   // on top of it, so 14 KB was tight -- but a task stack comes out of the same
@@ -1088,6 +1110,7 @@ bool startGithubJob(bool install) {
     updateSet("error", "Could not start update task", false);
     return false;
   }
+  runtime_event_note(RUNTIME_EVENT_OTA);
   return true;
 }
 
@@ -1342,6 +1365,16 @@ void handleStatus() {
   system["flashBytes"] = ESP.getFlashChipSize();
   system["uptimeMs"] = millis();
   system["resetReason"] = (int)esp_reset_reason();
+  MemoryPressureStatus pressure;
+  memory_pressure_snapshot(&pressure);
+  system["memoryPressure"] = memory_pressure_name(pressure.level);
+  system["memoryTransitions"] = pressure.transitions;
+  RuntimeEventStatus events;
+  runtime_event_snapshot(&events);
+  system["lifecycle"] = runtime_event_name(events.current);
+  system["lifecycleAtMs"] = events.currentAtMs;
+  system["previousLifecycle"] = runtime_event_name(events.previousBoot);
+  system["previousLifecycleAtMs"] = events.previousBootAtMs;
 
   /*
    * The speaker's own wall clock. Sent as a UTC epoch plus the stored offset
@@ -2628,6 +2661,10 @@ void handleSettingsBackup() {
    */
   String passphrase;
   if (server.hasArg("plain")) {
+    if (!memory_pressure_accept_json(server.arg("plain").length())) {
+      sendError(413, "Backup request is too large");
+      return;
+    }
     JsonDocument request;
     if (deserializeJson(request, server.arg("plain"))) {
       sendError(400, "Invalid JSON request body");
@@ -2848,15 +2885,19 @@ void handleSettingsBackup() {
    * an Authorization header and names the blob itself, because a plain link
    * would arrive unauthenticated.
    */
-  String body;
-  serializeJsonPretty(doc, body);
+  if (doc.overflowed()) {
+    sendError(500, "Not enough memory to build the settings backup");
+    return;
+  }
   char disposition[128];
   snprintf(disposition, sizeof(disposition),
            "attachment; filename=\"%s-settings.json\"",
            settings.hostname.c_str());
   server.sendHeader("Cache-Control", "no-store");
   server.sendHeader("Content-Disposition", disposition);
-  server.send(200, "application/json", body);
+  server.setContentLength(measureJsonPretty(doc));
+  server.send(200, "application/json", "");
+  serializeJsonPretty(doc, server.client());
   ui_show_system_status(UI_STATUS_SUCCESS, "Settings backed up",
                         passphrase.length() ? "Encrypted, downloaded"
                                             : "No secrets, downloaded",
@@ -3769,7 +3810,7 @@ void handleTelemetry() {
    * Six arrays of 120 numbers is over seven hundred ArduinoJson slots, and
    * serialising that into a String doubles it again while the String grows --
    * a transient spike of tens of kilobytes on the same heap the firmware
-   * updater needs a contiguous 34 kB block from. This is the one endpoint big
+   * updater needs a contiguous 45 kB block from. This is the one endpoint big
    * enough for that to matter, so it is the one endpoint that does not build a
    * document: a fixed scratch buffer, chunked transfer encoding, and a few
    * hundred bytes of peak.
@@ -4334,7 +4375,7 @@ const char *management_device_name(const char *fallback) {
 RadioMode management_radio_mode() { return radioMode; }
 
 RadioMode management_next_mode() {
-  return (RadioMode)((radioMode + 1) % RADIO_MODE_COUNT);
+  return (RadioMode)stability_mode_next((uint8_t)radioMode, RADIO_MODE_COUNT);
 }
 
 // Short on purpose: these land in a 24-character OLED title ("<name> mode") and
@@ -4359,6 +4400,7 @@ void management_switch_mode(RadioMode mode) {
   // Asking for a mode is a fresh start: it gets its full allowance of attempts
   // even if the last thing in that slot fell over.
   prefs.putUChar("bootFail", 0);
+  runtime_event_note(RUNTIME_EVENT_MODE_SWITCH);
   LOGF("[mode] switching to %s mode\n", management_mode_name(mode));
   char title[24];
   snprintf(title, sizeof(title), "%s mode", management_mode_name(mode));

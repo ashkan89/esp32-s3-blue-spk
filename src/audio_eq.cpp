@@ -19,6 +19,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "stability_policy.h"
+
 namespace {
 
 /*
@@ -55,32 +57,36 @@ struct CoeffSet {
   float preamp;    ///< linear, already includes the automatic reduction
   bool active;     ///< false means audio_eq_process() should return at once
   float headroom;  ///< dB the automatic preamp took off, <= 0, for the display
+  uint32_t stateEpoch;  ///< changes when old filter history must be discarded
 };
 
 /*
- * Two coefficient sets and an index.
- *
- * The web task writes the set the audio task is not reading and then stores the
- * index, which on this architecture is a single aligned 32-bit store and
- * therefore atomic. The audio task reads the index once per buffer and uses
- * that set for the whole buffer. Nothing is ever written to a set that anybody
- * is reading, so there is no lock and no torn read -- and the audio task never
- * waits, which is the requirement that ruled a mutex out.
- *
- * `volatile` is doing real work on both: without it the compiler is entitled to
- * hoist the index read out of the processing loop.
+ * Coefficients cross from the task changing settings to the task consuming
+ * PCM. This is a seqlock, not the tempting two-buffer/index scheme: two quick
+ * writers can wrap a two-buffer scheme and overwrite the set an audio block is
+ * still using. The writer publishes one complete immutable value between an
+ * odd/even sequence pair. The audio task copies it into audioCoeffs only at a
+ * block boundary and never waits or takes a lock.
  */
-CoeffSet coeffs[2];
-volatile uint8_t liveSet;
+CoeffSet publishedCoeffs;
+uint32_t coeffSeq;
+CoeffSet audioCoeffs;
+uint32_t audioCoeffSeq = UINT32_MAX;
 
+/* Only tiny configuration copies and publication are protected. Filter
+ * design calls powf/sinf/cosf and deliberately happens outside the critical
+ * section, including when a decoder reports a new sample rate. */
+portMUX_TYPE configMux = portMUX_INITIALIZER_UNLOCKED;
 EqConfig config;
 bool configured;
+uint32_t configGeneration;
 
 /// Filter state, per channel per band. Transposed direct form II keeps two
 /// numbers per section; they belong to the audio task alone.
 float state[2][EQ_BANDS][2];
 
 uint32_t sampleRate = 44100;
+uint32_t sampleRateEpoch;
 
 /// The named curves, in the order of EqPreset. EQ_PRESET_FLAT and
 /// EQ_PRESET_CUSTOM have no row: flat is all zeros by definition, and custom
@@ -201,40 +207,101 @@ void designPassthrough(Biquad &out) {
  * real music never does -- but the alternative is a limiter working most of the
  * time, and a limiter that is always working is a compressor nobody asked for.
  */
-void rebuild() {
-  const uint8_t spare = liveSet ^ 1;
-  CoeffSet &out = coeffs[spare];
+void designSet(CoeffSet &out, const EqConfig &cfg, uint32_t rate,
+               uint32_t stateEpoch) {
 
   float maxBoost = 0.0f;
   bool anyGain = false;
   for (uint8_t i = 0; i < EQ_BANDS; i++) {
-    if (config.gain[i] != 0) anyGain = true;
-    if (config.gain[i] > maxBoost) maxBoost = (float)config.gain[i];
+    if (cfg.gain[i] != 0) anyGain = true;
+    if (cfg.gain[i] > maxBoost) maxBoost = (float)cfg.gain[i];
   }
 
   for (uint8_t i = 0; i < EQ_BANDS; i++) {
-    const float gain = (float)config.gain[i];
+    const float gain = (float)cfg.gain[i];
+    const float hz =
+        (float)stability_eq_frequency(EQ_BAND_HZ[i], rate);
     if (gain == 0.0f) {
       designPassthrough(out.band[i]);
     } else if (i == 0) {
-      designShelf(out.band[i], (float)EQ_BAND_HZ[i], gain, SHELF_SLOPE,
-                  sampleRate, true);
+      designShelf(out.band[i], hz, gain, SHELF_SLOPE, rate, true);
     } else if (i == EQ_BANDS - 1) {
-      designShelf(out.band[i], (float)EQ_BAND_HZ[i], gain, SHELF_SLOPE,
-                  sampleRate, false);
+      designShelf(out.band[i], hz, gain, SHELF_SLOPE, rate, false);
     } else {
-      designPeaking(out.band[i], (float)EQ_BAND_HZ[i], gain, BAND_Q, sampleRate);
+      designPeaking(out.band[i], hz, gain, BAND_Q, rate);
     }
   }
 
-  const float autoDb = config.autoPreamp ? -maxBoost : 0.0f;
-  const float totalDb = autoDb + (float)config.preamp;
+  const float autoDb = cfg.autoPreamp ? -maxBoost : 0.0f;
+  const float totalDb = autoDb + (float)cfg.preamp;
   out.headroom = autoDb;
   out.preamp = powf(10.0f, totalDb / 20.0f);
   // Flat, no preamp and nothing to do: let the audio path skip the whole thing.
-  out.active = config.enabled && (anyGain || config.preamp != 0);
+  out.active = cfg.enabled && (anyGain || cfg.preamp != 0);
+  out.stateEpoch = stateEpoch;
+}
 
-  liveSet = spare;
+void rebuildLatest() {
+  EqConfig cfg;
+  uint32_t rate;
+  uint32_t stateEpoch;
+  uint32_t generation;
+  portENTER_CRITICAL(&configMux);
+  cfg = config;
+  rate = sampleRate;
+  stateEpoch = sampleRateEpoch;
+  generation = configGeneration;
+  portEXIT_CRITICAL(&configMux);
+
+  CoeffSet next;
+  designSet(next, cfg, rate, stateEpoch);
+
+  portENTER_CRITICAL(&configMux);
+  // A newer writer is already designing the authoritative value. Publishing
+  // this stale one, even briefly, would make rapid UI changes audible out of
+  // order.
+  if (generation != configGeneration) {
+    portEXIT_CRITICAL(&configMux);
+    return;
+  }
+  __atomic_add_fetch(&coeffSeq, 1U, __ATOMIC_RELEASE);  // odd: being written
+  __sync_synchronize();
+  publishedCoeffs = next;
+  __sync_synchronize();
+  __atomic_add_fetch(&coeffSeq, 1U, __ATOMIC_RELEASE);  // even: complete
+  portEXIT_CRITICAL(&configMux);
+}
+
+bool snapshotCoeffs(CoeffSet *out, uint32_t *version = nullptr) {
+  if (!out) return false;
+  for (uint8_t attempt = 0; attempt < 4; ++attempt) {
+    const uint32_t before = __atomic_load_n(&coeffSeq, __ATOMIC_ACQUIRE);
+    if (before & 1U) continue;
+    *out = publishedCoeffs;
+    __sync_synchronize();
+    const uint32_t after = __atomic_load_n(&coeffSeq, __ATOMIC_ACQUIRE);
+    if (before == after && !(after & 1U)) {
+      if (version) *version = after;
+      return true;
+    }
+  }
+  return false;
+}
+
+void adoptCoeffs() {
+  const uint32_t available = __atomic_load_n(&coeffSeq, __ATOMIC_ACQUIRE);
+  if (available == audioCoeffSeq || (available & 1U)) return;
+  CoeffSet next;
+  uint32_t version;
+  if (snapshotCoeffs(&next, &version)) {
+    const bool resetState = next.stateEpoch != audioCoeffs.stateEpoch;
+    audioCoeffs = next;
+    audioCoeffSeq = version;
+    // Filter delay elements are audio-task-owned just like audioCoeffs. A
+    // sample-rate writer merely publishes an epoch; the consumer clears its
+    // state here, between buffers, so it can never race the inner loop.
+    if (resetState) memset(state, 0, sizeof(state));
+  }
 }
 
 /// The same quadratic knee main.cpp uses, in float. Below the knee this is
@@ -278,19 +345,26 @@ uint8_t audio_eq_hw_preset(uint8_t preset) {
 }
 
 void audio_eq_configure(const EqConfig &cfg) {
-  config = cfg;
-  if (config.preset >= EQ_PRESET_COUNT) config.preset = EQ_PRESET_CUSTOM;
-  for (uint8_t i = 0; i < EQ_BANDS; i++) config.gain[i] = clampGain(config.gain[i]);
-  if (config.preamp < EQ_PREAMP_MIN) config.preamp = EQ_PREAMP_MIN;
-  if (config.preamp > EQ_PREAMP_MAX) config.preamp = EQ_PREAMP_MAX;
+  EqConfig next = cfg;
+  if (next.preset >= EQ_PRESET_COUNT) next.preset = EQ_PRESET_CUSTOM;
+  for (uint8_t i = 0; i < EQ_BANDS; i++) next.gain[i] = clampGain(next.gain[i]);
+  if (next.preamp < EQ_PREAMP_MIN) next.preamp = EQ_PREAMP_MIN;
+  if (next.preamp > EQ_PREAMP_MAX) next.preamp = EQ_PREAMP_MAX;
+  portENTER_CRITICAL(&configMux);
+  config = next;
   configured = true;
-  rebuild();
+  ++configGeneration;
+  portEXIT_CRITICAL(&configMux);
+  rebuildLatest();
 }
 
 void audio_eq_get(EqConfig *out) {
   if (!out) return;
-  if (!configured) audio_eq_defaults(&config);
-  *out = config;
+  portENTER_CRITICAL(&configMux);
+  const bool ready = configured;
+  if (ready) *out = config;
+  portEXIT_CRITICAL(&configMux);
+  if (!ready) audio_eq_defaults(out);
 }
 
 void audio_eq_set_sample_rate(uint32_t hz) {
@@ -298,17 +372,26 @@ void audio_eq_set_sample_rate(uint32_t hz) {
   // filters for it would produce coefficients that blow up rather than merely
   // sound wrong.
   if (hz < 8000 || hz > 96000) return;
-  if (hz == sampleRate) return;
+  portENTER_CRITICAL(&configMux);
+  if (hz == sampleRate) {
+    portEXIT_CRITICAL(&configMux);
+    return;
+  }
   sampleRate = hz;
-  // The state belongs to a filter that no longer exists. Carrying it into the
-  // new design is a step discontinuity -- an audible thump -- so it goes.
-  memset(state, 0, sizeof(state));
-  if (configured) rebuild();
+  ++sampleRateEpoch;
+  const bool ready = configured;
+  ++configGeneration;
+  portEXIT_CRITICAL(&configMux);
+  // The state belongs to the task consuming PCM. The new coefficient set
+  // carries a new epoch so that task clears the state at its next block
+  // boundary instead of this control task racing the filter loop.
+  if (ready) rebuildLatest();
 }
 
 void audio_eq_process(int16_t *interleaved, size_t frames) {
   if (!interleaved || frames == 0) return;
-  const CoeffSet &set = coeffs[liveSet];
+  adoptCoeffs();
+  const CoeffSet &set = audioCoeffs;
   if (!set.active) return;
 
   const float preamp = set.preamp;
@@ -330,17 +413,23 @@ void audio_eq_process(int16_t *interleaved, size_t frames) {
   }
 }
 
-bool audio_eq_active() { return coeffs[liveSet].active; }
+bool audio_eq_active() {
+  CoeffSet set;
+  return snapshotCoeffs(&set) && set.active;
+}
 
-float audio_eq_headroom_db() { return coeffs[liveSet].headroom; }
+float audio_eq_headroom_db() {
+  CoeffSet set;
+  return snapshotCoeffs(&set) ? set.headroom : 0.0f;
+}
 
 bool audio_eq_command(const char *line) {
   if (!line || strncmp(line, "eq", 2) != 0) return false;
   const char *rest = line + 2;
   while (*rest == ' ') rest++;
 
-  if (!configured) audio_eq_defaults(&config);
-  EqConfig next = config;
+  EqConfig next;
+  audio_eq_get(&next);
   bool changed = false;
 
   if (*rest == '\0') {
@@ -386,19 +475,24 @@ bool audio_eq_command(const char *line) {
 
   if (changed) audio_eq_configure(next);
 
-  LOGF("[eq] %s %s |", config.enabled ? "on" : "off",
-                audio_eq_preset_name(config.preset));
+  EqConfig live;
+  audio_eq_get(&live);
+  portENTER_CRITICAL(&configMux);
+  const uint32_t liveRate = sampleRate;
+  portEXIT_CRITICAL(&configMux);
+  LOGF("[eq] %s %s |", live.enabled ? "on" : "off",
+                audio_eq_preset_name(live.preset));
   for (uint8_t i = 0; i < EQ_BANDS; i++) {
     const uint16_t hz = EQ_BAND_HZ[i];
-    if (hz >= 1000) LOGF(" %ukHz %+d", (unsigned)(hz / 1000), config.gain[i]);
-    else LOGF(" %uHz %+d", (unsigned)hz, config.gain[i]);
+    if (hz >= 1000) LOGF(" %ukHz %+d", (unsigned)(hz / 1000), live.gain[i]);
+    else LOGF(" %uHz %+d", (unsigned)hz, live.gain[i]);
   }
-  LOGF(" | preamp %+d dB%s", config.preamp,
-                config.autoPreamp ? " auto" : "");
+  LOGF(" | preamp %+d dB%s", live.preamp,
+                live.autoPreamp ? " auto" : "");
   if (audio_eq_headroom_db() < 0.0f) {
     LOGF(" (%.0f dB for headroom)", audio_eq_headroom_db());
   }
   LOGF(" | %s at %u Hz\n", audio_eq_active() ? "active" : "bypassed",
-                (unsigned)sampleRate);
+                (unsigned)liveRate);
   return true;
 }

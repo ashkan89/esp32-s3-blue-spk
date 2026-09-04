@@ -26,11 +26,11 @@
  * per window however many tasks are watching, and keeps the lighting reactive
  * on a speaker with no display at all.
  *
- * The published frame is copied out under a seqlock, the same trick
- * player_state.h uses, so a reader never sees half of one frame and half of
- * the next. The analysis itself is serialised by a mutex that callers only
- * ever *try* to take: a task that finds the FFT already running takes the
- * previous frame and gets on with drawing rather than waiting for it.
+ * The published frame is copied under a very short cross-core critical section,
+ * so a reader never sees half of one frame and half of the next. The analysis
+ * itself is serialised by a mutex that callers only ever *try* to take: a task
+ * that finds the FFT already running takes the previous frame and gets on with
+ * drawing rather than waiting for it.
  *
  * The ring buffer is deliberately lock-free. The writer only ever bumps a
  * monotonic counter; the reader copies backwards from wherever that counter

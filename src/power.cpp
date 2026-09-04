@@ -11,6 +11,7 @@
 #include "battery.h"
 #include "df_player.h"
 #include "leds.h"
+#include "runtime_events.h"
 #include "status_led.h"
 #include "ui.h"
 #include "ui_config.h"
@@ -49,7 +50,7 @@ uint32_t g_lastEval;
 // --- sleep ------------------------------------------------------------------
 SleepMode g_sleepMode = SLEEP_MODE_OFF;
 uint32_t g_sleepAfterMs = (uint32_t)POWER_SLEEP_AFTER_S_DEFAULT * 1000UL;
-uint32_t g_activeAt;
+uint32_t g_activeAtWord;
 bool g_sleeping;  // the shutdown is running; do not start it twice
 
 /// The same grace the display's idle blanking uses, and for the same reason: a
@@ -185,14 +186,17 @@ void serviceSleep(uint32_t now) {
   if (g_sleepMode == SLEEP_MODE_SAVING && !g_active) {
     // Tied to saving and saving is not on: the countdown has not started, so it
     // should not be part-way through when it does.
-    g_activeAt = now;
+    __atomic_store_n(&g_activeAtWord, now, __ATOMIC_RELEASE);
     return;
   }
   if (busy(now)) {
-    g_activeAt = now;
+    __atomic_store_n(&g_activeAtWord, now, __ATOMIC_RELEASE);
     return;
   }
-  if (now - g_activeAt < g_sleepAfterMs) return;
+  if (now - __atomic_load_n(&g_activeAtWord, __ATOMIC_ACQUIRE) <
+      g_sleepAfterMs) {
+    return;
+  }
   power_sleep_now();
 }
 
@@ -237,12 +241,16 @@ void power_configure_sleep(SleepMode mode, uint16_t after_seconds) {
   // A policy that has just been chosen starts its countdown now rather than
   // part-way through, which for a long-running speaker would otherwise mean
   // "sleep immediately".
-  g_activeAt = millis();
+  __atomic_store_n(&g_activeAtWord, millis(), __ATOMIC_RELEASE);
 }
 
-void power_note_activity() { g_activeAt = millis(); }
+void power_note_activity() {
+  __atomic_store_n(&g_activeAtWord, millis(), __ATOMIC_RELEASE);
+}
 
-uint32_t power_idle_ms() { return millis() - g_activeAt; }
+uint32_t power_idle_ms() {
+  return millis() - __atomic_load_n(&g_activeAtWord, __ATOMIC_ACQUIRE);
+}
 
 bool power_sleep_possible() { return PIN_UI_BUTTON >= 0; }
 
@@ -263,6 +271,7 @@ bool power_sleep_now() {
   }
   if (g_sleeping) return true;
   g_sleeping = true;
+  runtime_event_note(RUNTIME_EVENT_STANDBY);
 
   LOGF("[power] standby; wake on GPIO%d\n", (int)PIN_UI_BUTTON);
 

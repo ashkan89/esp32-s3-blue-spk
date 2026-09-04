@@ -10,6 +10,7 @@
 
 #include "audio_probe.h"
 #include "df_player.h"
+#include "memory_pressure.h"
 
 // ------------------------------------------------------------------ strip ----
 /*
@@ -203,7 +204,10 @@ static float a_bass;   ///< 0..1, bottom four bands
 static float a_kick;   ///< 0..1, beat envelope: snaps to 1, decays
 static bool a_prev_beat;
 static uint16_t a_beat_hue;  ///< advanced on every beat, so beats differ
-static uint32_t a_heard_ms;
+// Written by the render task and also queried from the Arduino loop by the
+// management API. Publish the timestamp atomically so a status request cannot
+// race the audio-reactivity update running on the other core.
+static uint32_t aHeardWord;
 
 /// One-pole approach with separate attack and release, frame-rate independent.
 static float approach(float cur, float target, float dt, float rise_s, float fall_s) {
@@ -236,11 +240,12 @@ static void update_audio(const AudioVis &v, float dt, uint32_t now) {
   a_kick -= dt / 0.20f;
   if (a_kick < 0.0f) a_kick = 0.0f;
 
-  if (v.active) a_heard_ms = now;
+  if (v.active) __atomic_store_n(&aHeardWord, now, __ATOMIC_RELEASE);
 }
 
 static bool hearing(uint32_t now) {
-  return a_heard_ms != 0 && (now - a_heard_ms) < LED_AUDIO_IDLE_MS;
+  const uint32_t heard = __atomic_load_n(&aHeardWord, __ATOMIC_ACQUIRE);
+  return heard != 0 && (now - heard) < LED_AUDIO_IDLE_MS;
 }
 
 /*
@@ -251,13 +256,13 @@ static bool hearing(uint32_t now) {
  * speaker that boots into silence still gets its full idle period before going
  * dark, rather than resting on the first frame because the timer started at 0.
  */
-static volatile uint32_t awake_ms;
-static volatile bool resting;
+static uint32_t awakeWord;
+static uint32_t restingWord;
 
 /// Power saving, which outranks everything: the ring is the largest load on the
 /// board by a wide margin, so it is the first thing to go and the whole reason
 /// the mode is worth having.
-static volatile bool powerSave;
+static uint32_t powerSaveWord;
 
 /*
  * Standby. One black frame goes out, and then the task stops touching the RMT
@@ -272,8 +277,8 @@ static volatile bool powerSave;
  * second task committing a frame into the middle of the render task's commit
  * corrupts exactly the frame that was meant to leave the ring dark.
  */
-static volatile bool suspendRequested;
-static volatile bool suspendDone;
+static uint32_t suspendRequestedWord;
+static uint32_t suspendDoneWord;
 
 // ----------------------------------------------------------------- effects ---
 /*
@@ -597,15 +602,15 @@ static void leds_task(void *) {
   uint32_t last_ms = millis();
 
   for (;;) {
-    if (suspendRequested) {
+    if (__atomic_load_n(&suspendRequestedWord, __ATOMIC_ACQUIRE)) {
       // Black first, then park: the order is the whole point, because the
       // pixels keep showing the last thing they were sent once the task stops
       // sending. Done once, on the task that owns the channel.
-      if (!suspendDone) {
+      if (!__atomic_load_n(&suspendDoneWord, __ATOMIC_ACQUIRE)) {
         LedConfig off{};
         fill(0);
         commit(off, millis());
-        suspendDone = true;
+        __atomic_store_n(&suspendDoneWord, 1U, __ATOMIC_RELEASE);
       }
       vTaskDelay(pdMS_TO_TICKS(500));
       continue;
@@ -622,7 +627,8 @@ static void leds_task(void *) {
     portEXIT_CRITICAL(&cfg_mux);
 
     AudioVis vis;
-    audio_probe_frame(&vis, 1000 / LED_FPS);
+    audio_probe_frame(&vis,
+                      memory_pressure_optional_interval(1000 / LED_FPS));
     update_audio(vis, dt, now);
 
     // Resting is decided here rather than inside render() so that every effect
@@ -631,16 +637,20 @@ static void leds_task(void *) {
     // df_player_active() for the same reason the display checks it: that module
     // never feeds the analyser, so hearing() is deaf to the one mode whose whole
     // job is playing something.
-    if (hearing(now) || df_player_active()) awake_ms = now;
+    if (hearing(now) || df_player_active()) {
+      __atomic_store_n(&awakeWord, now, __ATOMIC_RELEASE);
+    }
+    const uint32_t awake = __atomic_load_n(&awakeWord, __ATOMIC_ACQUIRE);
     const bool asleep = live.idleOff && live.idleAfterS &&
-                        (now - awake_ms) > (uint32_t)live.idleAfterS * 1000UL;
-    resting = asleep;
+                        (now - awake) > (uint32_t)live.idleAfterS * 1000UL;
+    __atomic_store_n(&restingWord, asleep ? 1U : 0U, __ATOMIC_RELEASE);
 
     const float r = rate_of(live.speed);
     phase = wrap01(phase + dt * r);
     phase2 = wrap01(phase2 + dt * r * 0.23f);
 
-    if (!live.enabled || asleep || powerSave) {
+    if (!live.enabled || asleep ||
+        __atomic_load_n(&powerSaveWord, __ATOMIC_ACQUIRE)) {
       fill(0);
     } else {
       render(live, vis, dt, now);
@@ -689,6 +699,10 @@ bool leds_begin() {
   if (err != ESP_OK) {
     LOGF("[leds] RMT would not start (%s) -- lighting is off\n",
                   esp_err_to_name(err));
+    if (rmt_encoder) {
+      rmt_del_encoder(rmt_encoder);
+      rmt_encoder = nullptr;
+    }
     rmt_del_channel(rmt_channel);
     rmt_channel = nullptr;
     return false;
@@ -710,7 +724,7 @@ bool leds_begin() {
 
 void leds_start() {
   if (!g_present || task_running) return;
-  awake_ms = millis();  // a full idle period before the first rest
+  __atomic_store_n(&awakeWord, millis(), __ATOMIC_RELEASE);
   // Core 0, priority 1: the same berth as the display task, and below both the
   // Bluetooth controller and the audio path, so a late frame of light is the
   // only thing a busy moment can cost. The stack carries a whole AudioVis copy
@@ -721,6 +735,11 @@ void leds_start() {
     // standby blanking -- so say so and let leds_suspended() answer honestly
     // rather than making a shutdown wait for a frame that will never come.
     LOGLN("[leds] could not start the render task; the ring stays dark");
+    rmt_disable(rmt_channel);
+    rmt_del_encoder(rmt_encoder);
+    rmt_encoder = nullptr;
+    rmt_del_channel(rmt_channel);
+    rmt_channel = nullptr;
     g_present = false;
     return;
   }
@@ -733,7 +752,7 @@ void leds_configure(const LedConfig &in) {
   // Any change is a reason to be lit: turning the ring back on from a resting
   // dashboard and watching nothing happen for five minutes is not a setting,
   // it is a fault report.
-  awake_ms = millis();
+  __atomic_store_n(&awakeWord, millis(), __ATOMIC_RELEASE);
   LedConfig v = in;
   if (v.effect >= LED_FX_COUNT) v.effect = LED_FX_MUSIC;
   if (v.reactivity > 100) v.reactivity = 100;
@@ -783,27 +802,34 @@ const char *leds_effect_hint(uint8_t effect) {
 
 bool leds_hearing_audio() { return hearing(millis()); }
 
-bool leds_resting() { return resting; }
+bool leds_resting() {
+  return __atomic_load_n(&restingWord, __ATOMIC_ACQUIRE) != 0;
+}
 
-uint32_t leds_idle_ms() { return millis() - awake_ms; }
+uint32_t leds_idle_ms() {
+  return millis() - __atomic_load_n(&awakeWord, __ATOMIC_ACQUIRE);
+}
 
 void leds_suspend() {
   if (!g_present) return;
   // Only the request is made here. The render task does the blanking and then
   // parks; see the note on suspendRequested for why the caller must not touch
   // the RMT channel itself.
-  suspendRequested = true;
+  __atomic_store_n(&suspendRequestedWord, 1U, __ATOMIC_RELEASE);
 }
 
-bool leds_suspended() { return !g_present || suspendDone; }
+bool leds_suspended() {
+  return !g_present ||
+         __atomic_load_n(&suspendDoneWord, __ATOMIC_ACQUIRE) != 0;
+}
 
 void leds_set_power_save(bool on) {
-  if (on == powerSave) return;
-  powerSave = on;
+  if (on == (__atomic_load_n(&powerSaveWord, __ATOMIC_ACQUIRE) != 0)) return;
+  __atomic_store_n(&powerSaveWord, on ? 1U : 0U, __ATOMIC_RELEASE);
   // Coming back out, the ring has been dark for a while and its idle timer has
   // been running the whole time -- so without this it would light for one frame
   // and immediately rest again.
-  if (!on) awake_ms = millis();
+  if (!on) __atomic_store_n(&awakeWord, millis(), __ATOMIC_RELEASE);
 }
 
 // ----------------------------------------------------------------- console ---

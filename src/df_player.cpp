@@ -126,18 +126,19 @@ const char *error_text(uint8_t code) {
 DfStatus status;
 SemaphoreHandle_t statusLock;
 QueueHandle_t commands;
+uint32_t commandHighWater;
 bool running;
 
-/// Read without the mutex, by the status LED and the melody gate, which run
-/// every loop and only need one value each. A read that races the driver task
-/// returns the previous value for one frame, which no indicator can show.
-volatile DfState liveState = DF_STOPPED;
-volatile bool liveBusy;
+/// Single-word publications for readers that do not need the full status.
+/// `volatile` alone is not cross-core synchronization, so these use explicit
+/// acquire/release operations.
+uint32_t liveStateWord = DF_STOPPED;
+uint32_t liveBusyWord;
 
 /// Which source the *driver* believes is selected. Kept outside the mutex too,
 /// because the reply parser needs it to decide whether a 0x4C ("current track
 /// on SD") is about the library we are playing from.
-volatile uint8_t activeSource = DF_SRC_SD;
+uint32_t activeSourceWord = DF_SRC_SD;
 
 /*
  * Whether the module has been told to sleep.
@@ -150,7 +151,7 @@ volatile uint8_t activeSource = DF_SRC_SD;
  * the poller asks nothing and the parser leaves the state alone -- which is also
  * the honest behaviour, because a module in standby has nothing to report.
  */
-volatile bool sleeping;
+uint32_t sleepingWord;
 
 enum Op : uint8_t {
   OP_FRAME,    ///< put one protocol frame on the wire
@@ -177,7 +178,40 @@ struct Command {
  */
 bool push(const Command &cmd, uint32_t wait = 20) {
   if (commands == nullptr) return false;
-  return xQueueSend(commands, &cmd, pdMS_TO_TICKS(wait)) == pdTRUE;
+  if (xQueueSend(commands, &cmd, pdMS_TO_TICKS(wait)) != pdTRUE) return false;
+  const uint32_t depth = uxQueueMessagesWaiting(commands);
+  uint32_t previous = __atomic_load_n(&commandHighWater, __ATOMIC_RELAXED);
+  while (depth > previous &&
+         !__atomic_compare_exchange_n(&commandHighWater, &previous, depth,
+                                      false, __ATOMIC_RELEASE,
+                                      __ATOMIC_RELAXED)) {
+  }
+  return true;
+}
+
+DfState currentLiveState() {
+  return (DfState)__atomic_load_n(&liveStateWord, __ATOMIC_ACQUIRE);
+}
+void publishLiveState(DfState value) {
+  __atomic_store_n(&liveStateWord, (uint32_t)value, __ATOMIC_RELEASE);
+}
+bool currentLiveBusy() {
+  return __atomic_load_n(&liveBusyWord, __ATOMIC_ACQUIRE) != 0;
+}
+void publishLiveBusy(bool value) {
+  __atomic_store_n(&liveBusyWord, value ? 1U : 0U, __ATOMIC_RELEASE);
+}
+DfSource currentSource() {
+  return (DfSource)__atomic_load_n(&activeSourceWord, __ATOMIC_ACQUIRE);
+}
+void publishSource(DfSource value) {
+  __atomic_store_n(&activeSourceWord, (uint32_t)value, __ATOMIC_RELEASE);
+}
+bool isSleeping() {
+  return __atomic_load_n(&sleepingWord, __ATOMIC_ACQUIRE) != 0;
+}
+void publishSleeping(bool value) {
+  __atomic_store_n(&sleepingWord, value ? 1U : 0U, __ATOMIC_RELEASE);
 }
 
 /*
@@ -424,7 +458,7 @@ void handleFrame(uint8_t cmd, uint16_t param) {
       // poller is switched off while the module sleeps, so anything that reaches
       // this point was a command somebody sent -- and the useful answer is what
       // to do about it, not the module's own phrasing repeated as a fault.
-      if (sleeping && (uint8_t)(param & 0xFF) == 0x02) {
+      if (isSleeping() && (uint8_t)(param & 0xFF) == 0x02) {
         setError("The module is in standby and ignored that. Wake it first.");
         break;
       }
@@ -450,9 +484,9 @@ void handleFrame(uint8_t cmd, uint16_t param) {
       // A late reply that crossed a standby command would otherwise report the
       // module as merely stopped, and nothing would correct it: the poller is
       // switched off while it sleeps.
-      if (sleeping) break;
+      if (isSleeping()) break;
       status.state = play == 1 ? DF_PLAYING : play == 2 ? DF_PAUSED : DF_STOPPED;
-      liveState = status.state;
+      publishLiveState(status.state);
       break;
     }
 
@@ -480,6 +514,7 @@ void handleFrame(uint8_t cmd, uint16_t param) {
     case Q_FILES_USB:
     case Q_FILES_SD:
     case Q_FILES_FLASH: {
+      const DfSource activeSource = currentSource();
       const uint8_t want = activeSource == DF_SRC_USB   ? Q_FILES_USB
                            : activeSource == DF_SRC_FLASH ? Q_FILES_FLASH
                                                           : Q_FILES_SD;
@@ -499,6 +534,7 @@ void handleFrame(uint8_t cmd, uint16_t param) {
     case Q_TRACK_USB:
     case Q_TRACK_SD:
     case Q_TRACK_FLASH: {
+      const DfSource activeSource = currentSource();
       const uint8_t want = activeSource == DF_SRC_USB   ? Q_TRACK_USB
                            : activeSource == DF_SRC_FLASH ? Q_TRACK_FLASH
                                                           : Q_TRACK_SD;
@@ -611,7 +647,7 @@ void queueStartup(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
   // leaves the module asleep, and a cleared flag would then restart the poller
   // against it -- every query answered with "in standby", and that error latched
   // as a permanent fault because the suppression is gated on this same flag.
-  if (frameNow(CMD_RESET, 0)) sleeping = false;
+  if (frameNow(CMD_RESET, 0)) publishSleeping(false);
   // The task inserts DF_RESET_SETTLE_MS after a reset frame; see the task loop.
   frameNow(CMD_SOURCE, (uint16_t)source);
   frameNow(CMD_VOLUME, volume);
@@ -669,16 +705,16 @@ void driverTask(void *) {
 #if PIN_DF_BUSY >= 0
     const bool busy = digitalRead(PIN_DF_BUSY) == LOW;
 #else
-    const bool busy = liveState == DF_PLAYING;
+    const bool busy = currentLiveState() == DF_PLAYING;
 #endif
-    liveBusy = busy;
+    publishLiveBusy(busy);
     // When BUSY first went high, so the settle test below has something to
     // measure. `| 1` keeps 0 as the "currently playing" sentinel.
     if (busy) idleSince = 0;
     else if (idleSince == 0) idleSince = millis() | 1;
     serviceLed(ledMode, busy);
 
-    const bool asleep = sleeping;
+    const bool asleep = isSleeping();
     {
       Locked lock;
       if (lock.held) {
@@ -721,11 +757,11 @@ void driverTask(void *) {
           // nothing: the module is not playing and not stopped, it is asleep
         } else if (busy && status.state != DF_PLAYING) {
           status.state = DF_PLAYING;
-          liveState = DF_PLAYING;
+          publishLiveState(DF_PLAYING);
         } else if (!busy && status.state == DF_PLAYING &&
                    idleSince && millis() - idleSince >= BUSY_SETTLE_MS) {
           status.state = DF_STOPPED;
-          liveState = DF_STOPPED;
+          publishLiveState(DF_STOPPED);
         }
 #endif
       }
@@ -770,7 +806,7 @@ void driverTask(void *) {
      * command either. Ninety-nine folders at SCAN_GAP_MS is about twelve
      * seconds; the counts appear in the dashboard as they land.
      */
-    if (!sleeping && scanNext && uxQueueMessagesWaiting(commands) == 0 &&
+    if (!isSleeping() && scanNext && uxQueueMessagesWaiting(commands) == 0 &&
         (int32_t)(now - scanSentAt) >= (int32_t)SCAN_GAP_MS) {
       scanAt = scanNext;
       scanSentAt = now;
@@ -786,16 +822,18 @@ void driverTask(void *) {
     // frames on a 9600 baud link at once. Nothing is asked of a module that has
     // been told to sleep: it answers queries with an error, and that error would
     // latch as a fault for as long as it stayed asleep.
-    if (!sleeping && (int32_t)(now - nextPoll) >= 0 &&
+    if (!isSleeping() && (int32_t)(now - nextPoll) >= 0 &&
         uxQueueMessagesWaiting(commands) == 0) {
       nextPoll = now + DF_POLL_MS;
       switch (pollStep++ & 0x03) {
         case 0: frameNow(Q_STATUS); break;
-        case 1:
+        case 1: {
+          const DfSource activeSource = currentSource();
           frameNow(activeSource == DF_SRC_USB     ? Q_TRACK_USB
                    : activeSource == DF_SRC_FLASH ? Q_TRACK_FLASH
                                                   : Q_TRACK_SD);
           break;
+        }
         case 2: frameNow(Q_VOLUME); break;
         default: {
           // The library size only changes when a card does, and that arrives as
@@ -812,6 +850,7 @@ void driverTask(void *) {
             unknown = lock.held && status.totalTracks == 0;
           }
           if (unknown) {
+            const DfSource activeSource = currentSource();
             frameNow(activeSource == DF_SRC_USB     ? Q_FILES_USB
                      : activeSource == DF_SRC_FLASH ? Q_FILES_FLASH
                                                     : Q_FILES_SD);
@@ -848,12 +887,20 @@ bool df_player_begin(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
   status.loop = bootLoop;
   status.dacOn = true;
   status.ledMode = DF_LED_AUTO;
-  activeSource = bootSource;
+  publishSource(bootSource);
 
   statusLock = xSemaphoreCreateMutex();
   commands = xQueueCreate(24, sizeof(Command));
   if (statusLock == nullptr || commands == nullptr) {
     LOGLN("[df] out of memory: driver not started");
+    if (commands) {
+      vQueueDelete(commands);
+      commands = nullptr;
+    }
+    if (statusLock) {
+      vSemaphoreDelete(statusLock);
+      statusLock = nullptr;
+    }
     return false;
   }
 
@@ -882,6 +929,11 @@ bool df_player_begin(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
   if (xTaskCreatePinnedToCore(driverTask, "dfplayer", 4096, nullptr, 1, nullptr,
                               0) != pdPASS) {
     LOGLN("[df] could not start the driver task");
+    Serial2.end();
+    vQueueDelete(commands);
+    commands = nullptr;
+    vSemaphoreDelete(statusLock);
+    statusLock = nullptr;
     return false;
   }
 
@@ -897,9 +949,19 @@ bool df_player_begin(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
 
 bool df_player_running() { return running; }
 
-bool df_player_active() { return running && (liveBusy || liveState == DF_PLAYING); }
+bool df_player_active() {
+  return running && (currentLiveBusy() || currentLiveState() == DF_PLAYING);
+}
 
-DfState df_player_state() { return liveState; }
+DfState df_player_state() { return currentLiveState(); }
+
+uint8_t df_player_queue_depth() {
+  return commands ? (uint8_t)uxQueueMessagesWaiting(commands) : 0;
+}
+
+uint8_t df_player_queue_high_water() {
+  return (uint8_t)__atomic_load_n(&commandHighWater, __ATOMIC_ACQUIRE);
+}
 
 bool df_player_snapshot(DfStatus *out) {
   if (out == nullptr) return false;
@@ -1050,7 +1112,7 @@ bool df_player_next() { return frame(CMD_NEXT); }
 bool df_player_previous() { return frame(CMD_PREV); }
 
 bool df_player_toggle() {
-  return liveState == DF_PLAYING ? df_player_pause() : df_player_play();
+  return currentLiveState() == DF_PLAYING ? df_player_pause() : df_player_play();
 }
 
 bool df_player_play_track(uint16_t track) {
@@ -1134,7 +1196,7 @@ bool df_player_set_source(DfSource source) {
       source != DF_SRC_FLASH) {
     return false;
   }
-  activeSource = source;
+  publishSource(source);
   {
     Locked lock;
     if (lock.held) {
@@ -1207,7 +1269,7 @@ bool df_player_reset() {
       status.error[0] = 0;
     }
   }
-  liveState = DF_STOPPED;
+  publishLiveState(DF_STOPPED);
   dropFolderIndex();
   return push(Command{OP_STARTUP, 0, 0});
 }
@@ -1217,11 +1279,11 @@ bool df_player_standby() {
   // Set after the frame is queued, not before: if the queue is full the module
   // is not going to sleep, and a flag that said otherwise would switch the
   // poller off and leave the dashboard describing a state that never happened.
-  sleeping = true;
+  publishSleeping(true);
   Locked lock;
   if (lock.held) {
     status.state = DF_SLEEPING;
-    liveState = DF_SLEEPING;
+    publishLiveState(DF_SLEEPING);
     status.asleep = true;
     status.error[0] = 0;
   }
@@ -1230,8 +1292,8 @@ bool df_player_standby() {
 
 bool df_player_wake() {
   if (!frame(CMD_WAKE)) return false;
-  sleeping = false;
-  liveState = DF_STOPPED;
+  publishSleeping(false);
+  publishLiveState(DF_STOPPED);
   {
     Locked lock;
     if (lock.held) {

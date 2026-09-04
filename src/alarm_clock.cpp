@@ -10,6 +10,7 @@
 #include "net_radio.h"
 #include "power.h"
 #include "soft_clock.h"
+#include "stability_policy.h"
 #include "ui.h"
 #include "voice.h"
 
@@ -17,6 +18,7 @@ namespace {
 
 Preferences prefs;
 bool prefsOk;
+portMUX_TYPE alarmMux = portMUX_INITIALIZER_UNLOCKED;
 
 Alarm alarms[ALARM_MAX];
 uint8_t alarmCount;
@@ -112,26 +114,15 @@ void clampAlarm(Alarm *a) {
  * that explains the other.
  */
 uint32_t secondsUntilScheduled(const Alarm &a, const struct tm &now) {
-  if (!a.enabled) return 0;
-  const int32_t nowSecs = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec;
-  const int32_t atSecs = a.hour * 3600 + a.minute * 60;
-
-  if (a.days == ALARM_ONCE) {
-    int32_t delta = atSecs - nowSecs;
-    if (delta <= 0) delta += 86400;
-    return (uint32_t)delta;
-  }
-  for (uint8_t ahead = 0; ahead <= 7; ahead++) {
-    const uint8_t wday = (uint8_t)((now.tm_wday + ahead) % 7);
-    if (!(a.days & (1 << wday))) continue;
-    const int32_t delta = atSecs - nowSecs + (int32_t)ahead * 86400;
-    if (delta > 0) return (uint32_t)delta;
-  }
-  return 0;
+  return stability_alarm_seconds_until(
+      a.enabled, a.days, a.hour, a.minute, (uint8_t)now.tm_wday,
+      (uint8_t)now.tm_hour, (uint8_t)now.tm_min, (uint8_t)now.tm_sec);
 }
 
 void applyVolume(uint8_t volume) {
+  portENTER_CRITICAL(&alarmMux);
   rampVolume = volume;
+  portEXIT_CRITICAL(&alarmMux);
   if (setVolumeHook) setVolumeHook(volume);
 }
 
@@ -182,12 +173,16 @@ bool sourceAudible(const Alarm &a) {
 }
 
 void beginRinging(uint8_t index) {
+  Alarm a;
+  const uint32_t now = millis();
+  portENTER_CRITICAL(&alarmMux);
   activeIndex = (int8_t)index;
   state = ALARM_RINGING;
-  ringStartedMs = millis();
+  ringStartedMs = now;
   lastRampMs = ringStartedMs;
+  a = alarms[index];
+  portEXIT_CRITICAL(&alarmMux);
 
-  const Alarm &a = alarms[index];
   applyVolume(a.fadeSecs ? RAMP_FLOOR : a.volume);
   startSource(a);
 
@@ -203,26 +198,35 @@ void beginRinging(uint8_t index) {
 }
 
 void endRinging(const char *why) {
+  bool save = false;
+  portENTER_CRITICAL(&alarmMux);
   if (activeIndex >= 0) {
     Alarm &a = alarms[activeIndex];
     if (a.days == ALARM_ONCE) {
       // A one-shot has now happened. Disarming rather than deleting keeps it on
       // the dashboard, where it can be switched back on with one press.
       a.enabled = false;
-      saveAlarms();
+      save = true;
     }
   }
-  stopAudio();
   state = ALARM_IDLE;
   activeIndex = -1;
+  portEXIT_CRITICAL(&alarmMux);
+  if (save) saveAlarms();
+  stopAudio();
   ui_show_system_status(UI_STATUS_SUCCESS, "Alarm off", why, -1, 2000);
   LOGF("[alarm] stopped: %s\n", why);
 }
 
 void serviceRinging() {
-  const Alarm &a = alarms[activeIndex];
+  Alarm a;
+  uint32_t started;
+  portENTER_CRITICAL(&alarmMux);
+  a = alarms[activeIndex];
+  started = ringStartedMs;
+  portEXIT_CRITICAL(&alarmMux);
   const uint32_t now = millis();
-  const uint32_t elapsed = now - ringStartedMs;
+  const uint32_t elapsed = now - started;
 
   if (elapsed >= (uint32_t)a.durationSecs * 1000u) {
     endRinging("Timed out");
@@ -237,7 +241,9 @@ void serviceRinging() {
   }
 
   if (a.fadeSecs && now - lastRampMs >= RAMP_INTERVAL_MS) {
+    portENTER_CRITICAL(&alarmMux);
     lastRampMs = now;
+    portEXIT_CRITICAL(&alarmMux);
     const uint32_t fadeMs = (uint32_t)a.fadeSecs * 1000u;
     const uint32_t done = elapsed < fadeMs ? elapsed : fadeMs;
     const uint32_t span = a.volume > RAMP_FLOOR ? a.volume - RAMP_FLOOR : 0;
@@ -247,21 +253,32 @@ void serviceRinging() {
 }
 
 void serviceSleep() {
-  if (!sleepRunning) return;
+  uint32_t ends;
+  bool standby;
+  uint8_t fromVolume;
+  portENTER_CRITICAL(&alarmMux);
+  const bool running = sleepRunning;
+  ends = sleepEndsMs;
+  standby = sleepStandby;
+  fromVolume = sleepFromVolume;
+  portEXIT_CRITICAL(&alarmMux);
+  if (!running) return;
   const uint32_t now = millis();
-  const int32_t left = (int32_t)(sleepEndsMs - now);
+  const uint32_t left = stability_remaining(now, ends);
 
-  if (left <= 0) {
+  if (left == 0) {
+    portENTER_CRITICAL(&alarmMux);
     sleepRunning = false;
+    portEXIT_CRITICAL(&alarmMux);
     stopAudio();
     LOGLN("[alarm] sleep timer finished");
     voice_say(VOICE_SLEEP_ENDING, VOICE_CAT_ALARM);
-    if (sleepStandby && power_sleep_possible()) {
+    if (standby && power_sleep_possible()) {
       // power_sleep_now() draws its own farewell screen and does not return.
       ui_show_system_status(UI_STATUS_GOODBYE, "Sleep timer", "Going to standby", -1, 0);
       power_sleep_now();
     } else {
-      applyVolume(sleepFromVolume);
+      applyVolume(fromVolume);
       ui_show_system_status(UI_STATUS_SUCCESS, "Sleep timer", "Playback stopped", -1, 3000);
     }
     return;
@@ -269,10 +286,10 @@ void serviceSleep() {
 
   // The last minute is a fade rather than a cliff. Announcing it as well would
   // be a voice waking somebody the timer exists to let fall asleep.
-  if ((uint32_t)left <= SLEEP_FADE_MS) {
-    const uint32_t gone = SLEEP_FADE_MS - (uint32_t)left;
-    const uint8_t want = (uint8_t)(sleepFromVolume -
-                                   (uint32_t)sleepFromVolume * gone / SLEEP_FADE_MS);
+  if (left <= SLEEP_FADE_MS) {
+    const uint32_t gone = SLEEP_FADE_MS - left;
+    const uint8_t want = (uint8_t)(fromVolume -
+                                   (uint32_t)fromVolume * gone / SLEEP_FADE_MS);
     if (want != rampVolume) applyVolume(want);
   }
 }
@@ -362,7 +379,9 @@ void alarm_loop() {
 
     lastFiredStamp[i] = stamp;
     if (a.skipNext) {
+      portENTER_CRITICAL(&alarmMux);
       a.skipNext = false;
+      portEXIT_CRITICAL(&alarmMux);
       saveAlarms();
       LOGF("[alarm] %u skipped as asked\n", (unsigned)i + 1);
       continue;
@@ -375,22 +394,39 @@ void alarm_loop() {
 void alarm_status(AlarmStatus *out) {
   if (!out) return;
   memset(out, 0, sizeof(*out));
+  Alarm localAlarms[ALARM_MAX];
+  uint8_t count;
+  uint32_t ringStarted;
+  uint32_t snoozeUntil;
+  uint32_t sleepTotal;
+  uint32_t sleepEnds;
+  portENTER_CRITICAL(&alarmMux);
   out->state = state;
   out->active = activeIndex;
-  out->next = -1;
   out->rampVolume = rampVolume;
+  out->sleepRunning = sleepRunning;
+  count = alarmCount;
+  memcpy(localAlarms, alarms, (size_t)count * sizeof(Alarm));
+  ringStarted = ringStartedMs;
+  snoozeUntil = snoozeUntilMs;
+  sleepTotal = sleepTotalMs;
+  sleepEnds = sleepEndsMs;
+  portEXIT_CRITICAL(&alarmMux);
+  out->next = -1;
 
-  if (state == ALARM_RINGING) out->ringingForSecs = (millis() - ringStartedMs) / 1000;
-  if (state == ALARM_SNOOZED) {
-    const int32_t left = (int32_t)(snoozeUntilMs - millis());
-    out->snoozeLeftSecs = left > 0 ? (uint32_t)left / 1000 : 0;
+  const uint32_t nowMs = millis();
+  if (out->state == ALARM_RINGING) {
+    out->ringingForSecs = (nowMs - ringStarted) / 1000;
+  }
+  if (out->state == ALARM_SNOOZED) {
+    out->snoozeLeftSecs = stability_remaining(nowMs, snoozeUntil) / 1000;
   }
 
   struct tm local;
   soft_clock_now(&local);
   uint32_t best = 0;
-  for (uint8_t i = 0; i < alarmCount; i++) {
-    const uint32_t secs = secondsUntilScheduled(alarms[i], local);
+  for (uint8_t i = 0; i < count; i++) {
+    const uint32_t secs = secondsUntilScheduled(localAlarms[i], local);
     if (!secs) continue;
     if (best == 0 || secs < best) {
       best = secs;
@@ -399,42 +435,61 @@ void alarm_status(AlarmStatus *out) {
   }
   out->nextInSecs = best;
 
-  out->sleepRunning = sleepRunning;
-  out->sleepTotalSecs = sleepTotalMs / 1000;
-  if (sleepRunning) {
-    const int32_t left = (int32_t)(sleepEndsMs - millis());
-    out->sleepLeftSecs = left > 0 ? (uint32_t)left / 1000 : 0;
+  out->sleepTotalSecs = sleepTotal / 1000;
+  if (out->sleepRunning) {
+    out->sleepLeftSecs = stability_remaining(nowMs, sleepEnds) / 1000;
   }
 }
 
-uint8_t alarm_count() { return alarmCount; }
+uint8_t alarm_count() {
+  portENTER_CRITICAL(&alarmMux);
+  const uint8_t count = alarmCount;
+  portEXIT_CRITICAL(&alarmMux);
+  return count;
+}
 
 bool alarm_get(uint8_t index, Alarm *out) {
-  if (!out || index >= alarmCount) return false;
-  *out = alarms[index];
-  return true;
+  if (!out) return false;
+  bool valid;
+  portENTER_CRITICAL(&alarmMux);
+  valid = index < alarmCount;
+  if (valid) *out = alarms[index];
+  portEXIT_CRITICAL(&alarmMux);
+  return valid;
 }
 
 bool alarm_set(uint8_t index, const Alarm &alarm) {
-  if (index >= alarmCount) {
-    if (alarmCount >= ALARM_MAX) return false;
-    index = alarmCount++;
-  }
-  alarms[index] = alarm;
-  clampAlarm(&alarms[index]);
-  // An alarm edited into the current minute must not fire the instant it is
-  // saved -- somebody setting 07:00 at 07:00 means tomorrow.
+  Alarm next = alarm;
+  clampAlarm(&next);
   struct tm now;
   soft_clock_now(&now);
-  lastFiredStamp[index] = minuteStamp(now);
+  const uint32_t stamp = minuteStamp(now);
+  portENTER_CRITICAL(&alarmMux);
+  if (index >= alarmCount) {
+    if (alarmCount >= ALARM_MAX) {
+      portEXIT_CRITICAL(&alarmMux);
+      return false;
+    }
+    index = alarmCount++;
+  }
+  alarms[index] = next;
+  // An alarm edited into the current minute must not fire the instant it is
+  // saved -- somebody setting 07:00 at 07:00 means tomorrow.
+  lastFiredStamp[index] = stamp;
+  portEXIT_CRITICAL(&alarmMux);
   saveAlarms();
   voice_say(VOICE_ALARM_SET, VOICE_CAT_ALARM);
   return true;
 }
 
 bool alarm_remove(uint8_t index) {
-  if (index >= alarmCount) return false;
-  if (activeIndex == (int8_t)index) alarm_dismiss();
+  portENTER_CRITICAL(&alarmMux);
+  const bool valid = index < alarmCount;
+  const bool active = activeIndex == (int8_t)index;
+  portEXIT_CRITICAL(&alarmMux);
+  if (!valid) return false;
+  if (active) alarm_dismiss();
+  portENTER_CRITICAL(&alarmMux);
   for (uint8_t i = index; i + 1 < alarmCount; i++) {
     alarms[i] = alarms[i + 1];
     lastFiredStamp[i] = lastFiredStamp[i + 1];
@@ -442,6 +497,7 @@ bool alarm_remove(uint8_t index) {
   alarmCount--;
   memset(&alarms[alarmCount], 0, sizeof(Alarm));
   if (activeIndex > (int8_t)index) activeIndex--;
+  portEXIT_CRITICAL(&alarmMux);
   saveAlarms();
   return true;
 }
@@ -452,11 +508,17 @@ void alarm_dismiss() {
 }
 
 void alarm_snooze() {
-  if (state != ALARM_RINGING || activeIndex < 0) return;
-  const Alarm &a = alarms[activeIndex];
+  Alarm a;
+  portENTER_CRITICAL(&alarmMux);
+  const bool canSnooze = state == ALARM_RINGING && activeIndex >= 0;
+  if (canSnooze) a = alarms[activeIndex];
+  portEXIT_CRITICAL(&alarmMux);
+  if (!canSnooze) return;
   stopAudio();
+  portENTER_CRITICAL(&alarmMux);
   state = ALARM_SNOOZED;
   snoozeUntilMs = millis() + (uint32_t)a.snoozeMins * 60000u;
+  portEXIT_CRITICAL(&alarmMux);
   ui_wake();
   char detail[32];
   snprintf(detail, sizeof(detail), "%u more minutes", (unsigned)a.snoozeMins);
@@ -466,7 +528,7 @@ void alarm_snooze() {
 }
 
 bool alarm_trigger(uint8_t index) {
-  if (index >= alarmCount) return false;
+  if (index >= alarm_count()) return false;
   if (state != ALARM_IDLE) alarm_dismiss();
   beginRinging(index);
   return true;
@@ -478,6 +540,7 @@ bool alarm_sleep_start(uint16_t minutes, bool standby) {
     return true;
   }
   if (minutes > 600) minutes = 600;
+  portENTER_CRITICAL(&alarmMux);
   sleepTotalMs = (uint32_t)minutes * 60000u;
   sleepEndsMs = millis() + sleepTotalMs;
   sleepStandby = standby;
@@ -485,6 +548,7 @@ bool alarm_sleep_start(uint16_t minutes, bool standby) {
   // by then it has already been changed by the fade itself.
   sleepFromVolume = rampVolume ? rampVolume : 90;
   sleepRunning = true;
+  portEXIT_CRITICAL(&alarmMux);
 
   ui_wake();
   char detail[40];
@@ -498,31 +562,61 @@ bool alarm_sleep_start(uint16_t minutes, bool standby) {
 }
 
 void alarm_sleep_cancel() {
-  if (!sleepRunning) return;
+  uint8_t restore;
+  portENTER_CRITICAL(&alarmMux);
+  if (!sleepRunning) {
+    portEXIT_CRITICAL(&alarmMux);
+    return;
+  }
   sleepRunning = false;
+  restore = sleepFromVolume;
+  portEXIT_CRITICAL(&alarmMux);
   // The fade may already have pulled the volume down; put it back rather than
   // leaving the owner wondering why cancelling made things quieter.
-  applyVolume(sleepFromVolume);
+  applyVolume(restore);
   ui_show_system_status(UI_STATUS_SUCCESS, "Sleep timer", "Cancelled", -1, 2500);
   LOGLN("[alarm] sleep timer cancelled");
 }
 
 bool alarm_sleep_extend(uint16_t minutes) {
   if (!minutes) return false;
-  if (!sleepRunning) return alarm_sleep_start(minutes, sleepStandbyDefault);
-  sleepEndsMs += (uint32_t)minutes * 60000u;
-  sleepTotalMs += (uint32_t)minutes * 60000u;
+  portENTER_CRITICAL(&alarmMux);
+  if (!sleepRunning) {
+    const bool standby = sleepStandbyDefault;
+    portEXIT_CRITICAL(&alarmMux);
+    return alarm_sleep_start(minutes, standby);
+  }
+  const uint32_t maximum = 600u * 60000u;
+  const uint32_t room = sleepTotalMs < maximum ? maximum - sleepTotalMs : 0;
+  uint32_t added = (uint32_t)minutes * 60000u;
+  if (added > room) added = room;
+  if (!added) {
+    portEXIT_CRITICAL(&alarmMux);
+    return false;
+  }
+  sleepEndsMs += added;
+  sleepTotalMs += added;
+  const uint32_t ends = sleepEndsMs;
+  const uint8_t restore = sleepFromVolume;
+  portEXIT_CRITICAL(&alarmMux);
   // Extending past the fade means the fade has to be undone.
-  if ((int32_t)(sleepEndsMs - millis()) > (int32_t)SLEEP_FADE_MS) {
-    applyVolume(sleepFromVolume);
+  if (stability_remaining(millis(), ends) > SLEEP_FADE_MS) {
+    applyVolume(restore);
   }
   return true;
 }
 
-bool alarm_sleep_standby_default() { return sleepStandbyDefault; }
+bool alarm_sleep_standby_default() {
+  portENTER_CRITICAL(&alarmMux);
+  const bool standby = sleepStandbyDefault;
+  portEXIT_CRITICAL(&alarmMux);
+  return standby;
+}
 
 void alarm_set_sleep_standby_default(bool on) {
+  portENTER_CRITICAL(&alarmMux);
   sleepStandbyDefault = on;
+  portEXIT_CRITICAL(&alarmMux);
   if (prefsOk) prefs.putBool("sleepstby", on);
 }
 

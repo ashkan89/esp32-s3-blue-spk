@@ -37,10 +37,10 @@
  * to see.
  *
  * Nothing is allocated until a station is played. The buffer, the socket chunk
- * and the decoder feed are one 22 kB block claimed when a stream starts and
+ * and the decoder feed are one 24 kB block claimed when a stream starts and
  * freed when it ends, and the decoder task's 10 kB stack is created on the
  * first station and then kept. That is not tidiness: held from boot, they cost
- * the firmware updater its TLS handshake, which wants 60 kB free and a 34 kB
+ * the firmware updater its TLS handshake, which wants 80 kB free and a 45 kB
  * contiguous block -- and a 24 kB allocation made early sits in the middle of
  * the heap splitting exactly the block the handshake needs. A speaker that
  * never plays a station now pays for the station list and nothing else.
@@ -187,9 +187,8 @@ bool net_radio_step_station(bool forward);
 void net_radio_set_volume(uint8_t volume127);
 uint8_t net_radio_volume();
 
-/// Whether the radio should come back on its own after a reboot. Follows
-/// whatever was last asked for, so a speaker that was playing when the power
-/// went out is playing again when it returns.
+/// Whether the first favourite should start automatically after boot. A failed
+/// boot-time attempt disarms it so a bad station cannot create a boot loop.
 bool net_radio_autostart();
 void net_radio_set_autostart(bool on);
 

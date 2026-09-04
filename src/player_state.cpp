@@ -5,24 +5,28 @@
 #include <string.h>
 
 #include "ui_config.h"
+#include "stability_policy.h"
 
 static PlayerInfo g_info;
-static volatile uint32_t g_seq;  // even = stable, odd = write in progress
+static uint32_t g_seq;  // even = stable, odd = write in progress
 static char g_device_name[PS_NAME_MAX];
+// A seqlock needs one writer at a time. AVRCP/Bluetooth callbacks and loop()
+// both update this model, so serialize writers before changing the sequence.
+static portMUX_TYPE g_write_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // A write is bracketed by two increments with full barriers around the payload,
 // so a reader that sees the same even sequence twice knows nothing moved in
 // between. See the header for why this is not a mutex.
 static inline void begin_write() {
-  // Read-modify-write spelled out: ++ on a volatile is deprecated in C++20
-  // because its ordering is unspecified, and here the ordering is the point.
-  g_seq = g_seq + 1;
+  portENTER_CRITICAL(&g_write_mux);
+  __atomic_add_fetch(&g_seq, 1U, __ATOMIC_RELAXED);
   __sync_synchronize();
 }
 
 static inline void end_write() {
   __sync_synchronize();
-  g_seq = g_seq + 1;
+  __atomic_add_fetch(&g_seq, 1U, __ATOMIC_RELEASE);
+  portEXIT_CRITICAL(&g_write_mux);
 }
 
 /*
@@ -56,20 +60,20 @@ static void copy_sanitised(char *dst, size_t cap, const char *src) {
   for (const uint8_t *p = (const uint8_t *)src; *p && o + 1 < cap;) {
     uint32_t cp;
     uint8_t c = *p;
+    const uint8_t encoded =
+        stability_utf8_sequence_length((const char *)p);
 
     if (c < 0x80) {
       cp = c;
       p += 1;
-    } else if ((c & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+    } else if (encoded == 2) {
       cp = ((uint32_t)(c & 0x1F) << 6) | (uint32_t)(p[1] & 0x3F);
       p += 2;
-    } else if ((c & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 &&
-               (p[2] & 0xC0) == 0x80) {
+    } else if (encoded == 3) {
       cp = ((uint32_t)(c & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) |
            (uint32_t)(p[2] & 0x3F);
       p += 3;
-    } else if ((c & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 &&
-               (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+    } else if (encoded == 4) {
       /*
        * All three continuation bytes are checked, and that is not pedantry.
        * The lead byte alone used to be enough to advance by four, so a string
@@ -142,20 +146,22 @@ void ps_set_source(PsSource source) {
 }
 
 void ps_snapshot(PlayerInfo *out) {
-  // Bounded retry: a torn read only happens if a write lands in the middle of
-  // the memcpy, and a write holds the sequence for microseconds. The bound is
-  // there so this can never spin forever if something upstream misbehaves.
-  for (int attempt = 0; attempt < 8; attempt++) {
-    uint32_t s1 = g_seq;
-    if (s1 & 1) continue;  // write in progress
-    __sync_synchronize();
-    memcpy(out, &g_info, sizeof(PlayerInfo));
-    __sync_synchronize();
-    if (g_seq == s1) return;
+  if (!out) return;
+  // A write holds the odd sequence for only a few microseconds. Yield after a
+  // burst of collisions, but never return a knowingly torn snapshot.
+  uint8_t collisions = 0;
+  for (;;) {
+    const uint32_t s1 = __atomic_load_n(&g_seq, __ATOMIC_ACQUIRE);
+    if (!(s1 & 1)) {
+      memcpy(out, &g_info, sizeof(PlayerInfo));
+      __sync_synchronize();
+      if (__atomic_load_n(&g_seq, __ATOMIC_RELAXED) == s1) return;
+    }
+    if (++collisions == 8) {
+      taskYIELD();
+      collisions = 0;
+    }
   }
-  // Gave up racing. A slightly mixed snapshot is a cosmetic problem for one
-  // frame, so return what we have rather than leaving the caller with nothing.
-  memcpy(out, &g_info, sizeof(PlayerInfo));
 }
 
 uint32_t ps_position_ms(const PlayerInfo &s, uint32_t now_ms) {
@@ -310,6 +316,7 @@ void ps_new_track() {
 }
 
 void ps_set_metadata(uint8_t attr_id, const uint8_t *text) {
+  if (!text) return;
   const char *s = (const char *)text;
 
   switch (attr_id) {

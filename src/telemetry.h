@@ -16,7 +16,7 @@
  * Taking a sample is four reads of values other modules are already keeping, so
  * there is nothing to switch off in a release build. The
  * ring is in RAM and not in flash on purpose: this is for looking at a running
- * speaker, and writing a sample to NVS every thirty seconds would wear the
+ * speaker, and writing a sample to NVS every minute would wear the
  * chip out inside a year for a history nobody reads after a reboot.
  *
  * On the temperature reading, which deserves a warning. This is the ESP32's
@@ -48,7 +48,8 @@ static const uint16_t TELEMETRY_INTERVAL_S = 60;
 /*
  * One sample.
  *
- * Ten bytes, and every field is packed to the smallest type that holds it
+ * Twelve bytes including alignment, and every field is packed to the smallest
+ * type that holds it
  * without losing anything the graph could show: millivolts because that is the
  * gauge's own resolution, tenths of a degree because the sensor's step is
  * coarser than that anyway, and kilobytes of heap because a graph pixel is

@@ -16,7 +16,7 @@
 #define USE_DS3231 0
 #endif
 
-static ClockSource g_source = CLOCK_SRC_BUILD;
+static uint32_t g_sourceWord = CLOCK_SRC_BUILD;
 static Preferences g_prefs;
 static uint32_t g_last_persist_ms;
 static bool g_prefs_ok;
@@ -27,7 +27,7 @@ static int32_t g_offset_min = CLOCK_TZ_OFFSET_MIN;
 
 /// Set from the SNTP callback, which runs on lwIP's thread -- so it does
 /// nothing but raise this, and soft_clock_tick() does the work.
-static volatile bool g_ntp_fresh;
+static uint32_t g_ntp_fresh;
 static bool g_ntp_running;
 static bool g_ntp_synced;
 
@@ -58,7 +58,7 @@ static const char *ZONE_KEY = "tzrule";
 
 /// Presentation, not time: 24-hour or 12-hour with AM/PM. CLOCK_24H is only the
 /// value a speaker that has never been opened in a browser comes up with.
-static bool g_use_24h = CLOCK_24H != 0;
+static uint32_t g_use24Word = CLOCK_24H != 0;
 
 /// Whether SNTP is allowed to correct the clock. Off is for an owner who set the
 /// time by hand and wants it kept, and it is checked in network_begin() so no
@@ -414,7 +414,7 @@ static void persist_now();
 
 static void ntp_notification(struct timeval *tv) {
   (void)tv;
-  g_ntp_fresh = true;
+  __atomic_store_n(&g_ntp_fresh, 1U, __ATOMIC_RELEASE);
 }
 
 void soft_clock_network_begin() {
@@ -444,13 +444,12 @@ bool soft_clock_network_synced() { return g_ntp_synced; }
 
 /// Picks up what the SNTP client already wrote into the system clock.
 static void adopt_network_time() {
-  g_ntp_fresh = false;
   const time_t now = time(nullptr);
   if (now < EPOCH_SANITY_FLOOR) return;
 
   const bool first = !g_ntp_synced;
   g_ntp_synced = true;
-  g_source = CLOCK_SRC_NTP;
+  __atomic_store_n(&g_sourceWord, CLOCK_SRC_NTP, __ATOMIC_RELEASE);
 
 #if USE_DS3231
   struct tm local;
@@ -484,7 +483,9 @@ void soft_clock_begin() {
   if (g_prefs_ok) {
     g_offset_min = (int32_t)g_prefs.getLong(OFFSET_KEY, CLOCK_TZ_OFFSET_MIN);
     if (g_offset_min < -840 || g_offset_min > 840) g_offset_min = CLOCK_TZ_OFFSET_MIN;
-    g_use_24h = g_prefs.getBool(H24_KEY, CLOCK_24H != 0);
+    __atomic_store_n(&g_use24Word,
+                     g_prefs.getBool(H24_KEY, CLOCK_24H != 0),
+                     __ATOMIC_RELEASE);
     g_auto_sync = g_prefs.getBool(SYNC_KEY, true);
     // Read into a scratch buffer and vet it before it becomes the live zone: a
     // rule that stopped parsing between firmware versions must not take the
@@ -502,7 +503,7 @@ void soft_clock_begin() {
 
   // Always start from the build stamp, so nothing downstream ever sees 1970.
   apply_epoch(build_epoch());
-  g_source = CLOCK_SRC_BUILD;
+  __atomic_store_n(&g_sourceWord, CLOCK_SRC_BUILD, __ATOMIC_RELEASE);
 
   if (g_prefs_ok) {
     const uint32_t saved = g_prefs.getULong(EPOCH_KEY, 0);
@@ -510,7 +511,7 @@ void soft_clock_begin() {
     // left over from a previous firmware and is worse than the build stamp.
     if (saved > (uint32_t)build_epoch()) {
       apply_epoch((time_t)saved);
-      g_source = CLOCK_SRC_NVS;
+      __atomic_store_n(&g_sourceWord, CLOCK_SRC_NVS, __ATOMIC_RELEASE);
     }
   }
 
@@ -549,7 +550,7 @@ void soft_clock_begin() {
     } else if (readable) {
       g_rtc_state = RTC_OK;
       apply_epoch(mktime(&t));
-      g_source = CLOCK_SRC_RTC;
+      __atomic_store_n(&g_sourceWord, CLOCK_SRC_RTC, __ATOMIC_RELEASE);
       LOGLN("[clock] ds3231");
     } else if (!osfKnown) {
       g_rtc_state = RTC_UNREADABLE;
@@ -582,10 +583,12 @@ void soft_clock_now(struct tm *out) {
   localtime_r(&now, out);
 }
 
-bool soft_clock_trusted() { return g_source != CLOCK_SRC_BUILD; }
+bool soft_clock_trusted() {
+  return __atomic_load_n(&g_sourceWord, __ATOMIC_ACQUIRE) != CLOCK_SRC_BUILD;
+}
 
 const char *soft_clock_source_name() {
-  switch (g_source) {
+  switch ((ClockSource)__atomic_load_n(&g_sourceWord, __ATOMIC_ACQUIRE)) {
     case CLOCK_SRC_NVS: return "nvs";
     case CLOCK_SRC_SERIAL: return "set";
     case CLOCK_SRC_RTC: return "ds3231";
@@ -600,11 +603,13 @@ static void persist_now() {
   g_last_persist_ms = millis();
 }
 
-bool soft_clock_use_24h() { return g_use_24h; }
+bool soft_clock_use_24h() {
+  return __atomic_load_n(&g_use24Word, __ATOMIC_ACQUIRE) != 0;
+}
 
 void soft_clock_set_use_24h(bool on) {
-  if (on == g_use_24h) return;
-  g_use_24h = on;
+  if (on == soft_clock_use_24h()) return;
+  __atomic_store_n(&g_use24Word, on ? 1U : 0U, __ATOMIC_RELEASE);
   if (g_prefs_ok) g_prefs.putBool(H24_KEY, on);
   LOGF("[clock] %s clock\n", on ? "24-hour" : "12-hour");
 }
@@ -701,7 +706,7 @@ void soft_clock_set(const struct tm &t, ClockSource source) {
   if (epoch == (time_t)-1) return;
 
   apply_epoch(epoch);
-  g_source = source;
+  __atomic_store_n(&g_sourceWord, (uint32_t)source, __ATOMIC_RELEASE);
 
 #if USE_DS3231
   // Keep the hardware clock in step, so the next power cut is free. This is
@@ -718,7 +723,9 @@ void soft_clock_set(const struct tm &t, ClockSource source) {
 }
 
 void soft_clock_tick() {
-  if (g_ntp_fresh) adopt_network_time();
+  if (__atomic_exchange_n(&g_ntp_fresh, 0U, __ATOMIC_ACQ_REL)) {
+    adopt_network_time();
+  }
   const uint32_t now = millis();
 
   /*

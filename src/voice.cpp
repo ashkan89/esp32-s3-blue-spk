@@ -18,6 +18,8 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "stability_policy.h"
+
 namespace {
 
 /*
@@ -61,7 +63,9 @@ enum Owner : uint8_t {
 /// that a stream ending mid-announcement is picked up before the gap is audible.
 const uint32_t MIX_STALE_MS = 350;
 
-const uint8_t QUEUE_LEN = 4;
+// One slot distinguishes full from empty, so five array entries provide the
+// advertised four pending announcements.
+const uint8_t QUEUE_LEN = 5;
 
 struct Decoder {
   const uint8_t *data;
@@ -77,11 +81,14 @@ struct Decoder {
   uint32_t step;  ///< 16.16 increment: how much of a source sample per output one
 };
 
-VoiceConfig config;
-bool configured;
+/* Four bytes published atomically: enabled, volume, category mask, duck and a
+ * configured bit. The audio path never observes a half-written configuration. */
+uint32_t configWord;
 
-volatile uint8_t queue[QUEUE_LEN];
-volatile uint8_t queueHead, queueTail;
+uint8_t queue[QUEUE_LEN];
+uint8_t queueHead, queueTail;
+uint32_t queuedCount;
+uint32_t queueHighWater;
 
 /*
  * The queue has three producers -- the Arduino loop task, the radio decoder
@@ -93,10 +100,12 @@ volatile uint8_t queueHead, queueTail;
 portMUX_TYPE queueMux = portMUX_INITIALIZER_UNLOCKED;
 
 Decoder dec;
-volatile uint8_t owner;
-volatile bool playing;
+uint8_t owner;
+uint32_t playingWord;
+bool cancelRequested;
 uint32_t lastMixMs;
-uint32_t outRate = 44100;
+uint32_t outRateWord = 44100;
+uint32_t appliedOutRate = 44100;
 
 /*
  * The ducking ramp, as a 0..4096 multiplier on the music.
@@ -113,9 +122,47 @@ const int32_t DUCK_ATTACK = 70;   // per frame, ~60 ms from unity to a quarter
 const int32_t DUCK_RELEASE = 24;  // per frame, ~170 ms back
 
 inline int16_t clamp16(int32_t v) {
-  if (v > 32767) return 32767;
-  if (v < -32768) return -32768;
-  return (int16_t)v;
+  return stability_pcm_saturate(v);
+}
+
+uint32_t packConfig(const VoiceConfig &cfg, bool ready = true) {
+  return (cfg.enabled ? 1U : 0U) | ((uint32_t)cfg.volume << 1) |
+         ((uint32_t)cfg.categories << 8) | ((uint32_t)cfg.duck << 16) |
+         (ready ? 0x80000000U : 0U);
+}
+
+bool unpackConfig(uint32_t word, VoiceConfig *out) {
+  if (!out || !(word & 0x80000000U)) return false;
+  out->enabled = (word & 1U) != 0;
+  out->volume = (uint8_t)((word >> 1) & 0x7FU);
+  out->categories = (uint8_t)((word >> 8) & 0xFFU);
+  out->duck = (uint8_t)((word >> 16) & 0x7FU);
+  return true;
+}
+
+VoiceConfig currentConfig() {
+  VoiceConfig cfg;
+  const uint32_t word = __atomic_load_n(&configWord, __ATOMIC_ACQUIRE);
+  if (!unpackConfig(word, &cfg)) {
+    cfg.enabled = true;
+    cfg.volume = 70;
+    cfg.categories = (uint8_t)(VOICE_CAT_SYSTEM | VOICE_CAT_BATTERY |
+                               VOICE_CAT_RADIO | VOICE_CAT_ALARM);
+    cfg.duck = 75;
+  }
+  return cfg;
+}
+
+bool isPlaying() {
+  return __atomic_load_n(&playingWord, __ATOMIC_ACQUIRE) != 0;
+}
+
+void setPlaying(bool value) {
+  __atomic_store_n(&playingWord, value ? 1U : 0U, __ATOMIC_RELEASE);
+}
+
+uint32_t pendingClips() {
+  return __atomic_load_n(&queuedCount, __ATOMIC_ACQUIRE);
 }
 
 void resetDecoder() {
@@ -167,7 +214,9 @@ bool loadClip(uint8_t index) {
   resetDecoder();
   dec.data = clip.data;
   dec.samples = clip.samples;
-  dec.step = (uint32_t)(((uint64_t)VOICE_CLIP_RATE << 16) / (outRate ? outRate : 44100));
+  appliedOutRate = __atomic_load_n(&outRateWord, __ATOMIC_ACQUIRE);
+  dec.step = (uint32_t)(((uint64_t)VOICE_CLIP_RATE << 16) /
+                        (appliedOutRate ? appliedOutRate : 44100));
   // Prime the interpolator so the first output frame sits between two real
   // samples rather than between zero and the first one, which would be a step.
   nextSourceSample(&dec.prev);
@@ -178,15 +227,22 @@ bool loadClip(uint8_t index) {
 
 /// Pops the next queued clip and loads it. False when the queue is empty.
 bool startNext() {
-  while (queueHead != queueTail) {
-    const uint8_t index = queue[queueHead];
-    queueHead = (uint8_t)((queueHead + 1) % QUEUE_LEN);
+  for (;;) {
+    uint8_t index = VOICE_CLIP_COUNT;
+    taskENTER_CRITICAL(&queueMux);
+    if (queueHead != queueTail) {
+      index = queue[queueHead];
+      queueHead = (uint8_t)((queueHead + 1) % QUEUE_LEN);
+      __atomic_sub_fetch(&queuedCount, 1U, __ATOMIC_RELEASE);
+    }
+    taskEXIT_CRITICAL(&queueMux);
+    if (index >= VOICE_CLIP_COUNT) break;
     if (loadClip(index)) {
-      playing = true;
+      setPlaying(true);
       return true;
     }
   }
-  playing = false;
+  setPlaying(false);
   return false;
 }
 
@@ -217,30 +273,93 @@ bool nextOutputSample(int16_t *out) {
 
 /// The announcement's own level, as a 0..4096 multiplier.
 inline int32_t clipGain() {
-  const uint8_t volume = configured ? config.volume : 66;
+  const uint8_t volume = currentConfig().volume;
   return ((int32_t)volume * DUCK_UNITY) / 100;
 }
 
 /// Where the music is pulled down to while a clip plays, as a 0..4096
 /// multiplier. duck=0 leaves the music alone, duck=100 mutes it outright.
 inline int32_t duckTarget() {
-  const uint8_t duck = configured ? config.duck : 75;
+  const uint8_t duck = currentConfig().duck;
   return DUCK_UNITY - ((int32_t)duck * DUCK_UNITY) / 100;
 }
 
 bool categoryAllowed(VoiceCategory category) {
-  if (!configured) voice_defaults(&config);
-  if (!config.enabled) return false;
-  return (config.categories & (uint8_t)category) != 0;
+  const VoiceConfig cfg = currentConfig();
+  if (!cfg.enabled) return false;
+  return (cfg.categories & (uint8_t)category) != 0;
 }
 
-/// Frees the clip for the other path when the one that claimed it has gone
-/// quiet. Called from both renderers, so a stream that stops mid-announcement
-/// is picked up by loop() rather than leaving the clip stranded.
-void releaseIfStale() {
-  if (owner == OWNER_MIX && (uint32_t)(millis() - lastMixMs) > MIX_STALE_MS) {
+/* Claims the decoder without ever handing it to two tasks. The only takeover
+ * is from a mixing path that has missed several complete DMA buffers. */
+bool claimDecoder(Owner wanted) {
+  bool mine;
+  taskENTER_CRITICAL(&queueMux);
+  if (owner == OWNER_MIX && wanted == OWNER_LOOP &&
+      (uint32_t)(millis() - lastMixMs) > MIX_STALE_MS) {
     owner = OWNER_NONE;
   }
+  if (owner == OWNER_NONE) owner = wanted;
+  mine = owner == wanted;
+  if (mine && wanted == OWNER_MIX) lastMixMs = millis();
+  taskEXIT_CRITICAL(&queueMux);
+  return mine;
+}
+
+void releaseDecoder(Owner mine) {
+  taskENTER_CRITICAL(&queueMux);
+  if (owner == mine) owner = OWNER_NONE;
+  taskEXIT_CRITICAL(&queueMux);
+}
+
+/* Only the task that owns the decoder may honour cancellation. Control tasks
+ * clear the queue and set the request, but never touch ADPCM/resampler state. */
+void serviceCancel(Owner mine) {
+  bool cancel = false;
+  taskENTER_CRITICAL(&queueMux);
+  if (owner == mine && cancelRequested) {
+    cancelRequested = false;
+    cancel = true;
+  }
+  taskEXIT_CRITICAL(&queueMux);
+  if (cancel) {
+    resetDecoder();
+    setPlaying(false);
+  }
+}
+
+void adoptSampleRate() {
+  const uint32_t rate = __atomic_load_n(&outRateWord, __ATOMIC_ACQUIRE);
+  if (rate == appliedOutRate) return;
+  appliedOutRate = rate;
+  if (dec.data) {
+    dec.step = (uint32_t)(((uint64_t)VOICE_CLIP_RATE << 16) / appliedOutRate);
+  }
+}
+
+bool enqueueClip(uint8_t clip) {
+  bool queued = false;
+  taskENTER_CRITICAL(&queueMux);
+  const uint8_t next = (uint8_t)((queueTail + 1) % QUEUE_LEN);
+  // A full queue drops the newest rather than the oldest. Announcements are
+  // events in time: the four already waiting describe what happened, and a
+  // fifth that pushed one of them out would tell a story that did not occur.
+  if (next != queueHead) {
+    queue[queueTail] = clip;
+    queueTail = next;
+    __atomic_add_fetch(&queuedCount, 1U, __ATOMIC_RELEASE);
+    const uint32_t depth = pendingClips();
+    uint32_t previous =
+        __atomic_load_n(&queueHighWater, __ATOMIC_RELAXED);
+    while (depth > previous &&
+           !__atomic_compare_exchange_n(&queueHighWater, &previous, depth,
+                                        false, __ATOMIC_RELEASE,
+                                        __ATOMIC_RELAXED)) {
+    }
+    queued = true;
+  }
+  taskEXIT_CRITICAL(&queueMux);
+  return queued;
 }
 
 }  // namespace
@@ -259,36 +378,24 @@ void voice_defaults(VoiceConfig *out) {
 }
 
 void voice_configure(const VoiceConfig &cfg) {
-  config = cfg;
-  if (config.volume > 100) config.volume = 100;
-  if (config.duck > 100) config.duck = 100;
-  config.categories &= (uint8_t)VOICE_CAT_ALL;
-  configured = true;
-  if (!config.enabled) voice_silence();
+  VoiceConfig next = cfg;
+  if (next.volume > 100) next.volume = 100;
+  if (next.duck > 100) next.duck = 100;
+  next.categories &= (uint8_t)VOICE_CAT_ALL;
+  __atomic_store_n(&configWord, packConfig(next), __ATOMIC_RELEASE);
+  if (!next.enabled) voice_silence();
 }
 
 void voice_get(VoiceConfig *out) {
   if (!out) return;
-  if (!configured) voice_defaults(&config);
-  *out = config;
+  const uint32_t word = __atomic_load_n(&configWord, __ATOMIC_ACQUIRE);
+  if (!unpackConfig(word, out)) voice_defaults(out);
 }
 
 bool voice_say_index(uint8_t clip, VoiceCategory category) {
   if (clip >= VOICE_CLIP_COUNT) return false;
   if (!categoryAllowed(category)) return false;
-  bool queued = false;
-  taskENTER_CRITICAL(&queueMux);
-  const uint8_t next = (uint8_t)((queueTail + 1) % QUEUE_LEN);
-  // A full queue drops the newest rather than the oldest. Announcements are
-  // events in time: the four already waiting describe what happened, and a
-  // fifth that pushed one of them out would tell a story that did not occur.
-  if (next != queueHead) {
-    queue[queueTail] = clip;
-    queueTail = next;
-    queued = true;
-  }
-  taskEXIT_CRITICAL(&queueMux);
-  return queued;
+  return enqueueClip(clip);
 }
 
 bool voice_say(VoiceClipId clip, VoiceCategory category) {
@@ -296,41 +403,38 @@ bool voice_say(VoiceClipId clip, VoiceCategory category) {
 }
 
 void voice_silence() {
+  taskENTER_CRITICAL(&queueMux);
   queueHead = queueTail;
-  resetDecoder();
-  playing = false;
-  owner = OWNER_NONE;
+  __atomic_store_n(&queuedCount, 0U, __ATOMIC_RELEASE);
+  cancelRequested = true;
+  taskEXIT_CRITICAL(&queueMux);
 }
 
-bool voice_busy() { return playing || queueHead != queueTail; }
+bool voice_busy() { return isPlaying() || pendingClips() != 0; }
+
+uint8_t voice_queue_depth() { return (uint8_t)pendingClips(); }
+
+uint8_t voice_queue_high_water() {
+  return (uint8_t)__atomic_load_n(&queueHighWater, __ATOMIC_ACQUIRE);
+}
 
 void voice_set_sample_rate(uint32_t hz) {
-  if (hz < 8000 || hz > 96000 || hz == outRate) return;
-  outRate = hz;
-  // Retune the running clip rather than dropping it: the rate changes when a
-  // stream starts, which is exactly when an announcement is most likely to be
-  // in flight.
-  if (dec.data) dec.step = (uint32_t)(((uint64_t)VOICE_CLIP_RATE << 16) / outRate);
+  if (hz < 8000 || hz > 96000) return;
+  // The setter can run on loop() while A2DP owns the decoder. Publish only;
+  // whichever audio path owns the next buffer retunes its own state.
+  __atomic_store_n(&outRateWord, hz, __ATOMIC_RELEASE);
 }
 
 size_t voice_render(int16_t *interleaved, size_t frames) {
   if (!interleaved || frames == 0) return 0;
-  releaseIfStale();
   // Claim it or leave it alone: testing and then setting without this is the
   // window in which both renderers decode alternate chunks of one clip.
-  bool mine = false;
-  taskENTER_CRITICAL(&queueMux);
-  if (owner == OWNER_NONE) {
-    owner = OWNER_LOOP;
-    mine = true;
-  } else if (owner == OWNER_LOOP) {
-    mine = true;
-  }
-  taskEXIT_CRITICAL(&queueMux);
-  if (!mine) return 0;
+  if (!claimDecoder(OWNER_LOOP)) return 0;
+  serviceCancel(OWNER_LOOP);
+  adoptSampleRate();
 
-  if (!playing && !startNext()) {
-    owner = OWNER_NONE;
+  if (!isPlaying() && !startNext()) {
+    releaseDecoder(OWNER_LOOP);
     return 0;
   }
 
@@ -347,7 +451,7 @@ size_t voice_render(int16_t *interleaved, size_t frames) {
       // Straight on to the next queued clip, so a two-part announcement plays
       // as one utterance instead of with a buffer-length hole in it.
       if (!startNext()) {
-        owner = OWNER_NONE;
+        releaseDecoder(OWNER_LOOP);
         break;
       }
     }
@@ -358,24 +462,20 @@ size_t voice_render(int16_t *interleaved, size_t frames) {
 bool voice_mix(int16_t *interleaved, size_t frames) {
   if (!interleaved || frames == 0) return false;
 
-  const bool queued = playing || queueHead != queueTail;
+  const bool queued = isPlaying() || pendingClips() != 0;
   // Nothing to say and the music already back at full level: the common case,
   // and it has to cost nothing because this runs on every buffer of every
   // stream.
   if (!queued && duckLevel >= DUCK_UNITY) return false;
 
-  releaseIfStale();
-  bool mine = false;
-  taskENTER_CRITICAL(&queueMux);
-  if (queued && owner == OWNER_NONE) owner = OWNER_MIX;
-  mine = owner == OWNER_MIX;
-  taskEXIT_CRITICAL(&queueMux);
-  if (mine) lastMixMs = millis();
-  if (mine && !playing && !startNext()) {
-    owner = OWNER_NONE;
+  const bool mine = queued && claimDecoder(OWNER_MIX);
+  if (mine) serviceCancel(OWNER_MIX);
+  if (mine) adoptSampleRate();
+  if (mine && !isPlaying() && !startNext()) {
+    releaseDecoder(OWNER_MIX);
   }
 
-  const bool speaking = mine && playing;
+  const bool speaking = mine && isPlaying();
   const int32_t target = speaking ? duckTarget() : DUCK_UNITY;
   const int32_t gain = clipGain();
 
@@ -398,7 +498,7 @@ bool voice_mix(int16_t *interleaved, size_t frames) {
       left += voiced;
       right += voiced;
       if (!more && !startNext()) {
-        owner = OWNER_NONE;
+        releaseDecoder(OWNER_MIX);
         // The duck ramp is left where it is; the loop above walks it back to
         // unity over the following frames, which is the release.
         for (size_t rest = f + 1; rest < frames; rest++) {
@@ -446,7 +546,8 @@ bool voice_command(const char *line) {
   const char *rest = line + 3;
   while (*rest == ' ') rest++;
 
-  if (!configured) voice_defaults(&config);
+  VoiceConfig config;
+  voice_get(&config);
 
   if (*rest == '\0') {
     LOGF("[voice] %s, volume %u%%, duck %u%%, %u clips |",
@@ -483,15 +584,9 @@ bool voice_command(const char *line) {
     LOGF("[voice] no clip called \"%s\"; type 'say' for the list\n", rest);
     return true;
   }
-  // The console asks for it by name, so it is said whatever the category mask
-  // has to say about it -- somebody typing "say battery_low" wants to hear it.
-  const uint8_t saved = config.categories;
-  const bool savedEnabled = config.enabled;
-  config.categories = VOICE_CAT_ALL;
-  config.enabled = true;
-  const bool ok = voice_say_index(index, VOICE_CAT_SYSTEM);
-  config.categories = saved;
-  config.enabled = savedEnabled;
+  // The console asks for it by name, so it bypasses the category mask without
+  // temporarily rewriting the configuration under the audio task.
+  const bool ok = enqueueClip(index);
   LOGF("[voice] %s \"%s\"\n", ok ? "queued" : "dropped",
                 VOICE_CLIPS[index].text);
   return true;
