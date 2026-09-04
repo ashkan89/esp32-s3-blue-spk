@@ -4566,26 +4566,29 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   sink = &a2dp;
   if (!stableDeviceName.length()) loadSettings(APP_NAME);
   radioMode = (RadioMode)prefs.getUChar("radioMode", RADIO_MODE_MANAGEMENT);
-  if (radioMode >= RADIO_MODE_COUNT) radioMode = RADIO_MODE_MANAGEMENT;
 
   // See the boot sentinel note above. Wi-Fi mode is the fallback, so it never
   // takes a strike -- it just clears whatever the last mode left behind.
   bootStrikes = prefs.getUChar("bootFail", 0);
-  if (radioMode == RADIO_MODE_MANAGEMENT) {
-    if (bootStrikes) prefs.putUChar("bootFail", 0);
-  } else if (bootStrikes >= BOOT_STRIKES_MAX) {
+  const RadioMode requestedMode = radioMode;
+  const StabilityModeBootDecision boot = stability_mode_boot(
+      (uint8_t)requestedMode, RADIO_MODE_COUNT, RADIO_MODE_MANAGEMENT,
+      bootStrikes, BOOT_STRIKES_MAX);
+  radioMode = (RadioMode)boot.mode;
+  if (boot.fellBack) {
     LOGF("[mode] %s mode failed to stay up %u times in a row. Falling "
-                  "back to Wi-Fi mode so the dashboard is reachable; pick a "
-                  "mode again from there once you know why.\n",
-                  management_mode_name(radioMode), (unsigned)bootStrikes);
+         "back to Wi-Fi mode so the dashboard is reachable; pick a "
+         "mode again from there once you know why.\n",
+         management_mode_name(requestedMode), (unsigned)bootStrikes);
     ui_show_system_status(UI_STATUS_ERROR, "Mode failed", "Back to Wi-Fi", -1,
                           10000);
-    radioMode = RADIO_MODE_MANAGEMENT;
     prefs.putUChar("radioMode", (uint8_t)radioMode);
     prefs.putUChar("bootFail", 0);
+  } else if (radioMode == RADIO_MODE_MANAGEMENT) {
+    if (bootStrikes) prefs.putUChar("bootFail", 0);
   } else {
-    prefs.putUChar("bootFail", (uint8_t)(bootStrikes + 1));
-    bootStrikePending = true;
+    prefs.putUChar("bootFail", boot.nextStrikes);
+    bootStrikePending = boot.strikePending;
   }
 
   /*

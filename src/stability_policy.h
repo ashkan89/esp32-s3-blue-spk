@@ -151,6 +151,28 @@ constexpr uint8_t stability_mode_next(uint8_t current, uint8_t modeCount) {
   return modeCount ? (uint8_t)((current + 1U) % modeCount) : 0;
 }
 
+struct StabilityModeBootDecision {
+  uint8_t mode;
+  uint8_t nextStrikes;
+  bool strikePending;
+  bool fellBack;
+};
+
+/* Deterministic boot sentinel for a reboot-based mode manager. The fallback
+ * mode never takes a strike; each other mode gets `maximumStrikes` complete
+ * boot attempts before the next reset returns to the reachable fallback. */
+constexpr StabilityModeBootDecision stability_mode_boot(
+    uint8_t requested, uint8_t modeCount, uint8_t fallback, uint8_t strikes,
+    uint8_t maximumStrikes) {
+  const uint8_t safeFallback = fallback < modeCount ? fallback : 0U;
+  const uint8_t mode = requested < modeCount ? requested : safeFallback;
+  if (mode == safeFallback) return {mode, 0U, false, false};
+  if (strikes >= maximumStrikes) {
+    return {safeFallback, 0U, false, true};
+  }
+  return {mode, (uint8_t)(strikes + 1U), true, false};
+}
+
 constexpr char stability_ascii_lower(char value) {
   return value >= 'A' && value <= 'Z' ? (char)(value + ('a' - 'A')) : value;
 }

@@ -143,7 +143,7 @@ selected source cannot operate in the active mode.
 
 ## Static and dynamic memory budget
 
-Final development-image sections are `.dram0.data` 30,737 B and `.dram0.bss`
+Final development-image sections are `.dram0.data` 30,753 B and `.dram0.bss`
 58,944 B.
 The major application-owned entries are:
 
@@ -274,18 +274,19 @@ History remains 120 one-minute samples, preserving the two-hour requirement.
 
 ## Final measurements
 
-The final table is filled from clean final builds after the generated dashboard
-is refreshed:
+The final table comes from the verified builds after the generated dashboard
+was refreshed:
 
 | Environment | Static RAM | OTA-slot image | App-slot use | `.bin` | Change from baseline |
 |---|---:|---:|---:|---:|---:|
-| `esp32dev` | 89,588 B | 2,860,972 B | 43.7% | 2,905,264 B | +152 B RAM, +7,292 B image |
-| `release` | 89,452 B | 2,769,820 B | 42.3% | pending final rerun | +168 B RAM, +5,908 B image |
-| `release-verbose` | pending final rerun | pending final rerun | pending | pending | pending |
+| `esp32dev` | 89,700 B | 2,862,832 B | 43.7% | 2,907,376 B | +264 B RAM, +9,152 B app image |
+| `release` | 89,548 B | 2,771,700 B | 42.3% | 2,814,944 B | +264 B RAM, +7,788 B app image |
+| `release-verbose` | 89,548 B | 2,784,340 B | 42.5% | 2,827,776 B | +264 B RAM, +7,968 B app image |
 
-IRAM is unchanged at 130,311 bytes, leaving 761 bytes. The observability and
-ownership fixes intentionally cost a small amount of static state and flash;
-they do not pretend to create runtime heap. Peak RAM is reduced by one complete
+Development IRAM is 130,419 of 131,072 bytes, leaving 653 bytes; both release
+variants use 130,075 bytes and leave 997 bytes. The observability and ownership
+fixes intentionally cost a small amount of static state and flash; they do not
+pretend to create runtime heap. Peak RAM is reduced by one complete
 serialized JSON response because ordinary and backup JSON are no longer copied
 into a second `String`. The exact saving equals the response length and varies
 with station/alarm/settings data. The radio working buffers remain one 24,424 B
@@ -312,6 +313,13 @@ C:\Espressif\tools\python\python.exe scripts\test_stability_policy.py
 C:\Espressif\tools\python\python.exe scripts\test_audio_eq.py
 git diff --check
 ```
+
+All commands above passed on 2026-09-04. The focused results were 21 pin-map
+cases; 44 backup keys covering all 43 stored settings and six namespaces;
+10 Arabic shaping vectors plus all 143 emitted glyphs; 256 Unicode joining
+classes, 42 presentation-form letters and four lam-alef ligatures; the complete
+compile-time stability-policy suite; and 1,000 finite, pole-stable,
+Nyquist-bounded EQ designs.
 
 The stability test compiles the actual dependency-free production header with
 the installed Xtensa compiler and `-Wall -Wextra -Werror`, using compile-time

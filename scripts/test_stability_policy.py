@@ -72,6 +72,26 @@ static_assert(stability_mode_next(0, 3) == 1);
 static_assert(stability_mode_next(1, 3) == 2);
 static_assert(stability_mode_next(2, 3) == 0);
 static_assert(stability_mode_next(2, 0) == 0);
+constexpr StabilityModeBootDecision mode_wifi =
+    stability_mode_boot(0, 3, 0, 2, 2);
+static_assert(mode_wifi.mode == 0 && mode_wifi.nextStrikes == 0 &&
+              !mode_wifi.strikePending && !mode_wifi.fellBack);
+constexpr StabilityModeBootDecision mode_first =
+    stability_mode_boot(1, 3, 0, 0, 2);
+static_assert(mode_first.mode == 1 && mode_first.nextStrikes == 1 &&
+              mode_first.strikePending && !mode_first.fellBack);
+constexpr StabilityModeBootDecision mode_second =
+    stability_mode_boot(2, 3, 0, 1, 2);
+static_assert(mode_second.mode == 2 && mode_second.nextStrikes == 2 &&
+              mode_second.strikePending && !mode_second.fellBack);
+constexpr StabilityModeBootDecision mode_fallback =
+    stability_mode_boot(2, 3, 0, 2, 2);
+static_assert(mode_fallback.mode == 0 && mode_fallback.nextStrikes == 0 &&
+              !mode_fallback.strikePending && mode_fallback.fellBack);
+constexpr StabilityModeBootDecision mode_corrupt =
+    stability_mode_boot(99, 3, 0, 1, 2);
+static_assert(mode_corrupt.mode == 0 && mode_corrupt.nextStrikes == 0 &&
+              !mode_corrupt.strikePending && !mode_corrupt.fellBack);
 
 static_assert(stability_url_http("http://station.example/live"));
 static_assert(stability_url_http("HTTPS://station.example/live"));

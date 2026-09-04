@@ -433,8 +433,8 @@ Then on your phone: Bluetooth settings → pair with **"esp32-blue-spk"** → pl
 ### What a clean build should say
 
 ```
-RAM:   [===       ]  28.3% (used 92884 bytes from 327680 bytes)
-Flash: [====      ]  39.2% (used 2571268 bytes from 6553600 bytes)
+RAM:   [===       ]  27.4% (used 89700 bytes from 327680 bytes)
+Flash: [====      ]  43.7% (used 2862832 bytes from 6553600 bytes)
 ```
 
 The flash denominator is the 6.25 MB `app0` slot of the 16 MB partition table,
@@ -493,7 +493,7 @@ every subsystem by hand, and prints the full `diag` report.
 | IDF logging | `CORE_DEBUG_LEVEL=1` | `CORE_DEBUG_LEVEL=0` |
 | `assert()` | active | `NDEBUG` |
 | Flash clock | 40 MHz DIO | **80 MHz** DIO |
-| Firmware image | 2,895,728 B | **2,805,392 B** |
+| Firmware image | 2,907,376 B | **2,814,944 B** |
 
 You can check the last claim rather than believing it:
 
@@ -502,8 +502,8 @@ grep -ac "screen 0..7" .pio/build/esp32dev/firmware.bin    # 1
 grep -ac "screen 0..7" .pio/build/release/firmware.bin     # 0
 ```
 
-The saving is 90 kB of flash and 152 bytes of RAM, which is the honest shape of
-it: the log was never a RAM cost. The reasons to build release are that a
+The saving is 92,432 bytes of flash and 152 bytes of RAM, which is the honest
+shape of it: the log was never a RAM cost. The reasons to build release are that a
 production unit should not narrate itself to anybody holding a UART adapter, and
 that **the console is an unauthenticated control channel** — mode switches, the
 factory reset, the DFPlayer's entire command set — for anybody who can reach two
